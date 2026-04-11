@@ -1,0 +1,149 @@
+
+chain = "base"
+chain_id = 8453
+native_symbol = "ETH"
+max_hops = 5
+screening_margin_bps = 3
+min_net_profit_default = 100000
+poll_interval_ms = 400
+event_backfill_blocks = 32
+staleness_timeout_ms = 120000
+gas_risk_buffer_pct = 0.15
+gas_price_ceiling_wei = 3000000000
+max_position_default = 2000000000
+max_flash_loan_default = 10000000000
+daily_loss_limit_default = -50000000
+pool_health_min_bps = 9000
+stable_depeg_cutoff_e6 = 995000
+strict_target_allowlist = false
+
+[[tokens]]
+symbol = "USDC"
+address_env = "BASE_USDC"
+decimals = 6
+is_stable = true
+price_env = "BASE_USDC_PRICE_E8"
+
+[[tokens]]
+symbol = "USDT"
+address_env = "BASE_USDT"
+decimals = 6
+is_stable = true
+price_env = "BASE_USDT_PRICE_E8"
+
+[[tokens]]
+symbol = "WETH"
+address_env = "BASE_WETH"
+decimals = 18
+is_stable = false
+price_env = "BASE_WETH_PRICE_E8"
+
+[[tokens]]
+symbol = "DAI"
+address_env = "BASE_DAI"
+decimals = 18
+is_stable = false
+price_env = "BASE_DAI_PRICE_E8"
+
+[[tokens]]
+symbol = "cbETH"
+address_env = "BASE_CBETH"
+decimals = 18
+is_stable = false
+price_env = ""
+
+[[dexes]]
+name = "uniswap_v2"
+amm = "uniswap_v2_like"
+discovery = "factory_all_pairs"
+factory_env = "BASE_UNISWAP_V2_FACTORY"
+quoter_env = ""
+registry_env = ""
+vault_env = ""
+fee_ppm = 3000
+start_block = 0
+enabled = true
+
+[[dexes]]
+name = "sushiswap_v2"
+amm = "uniswap_v2_like"
+discovery = "factory_all_pairs"
+factory_env = "BASE_SUSHISWAP_V2_FACTORY"
+quoter_env = ""
+registry_env = ""
+vault_env = ""
+fee_ppm = 3000
+start_block = 0
+enabled = true
+
+[[dexes]]
+name = "baseswap_v2"
+amm = "uniswap_v2_like"
+discovery = "factory_all_pairs"
+factory_env = "BASE_BASESWAP_FACTORY"
+quoter_env = ""
+registry_env = ""
+vault_env = ""
+fee_ppm = 2500
+start_block = 0
+enabled = true
+
+[[dexes]]
+name = "aerodrome_v2"
+amm = "uniswap_v2_like"
+discovery = "factory_all_pairs"
+factory_env = "BASE_AERODROME_V2_FACTORY"
+quoter_env = ""
+registry_env = ""
+vault_env = ""
+fee_ppm = 2000
+start_block = 0
+enabled = true
+
+[[dexes]]
+name = "uniswap_v3"
+amm = "uniswap_v3_like"
+discovery = "pool_created_logs"
+factory_env = "BASE_UNISWAP_V3_FACTORY"
+quoter_env = "BASE_UNISWAP_V3_QUOTER"
+registry_env = ""
+vault_env = ""
+fee_ppm = 0
+start_block = 0
+enabled = true
+
+[[dexes]]
+name = "aerodrome_v3"
+amm = "uniswap_v3_like"
+discovery = "pool_created_logs"
+factory_env = "BASE_AERODROME_V3_FACTORY"
+quoter_env = "BASE_AERODROME_V3_QUOTER"
+registry_env = ""
+vault_env = ""
+fee_ppm = 0
+start_block = 0
+enabled = true
+
+[[dexes]]
+name = "curve"
+amm = "curve_plain"
+discovery = "curve_registry"
+factory_env = ""
+quoter_env = ""
+registry_env = "BASE_CURVE_REGISTRY"
+vault_env = ""
+fee_ppm = 0
+start_block = 0
+enabled = true
+
+[[dexes]]
+name = "balancer"
+amm = "balancer_weighted"
+discovery = "balancer_vault_logs"
+factory_env = ""
+quoter_env = ""
+registry_env = ""
+vault_env = "BASE_BALANCER_VAULT"
+fee_ppm = 0
+start_block = 0
+enabled = true

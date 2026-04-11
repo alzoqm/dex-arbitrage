@@ -1,0 +1,137 @@
+
+chain = "polygon"
+chain_id = 137
+native_symbol = "MATIC"
+max_hops = 5
+screening_margin_bps = 3
+min_net_profit_default = 150000
+poll_interval_ms = 400
+event_backfill_blocks = 32
+staleness_timeout_ms = 120000
+gas_risk_buffer_pct = 0.15
+gas_price_ceiling_wei = 200000000000
+max_position_default = 2000000000
+max_flash_loan_default = 10000000000
+daily_loss_limit_default = -50000000
+pool_health_min_bps = 9000
+stable_depeg_cutoff_e6 = 995000
+strict_target_allowlist = false
+
+[[tokens]]
+symbol = "USDC"
+address_env = "POLYGON_USDC"
+decimals = 6
+is_stable = true
+price_env = "POLYGON_USDC_PRICE_E8"
+
+[[tokens]]
+symbol = "USDT"
+address_env = "POLYGON_USDT"
+decimals = 6
+is_stable = true
+price_env = "POLYGON_USDT_PRICE_E8"
+
+[[tokens]]
+symbol = "WMATIC"
+address_env = "POLYGON_WMATIC"
+decimals = 18
+is_stable = false
+price_env = "POLYGON_WMATIC_PRICE_E8"
+
+[[tokens]]
+symbol = "WETH"
+address_env = "POLYGON_WETH"
+decimals = 18
+is_stable = false
+price_env = "POLYGON_WETH_PRICE_E8"
+
+[[tokens]]
+symbol = "DAI"
+address_env = "POLYGON_DAI"
+decimals = 18
+is_stable = false
+price_env = "POLYGON_DAI_PRICE_E8"
+
+[[dexes]]
+name = "uniswap_v2"
+amm = "uniswap_v2_like"
+discovery = "factory_all_pairs"
+factory_env = "POLYGON_UNISWAP_V2_FACTORY"
+quoter_env = ""
+registry_env = ""
+vault_env = ""
+fee_ppm = 3000
+start_block = 0
+enabled = true
+
+[[dexes]]
+name = "quickswap_v2"
+amm = "uniswap_v2_like"
+discovery = "factory_all_pairs"
+factory_env = "POLYGON_QUICKSWAP_V2_FACTORY"
+quoter_env = ""
+registry_env = ""
+vault_env = ""
+fee_ppm = 3000
+start_block = 0
+enabled = true
+
+[[dexes]]
+name = "sushiswap_v2"
+amm = "uniswap_v2_like"
+discovery = "factory_all_pairs"
+factory_env = "POLYGON_SUSHISWAP_V2_FACTORY"
+quoter_env = ""
+registry_env = ""
+vault_env = ""
+fee_ppm = 3000
+start_block = 0
+enabled = true
+
+[[dexes]]
+name = "uniswap_v3"
+amm = "uniswap_v3_like"
+discovery = "pool_created_logs"
+factory_env = "POLYGON_UNISWAP_V3_FACTORY"
+quoter_env = "POLYGON_UNISWAP_V3_QUOTER"
+registry_env = ""
+vault_env = ""
+fee_ppm = 0
+start_block = 0
+enabled = true
+
+[[dexes]]
+name = "quickswap_v3"
+amm = "uniswap_v3_like"
+discovery = "pool_created_logs"
+factory_env = "POLYGON_QUICKSWAP_V3_FACTORY"
+quoter_env = "POLYGON_QUICKSWAP_V3_QUOTER"
+registry_env = ""
+vault_env = ""
+fee_ppm = 0
+start_block = 0
+enabled = true
+
+[[dexes]]
+name = "curve"
+amm = "curve_plain"
+discovery = "curve_registry"
+factory_env = ""
+quoter_env = ""
+registry_env = "POLYGON_CURVE_REGISTRY"
+vault_env = ""
+fee_ppm = 0
+start_block = 0
+enabled = true
+
+[[dexes]]
+name = "balancer"
+amm = "balancer_weighted"
+discovery = "balancer_vault_logs"
+factory_env = ""
+quoter_env = ""
+registry_env = ""
+vault_env = "POLYGON_BALANCER_VAULT"
+fee_ppm = 0
+start_block = 0
+enabled = true

@@ -1,0 +1,11 @@
+
+[profile.default]
+src = "contracts"
+test = "contracts/test"
+out = "contracts/out"
+libs = []
+solc_version = "0.8.24"
+optimizer = true
+optimizer_runs = 5000
+via_ir = true
+fs_permissions = [{ access = "read-write", path = "./" }]
