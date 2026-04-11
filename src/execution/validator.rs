@@ -42,7 +42,10 @@ impl Validator {
     }
 
     pub async fn prepare(&self, mut plan: ExactPlan) -> Result<Option<ExecutablePlan>> {
-        let (capital_source, capital_profit) = self.capital_selector.choose(&plan).await?;
+        let Some((capital_source, capital_profit)) = self.capital_selector.choose(&plan).await?
+        else {
+            return Ok(None);
+        };
         plan.capital_source = capital_source;
         plan.expected_profit = capital_profit;
         if plan.expected_profit < self.settings.risk.min_net_profit {
@@ -64,7 +67,10 @@ impl Validator {
             .estimate_gas(executor, Some(operator), calldata.clone())
             .await
             .unwrap_or(plan.gas_limit);
-        let gas_quote = self.gas_tracker.quote(&self.rpc.best_read(), gas_estimate).await?;
+        let gas_quote = self
+            .gas_tracker
+            .quote(&self.rpc.best_read(), gas_estimate)
+            .await?;
         if self.gas_tracker.above_ceiling(&gas_quote) {
             return Ok(None);
         }

@@ -21,23 +21,44 @@ pub struct CapitalSelector {
 impl CapitalSelector {
     pub fn new(settings: Arc<Settings>, rpc: Arc<RpcClients>) -> Self {
         let flash = FlashLoanEngine::new(settings.clone(), rpc.clone());
-        Self { settings, rpc, flash }
+        Self {
+            settings,
+            rpc,
+            flash,
+        }
     }
 
-    pub async fn choose(&self, plan: &ExactPlan) -> Result<(CapitalSource, i128)> {
-        let self_balance = self.executor_balance(plan.input_token).await.unwrap_or(0);
-        let flash_fee = self.flash.fee_for_amount(plan.input_amount).await.unwrap_or(0);
-
+    pub async fn choose(&self, plan: &ExactPlan) -> Result<Option<(CapitalSource, i128)>> {
+        let Some(token) = self.settings.token_by_address(plan.input_token) else {
+            return Ok(None);
+        };
         let self_profit = plan.output_amount as i128 - plan.input_amount as i128;
-        let flash_profit = self_profit - flash_fee as i128;
-
-        if self_balance >= plan.input_amount && self_profit >= flash_profit {
-            Ok((CapitalSource::SelfFunded, self_profit))
-        } else if self.settings.contracts.aave_pool.is_some() && plan.input_amount <= self.settings.risk.max_flash_loan {
-            Ok((CapitalSource::FlashLoan, flash_profit))
-        } else {
-            Ok((CapitalSource::SelfFunded, self_profit))
+        if self_profit <= 0 {
+            return Ok(None);
         }
+
+        if token.allow_self_funded {
+            let self_balance = self.executor_balance(plan.input_token).await.unwrap_or(0);
+            if self_balance >= plan.input_amount {
+                return Ok(Some((CapitalSource::SelfFunded, self_profit)));
+            }
+        }
+
+        if token.flash_loan_enabled
+            && self.settings.contracts.aave_pool.is_some()
+            && plan.input_amount <= self.settings.risk.max_flash_loan
+        {
+            let flash_fee = match self.flash.fee_for_amount(plan.input_amount).await {
+                Ok(fee) => fee,
+                Err(_) => return Ok(None),
+            };
+            let flash_profit = self_profit - flash_fee as i128;
+            if flash_profit > 0 {
+                return Ok(Some((CapitalSource::FlashLoan, flash_profit)));
+            }
+        }
+
+        Ok(None)
     }
 
     pub fn operator_address(&self) -> Result<alloy::primitives::Address> {
@@ -60,11 +81,13 @@ impl CapitalSelector {
             .eth_call(
                 token,
                 None,
-                IERC20::balanceOfCall { account: executor }.abi_encode().into(),
+                IERC20::balanceOfCall { account: executor }
+                    .abi_encode()
+                    .into(),
                 "latest",
             )
             .await?;
-        let ret = IERC20::balanceOfCall::abi_decode_returns(&raw, true)?;
-        Ok(ret._0.to_string().parse::<u128>().unwrap_or(u128::MAX))
+        let ret = IERC20::balanceOfCall::abi_decode_returns(&raw)?;
+        Ok(ret.to_string().parse::<u128>().unwrap_or(u128::MAX))
     }
 }

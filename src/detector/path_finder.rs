@@ -1,4 +1,7 @@
-use std::{collections::{HashSet, VecDeque}, sync::Arc};
+use std::{
+    collections::{HashSet, VecDeque},
+    sync::Arc,
+};
 
 use crate::{
     config::Settings,
@@ -15,6 +18,7 @@ pub struct PathFinder {
     screening_threshold_q32: i64,
     max_branching: usize,
     max_candidates: usize,
+    max_candidates_per_anchor: usize,
 }
 
 impl PathFinder {
@@ -28,6 +32,7 @@ impl PathFinder {
             screening_threshold_q32: threshold,
             max_branching: 8,
             max_candidates: 128,
+            max_candidates_per_anchor: 32,
         }
     }
 
@@ -41,12 +46,13 @@ impl PathFinder {
         let mut candidates = Vec::new();
         let mut dedup = HashSet::<String>::new();
 
-        for &stable_idx in &snapshot.stable_token_indices {
-            let start_addr = snapshot.tokens[stable_idx].address;
-            let start_symbol = snapshot.tokens[stable_idx].symbol.clone();
+        for &anchor_idx in &snapshot.cycle_anchor_indices {
+            let start_addr = snapshot.tokens[anchor_idx].address;
+            let start_symbol = snapshot.tokens[anchor_idx].symbol.clone();
             let mut visited = HashSet::new();
-            visited.insert(stable_idx);
+            visited.insert(anchor_idx);
             let mut current_path = VecDeque::new();
+            let anchor_start = candidates.len();
             self.dfs(
                 snapshot,
                 distance_cache,
@@ -55,14 +61,19 @@ impl PathFinder {
                 &mut dedup,
                 &mut visited,
                 &mut current_path,
-                stable_idx,
-                stable_idx,
+                anchor_idx,
+                anchor_idx,
                 start_addr,
                 &start_symbol,
                 0,
                 0,
                 false,
             );
+            // Enforce per-anchor candidate budget
+            let anchor_count = candidates.len() - anchor_start;
+            if anchor_count > self.max_candidates_per_anchor {
+                candidates.truncate(anchor_start + self.max_candidates_per_anchor);
+            }
             if candidates.len() >= self.max_candidates {
                 break;
             }
@@ -94,11 +105,16 @@ impl PathFinder {
         }
 
         for edge_ref in pruning::ranked_outgoing(snapshot, current_idx, self.max_branching) {
-            let Some(edge) = snapshot.edge(edge_ref) else { continue };
-            if !edge.pool_health.healthy(self.min_confidence_bps, self.staleness_timeout) {
+            let Some(edge) = snapshot.edge(edge_ref) else {
+                continue;
+            };
+            if !edge
+                .pool_health
+                .healthy(self.min_confidence_bps, self.staleness_timeout)
+            {
                 continue;
             }
-            if !distance_cache.reachable_to_stable[edge.to] {
+            if !distance_cache.reachable_to_anchor[edge.to] {
                 continue;
             }
             let is_cycle = edge.to == start_idx && depth >= 1;

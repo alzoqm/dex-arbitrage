@@ -28,13 +28,28 @@ fn health() -> PoolHealth {
 }
 
 fn token(symbol: &str, address: Address, decimals: u8, stable: bool) -> TokenInfo {
+    token_with_anchor(symbol, address, decimals, stable, stable)
+}
+
+fn token_with_anchor(
+    symbol: &str,
+    address: Address,
+    decimals: u8,
+    stable: bool,
+    is_cycle_anchor: bool,
+) -> TokenInfo {
     TokenInfo {
         address,
         symbol: symbol.to_string(),
         decimals,
         is_stable: stable,
+        is_cycle_anchor,
+        flash_loan_enabled: is_cycle_anchor,
+        allow_self_funded: stable,
         behavior: TokenBehavior::default(),
         manual_price_usd_e8: stable.then_some(100_000_000),
+        max_position_usd_e8: None,
+        max_flash_loan_usd_e8: None,
     }
 }
 
@@ -108,21 +123,36 @@ fn settings() -> Arc<Settings> {
                 address: addr(1),
                 decimals: 6,
                 is_stable: true,
+                is_cycle_anchor: true,
+                flash_loan_enabled: true,
+                allow_self_funded: true,
                 manual_price_usd_e8: Some(100_000_000),
+                max_position_usd_e8: None,
+                max_flash_loan_usd_e8: None,
             },
             TokenConfig {
                 symbol: "WETH".to_string(),
                 address: addr(2),
                 decimals: 18,
                 is_stable: false,
+                is_cycle_anchor: false,
+                flash_loan_enabled: false,
+                allow_self_funded: false,
                 manual_price_usd_e8: None,
+                max_position_usd_e8: None,
+                max_flash_loan_usd_e8: None,
             },
             TokenConfig {
                 symbol: "DAI".to_string(),
                 address: addr(3),
                 decimals: 18,
                 is_stable: true,
+                is_cycle_anchor: true,
+                flash_loan_enabled: true,
+                allow_self_funded: true,
                 manual_price_usd_e8: Some(100_000_000),
+                max_position_usd_e8: None,
+                max_flash_loan_usd_e8: None,
             },
         ],
         dexes: vec![DexConfig {
@@ -146,9 +176,27 @@ fn detector_finds_profitable_cycle_touching_changed_edges() {
     let weth = token("WETH", addr(2), 18, false);
     let dai = token("DAI", addr(3), 18, true);
 
-    let p1 = pool(addr(11), usdc.address, weth.address, 1_000_000_000, 1_000_000_000_000_000_000);
-    let p2 = pool(addr(12), weth.address, dai.address, 1_000_000_000_000_000_000, 1_200_000_000_000_000_000_000);
-    let p3 = pool(addr(13), dai.address, usdc.address, 1_000_000_000_000_000_000_000, 1_100_000_000);
+    let p1 = pool(
+        addr(11),
+        usdc.address,
+        weth.address,
+        1_000_000_000,
+        1_000_000_000_000_000_000,
+    );
+    let p2 = pool(
+        addr(12),
+        weth.address,
+        dai.address,
+        1_000_000_000_000_000_000,
+        1_200_000_000_000_000_000_000,
+    );
+    let p3 = pool(
+        addr(13),
+        dai.address,
+        usdc.address,
+        1_000_000_000_000_000_000_000,
+        1_100_000_000,
+    );
 
     let mut pools = HashMap::new();
     pools.insert(p1.pool_id, p1);
@@ -169,4 +217,56 @@ fn detector_finds_profitable_cycle_touching_changed_edges() {
     let candidates = detector.detect(&snapshot, &changed_edges, &distance_cache);
     assert!(!candidates.is_empty());
     assert!(candidates.iter().any(|candidate| candidate.path.len() >= 2));
+}
+
+#[test]
+fn detector_can_start_from_non_stable_cycle_anchor() {
+    let usdc = token("USDC", addr(1), 6, true);
+    let weth = token_with_anchor("WETH", addr(2), 18, false, true);
+    let dai = token("DAI", addr(3), 18, true);
+
+    let p1 = pool(
+        addr(11),
+        usdc.address,
+        weth.address,
+        1_000_000_000,
+        1_000_000_000_000_000_000,
+    );
+    let p2 = pool(
+        addr(12),
+        weth.address,
+        dai.address,
+        1_000_000_000_000_000_000,
+        1_200_000_000_000_000_000_000,
+    );
+    let p3 = pool(
+        addr(13),
+        dai.address,
+        usdc.address,
+        1_000_000_000_000_000_000_000,
+        1_100_000_000,
+    );
+
+    let mut pools = HashMap::new();
+    pools.insert(p1.pool_id, p1);
+    pools.insert(p2.pool_id, p2);
+    pools.insert(p3.pool_id, p3);
+
+    let snapshot = GraphSnapshot::build(1, None, vec![usdc, weth.clone(), dai], pools);
+    let distance_cache = DistanceCache::recompute(&snapshot);
+    let detector = Detector::new(settings());
+
+    let changed_edges = snapshot
+        .adjacency
+        .iter()
+        .enumerate()
+        .flat_map(|(from, edges)| (0..edges.len()).map(move |edge_idx| EdgeRef { from, edge_idx }))
+        .collect::<Vec<_>>();
+
+    let candidates = detector.detect(&snapshot, &changed_edges, &distance_cache);
+    assert!(
+        candidates
+            .iter()
+            .any(|candidate| candidate.start_token == weth.address)
+    );
 }

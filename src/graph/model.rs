@@ -17,6 +17,7 @@ pub struct GraphSnapshot {
     pub tokens: Vec<TokenInfo>,
     pub token_to_index: HashMap<Address, usize>,
     pub stable_token_indices: Vec<usize>,
+    pub cycle_anchor_indices: Vec<usize>,
     pub adjacency: Vec<Vec<Edge>>,
     pub reverse_adj: Vec<Vec<EdgeRef>>,
     pub pools: HashMap<Address, PoolState>,
@@ -42,6 +43,12 @@ impl GraphSnapshot {
             .filter_map(|(idx, token)| token.is_stable.then_some(idx))
             .collect::<Vec<_>>();
 
+        let cycle_anchor_indices = tokens
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, token)| token.is_cycle_anchor.then_some(idx))
+            .collect::<Vec<_>>();
+
         let mut adjacency = vec![Vec::new(); tokens.len()];
         let mut reverse_adj = vec![Vec::new(); tokens.len()];
         let mut pool_to_edges: HashMap<Address, SmallVec<[EdgeRef; 8]>> = HashMap::new();
@@ -56,7 +63,10 @@ impl GraphSnapshot {
                 let edge_idx = adjacency[from].len() - 1;
                 let edge_ref = EdgeRef { from, edge_idx };
                 reverse_adj[to].push(edge_ref);
-                pool_to_edges.entry(pool.pool_id).or_default().push(edge_ref);
+                pool_to_edges
+                    .entry(pool.pool_id)
+                    .or_default()
+                    .push(edge_ref);
                 pair_to_edges.entry((from, to)).or_default().push(edge_ref);
             }
         }
@@ -67,6 +77,7 @@ impl GraphSnapshot {
             tokens,
             token_to_index,
             stable_token_indices,
+            cycle_anchor_indices,
             adjacency,
             reverse_adj,
             pools,
@@ -108,24 +119,35 @@ impl GraphSnapshot {
 
 fn build_edges_for_pool(pool: &PoolState, token_to_index: &HashMap<Address, usize>) -> Vec<Edge> {
     match &pool.state {
-        PoolSpecificState::UniswapV2Like(state) => {
-            build_two_token_edges(pool, token_to_index, pool.kind, state.fee_ppm, |zero_for_one| {
-                amm::uniswap_v2::spot_rate(state, zero_for_one)
-            })
-        }
+        PoolSpecificState::UniswapV2Like(state) => build_two_token_edges(
+            pool,
+            token_to_index,
+            pool.kind,
+            state.fee_ppm,
+            |zero_for_one| amm::uniswap_v2::spot_rate(state, zero_for_one),
+        ),
         PoolSpecificState::UniswapV3Like(state) => {
             build_two_token_edges(pool, token_to_index, pool.kind, state.fee, |zero_for_one| {
                 amm::uniswap_v3::spot_rate(state, zero_for_one)
             })
         }
-        PoolSpecificState::CurvePlain(state) => build_n_token_edges(pool, token_to_index, pool.kind, |i, j| {
-            let (spot_rate_q128, weight_log_q32, liquidity) = amm::curve::spot_rate(state, i, j);
-            (spot_rate_q128, weight_log_q32, liquidity, state.fee)
-        }),
+        PoolSpecificState::CurvePlain(state) => {
+            build_n_token_edges(pool, token_to_index, pool.kind, |i, j| {
+                let (spot_rate_q128, weight_log_q32, liquidity) =
+                    amm::curve::spot_rate(state, i, j);
+                (spot_rate_q128, weight_log_q32, liquidity, state.fee)
+            })
+        }
         PoolSpecificState::BalancerWeighted(state) => {
             build_n_token_edges(pool, token_to_index, pool.kind, |i, j| {
-                let (spot_rate_q128, weight_log_q32, liquidity) = amm::balancer::spot_rate(state, i, j);
-                (spot_rate_q128, weight_log_q32, liquidity, state.swap_fee_ppm)
+                let (spot_rate_q128, weight_log_q32, liquidity) =
+                    amm::balancer::spot_rate(state, i, j);
+                (
+                    spot_rate_q128,
+                    weight_log_q32,
+                    liquidity,
+                    state.swap_fee_ppm,
+                )
             })
         }
     }

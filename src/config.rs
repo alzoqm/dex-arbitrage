@@ -1,4 +1,3 @@
-
 use std::{collections::HashMap, env, fs, path::Path, str::FromStr};
 
 use alloy::primitives::Address;
@@ -67,7 +66,12 @@ pub struct TokenConfig {
     pub address: Address,
     pub decimals: u8,
     pub is_stable: bool,
+    pub is_cycle_anchor: bool,
+    pub flash_loan_enabled: bool,
+    pub allow_self_funded: bool,
     pub manual_price_usd_e8: Option<u64>,
+    pub max_position_usd_e8: Option<u128>,
+    pub max_flash_loan_usd_e8: Option<u128>,
 }
 
 #[derive(Debug, Clone)]
@@ -113,7 +117,17 @@ struct FileTokenConfig {
     address_env: String,
     decimals: u8,
     is_stable: bool,
+    #[serde(default)]
+    is_cycle_anchor: Option<bool>,
+    #[serde(default)]
+    flash_loan_enabled: Option<bool>,
+    #[serde(default)]
+    allow_self_funded: Option<bool>,
     price_env: String,
+    #[serde(default)]
+    max_position_usd_e8: Option<u128>,
+    #[serde(default)]
+    max_flash_loan_usd_e8: Option<u128>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -139,7 +153,11 @@ impl Settings {
         let file_cfg: FileConfig = toml::from_str(&file).context("failed to parse chain toml")?;
 
         if file_cfg.chain != chain.as_str() {
-            anyhow::bail!("config chain mismatch: expected {}, found {}", chain, file_cfg.chain);
+            anyhow::bail!(
+                "config chain mismatch: expected {}, found {}",
+                chain,
+                file_cfg.chain
+            );
         }
 
         let simulation_only = env_bool("SIMULATION_ONLY", true);
@@ -155,7 +173,10 @@ impl Settings {
                 preconf_rpc_url: env_opt("BASE_PRECONF_RPC_URL"),
                 ws_url: env_opt("BASE_WSS_URL"),
                 protected_rpc_url: env_opt("BASE_PROTECTED_RPC_URL"),
-                private_submit_method: env_or("BASE_PRIVATE_SUBMIT_METHOD", "eth_sendRawTransaction"),
+                private_submit_method: env_or(
+                    "BASE_PRIVATE_SUBMIT_METHOD",
+                    "eth_sendRawTransaction",
+                ),
                 simulate_method: env_or("BASE_SIMULATE_METHOD", "eth_call"),
             },
             Chain::Polygon => RpcSettings {
@@ -164,7 +185,10 @@ impl Settings {
                 preconf_rpc_url: env_opt("POLYGON_PRIVATE_MEMPOOL_URL"),
                 ws_url: env_opt("POLYGON_WSS_URL"),
                 protected_rpc_url: env_opt("POLYGON_PRIVATE_MEMPOOL_URL"),
-                private_submit_method: env_or("POLYGON_PRIVATE_SUBMIT_METHOD", "eth_sendRawTransaction"),
+                private_submit_method: env_or(
+                    "POLYGON_PRIVATE_SUBMIT_METHOD",
+                    "eth_sendRawTransaction",
+                ),
                 simulate_method: env_or("POLYGON_SIMULATE_METHOD", "eth_call"),
             },
         };
@@ -178,22 +202,44 @@ impl Settings {
         let risk = RiskSettings {
             max_hops: file_cfg.max_hops,
             screening_margin_bps: file_cfg.screening_margin_bps,
-            min_net_profit: env_opt_i128(if chain == Chain::Base { "BASE_MIN_NET_PROFIT" } else { "POLYGON_MIN_NET_PROFIT" })
-                .unwrap_or(file_cfg.min_net_profit_default),
+            min_net_profit: env_opt_i128(if chain == Chain::Base {
+                "BASE_MIN_NET_PROFIT"
+            } else {
+                "POLYGON_MIN_NET_PROFIT"
+            })
+            .unwrap_or(file_cfg.min_net_profit_default),
             poll_interval_ms: env_opt_u64("POLL_INTERVAL_MS").unwrap_or(file_cfg.poll_interval_ms),
-            event_backfill_blocks: env_opt_u64("EVENT_BACKFILL_BLOCKS").unwrap_or(file_cfg.event_backfill_blocks),
-            staleness_timeout_ms: env_opt_u64("STALENESS_TIMEOUT_MS").unwrap_or(file_cfg.staleness_timeout_ms),
-            gas_risk_buffer_pct: env_opt_f64("GAS_RISK_BUFFER_PCT").unwrap_or(file_cfg.gas_risk_buffer_pct),
-            gas_price_ceiling_wei: env_opt_u128(if chain == Chain::Base { "BASE_GAS_PRICE_CEILING_WEI" } else { "POLYGON_GAS_PRICE_CEILING_WEI" })
-                .unwrap_or(file_cfg.gas_price_ceiling_wei),
-            max_position: env_opt_u128(if chain == Chain::Base { "BASE_MAX_POSITION" } else { "POLYGON_MAX_POSITION" })
-                .unwrap_or(file_cfg.max_position_default),
-            max_flash_loan: env_opt_u128(if chain == Chain::Base { "BASE_MAX_FLASH_LOAN" } else { "POLYGON_MAX_FLASH_LOAN" })
-                .unwrap_or(file_cfg.max_flash_loan_default),
-            daily_loss_limit: env_opt_i128("DAILY_LOSS_LIMIT").unwrap_or(file_cfg.daily_loss_limit_default),
+            event_backfill_blocks: env_opt_u64("EVENT_BACKFILL_BLOCKS")
+                .unwrap_or(file_cfg.event_backfill_blocks),
+            staleness_timeout_ms: env_opt_u64("STALENESS_TIMEOUT_MS")
+                .unwrap_or(file_cfg.staleness_timeout_ms),
+            gas_risk_buffer_pct: env_opt_f64("GAS_RISK_BUFFER_PCT")
+                .unwrap_or(file_cfg.gas_risk_buffer_pct),
+            gas_price_ceiling_wei: env_opt_u128(if chain == Chain::Base {
+                "BASE_GAS_PRICE_CEILING_WEI"
+            } else {
+                "POLYGON_GAS_PRICE_CEILING_WEI"
+            })
+            .unwrap_or(file_cfg.gas_price_ceiling_wei),
+            max_position: env_opt_u128(if chain == Chain::Base {
+                "BASE_MAX_POSITION"
+            } else {
+                "POLYGON_MAX_POSITION"
+            })
+            .unwrap_or(file_cfg.max_position_default),
+            max_flash_loan: env_opt_u128(if chain == Chain::Base {
+                "BASE_MAX_FLASH_LOAN"
+            } else {
+                "POLYGON_MAX_FLASH_LOAN"
+            })
+            .unwrap_or(file_cfg.max_flash_loan_default),
+            daily_loss_limit: env_opt_i128("DAILY_LOSS_LIMIT")
+                .unwrap_or(file_cfg.daily_loss_limit_default),
             max_concurrent_tx: env_opt_usize("MAX_CONCURRENT_TX").unwrap_or(1),
-            pool_health_min_bps: env_opt_u16("POOL_HEALTH_MIN_BPS").unwrap_or(file_cfg.pool_health_min_bps),
-            stable_depeg_cutoff_e6: env_opt_u32("STABLE_DEPEG_CUTOFF_E6").unwrap_or(file_cfg.stable_depeg_cutoff_e6),
+            pool_health_min_bps: env_opt_u16("POOL_HEALTH_MIN_BPS")
+                .unwrap_or(file_cfg.pool_health_min_bps),
+            stable_depeg_cutoff_e6: env_opt_u32("STABLE_DEPEG_CUTOFF_E6")
+                .unwrap_or(file_cfg.stable_depeg_cutoff_e6),
         };
 
         let tokens = file_cfg
@@ -209,18 +255,45 @@ impl Settings {
                 } else {
                     env_opt_u64(&token.price_env)
                 };
+                // Apply backward-compatible defaults
+                let is_cycle_anchor = token.is_cycle_anchor.unwrap_or(token.is_stable);
+                let flash_loan_enabled = token.flash_loan_enabled.unwrap_or(is_cycle_anchor);
+                let allow_self_funded = token.allow_self_funded.unwrap_or(token.is_stable);
                 Some(TokenConfig {
                     symbol: token.symbol,
                     address,
                     decimals: token.decimals,
                     is_stable: token.is_stable,
+                    is_cycle_anchor,
+                    flash_loan_enabled,
+                    allow_self_funded,
                     manual_price_usd_e8,
+                    max_position_usd_e8: token.max_position_usd_e8,
+                    max_flash_loan_usd_e8: token.max_flash_loan_usd_e8,
                 })
             })
             .collect::<Vec<_>>();
 
         if tokens.is_empty() {
             anyhow::bail!("no token addresses configured for {}", chain);
+        }
+
+        // Validate at least one cycle anchor is configured
+        let anchor_count = tokens.iter().filter(|t| t.is_cycle_anchor).count();
+        if anchor_count == 0 {
+            anyhow::bail!(
+                "at least one cycle anchor token must be configured (is_cycle_anchor=true)"
+            );
+        }
+
+        // Validate flash-loan-enabled tokens are also cycle anchors
+        for token in &tokens {
+            if token.flash_loan_enabled && !token.is_cycle_anchor {
+                anyhow::bail!(
+                    "token {} has flash_loan_enabled=true but is_cycle_anchor=false - flash loan tokens must be cycle anchors",
+                    token.symbol
+                );
+            }
         }
 
         let dexes = file_cfg
@@ -280,6 +353,18 @@ impl Settings {
             .filter(|token| token.is_stable)
             .map(|token| token.address)
             .collect()
+    }
+
+    pub fn cycle_anchor_tokens(&self) -> Vec<Address> {
+        self.tokens
+            .iter()
+            .filter(|token| token.is_cycle_anchor)
+            .map(|token| token.address)
+            .collect()
+    }
+
+    pub fn token_by_address(&self, address: Address) -> Option<&TokenConfig> {
+        self.tokens.iter().find(|token| token.address == address)
     }
 
     pub fn data_path(&self, suffix: &str) -> String {

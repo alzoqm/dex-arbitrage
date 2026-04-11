@@ -32,16 +32,26 @@ fn graph_snapshot_builds_pair_and_pool_indices() {
         symbol: "USDC".to_string(),
         decimals: 6,
         is_stable: true,
+        is_cycle_anchor: true,
+        flash_loan_enabled: true,
+        allow_self_funded: true,
         behavior: TokenBehavior::default(),
         manual_price_usd_e8: Some(100_000_000),
+        max_position_usd_e8: None,
+        max_flash_loan_usd_e8: None,
     };
     let weth = TokenInfo {
         address: addr(2),
         symbol: "WETH".to_string(),
         decimals: 18,
         is_stable: false,
+        is_cycle_anchor: false,
+        flash_loan_enabled: false,
+        allow_self_funded: false,
         behavior: TokenBehavior::default(),
         manual_price_usd_e8: None,
+        max_position_usd_e8: None,
+        max_flash_loan_usd_e8: None,
     };
 
     let pool = PoolState {

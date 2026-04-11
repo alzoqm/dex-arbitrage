@@ -36,6 +36,9 @@ symbol = "WETH"
 address_env = "BASE_WETH"
 decimals = 18
 is_stable = false
+is_cycle_anchor = false
+flash_loan_enabled = false
+allow_self_funded = false
 price_env = "BASE_WETH_PRICE_E8"
 
 [[tokens]]
@@ -43,6 +46,9 @@ symbol = "DAI"
 address_env = "BASE_DAI"
 decimals = 18
 is_stable = false
+is_cycle_anchor = false
+flash_loan_enabled = false
+allow_self_funded = false
 price_env = "BASE_DAI_PRICE_E8"
 
 [[tokens]]
@@ -50,6 +56,9 @@ symbol = "cbETH"
 address_env = "BASE_CBETH"
 decimals = 18
 is_stable = false
+is_cycle_anchor = false
+flash_loan_enabled = false
+allow_self_funded = false
 price_env = ""
 
 [[dexes]]

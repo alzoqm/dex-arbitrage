@@ -1,4 +1,3 @@
-
 use std::{
     collections::HashMap,
     fmt::{Display, Formatter},
@@ -6,7 +5,7 @@ use std::{
     time::{Duration, SystemTime},
 };
 
-use alloy::primitives::{Address, B256, Bytes, U256};
+use alloy::primitives::{Address, Bytes, B256, U256};
 use smallvec::SmallVec;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -155,7 +154,11 @@ pub struct TokenBehavior {
 
 impl TokenBehavior {
     pub fn is_exotic(&self) -> bool {
-        self.fee_on_transfer || self.rebasing || self.erc4626 || self.callback_token || self.rate_oraclized
+        self.fee_on_transfer
+            || self.rebasing
+            || self.erc4626
+            || self.callback_token
+            || self.rate_oraclized
     }
 }
 
@@ -165,8 +168,13 @@ pub struct TokenInfo {
     pub symbol: String,
     pub decimals: u8,
     pub is_stable: bool,
+    pub is_cycle_anchor: bool,
+    pub flash_loan_enabled: bool,
+    pub allow_self_funded: bool,
     pub behavior: TokenBehavior,
     pub manual_price_usd_e8: Option<u64>,
+    pub max_position_usd_e8: Option<u128>,
+    pub max_flash_loan_usd_e8: Option<u128>,
 }
 
 #[derive(Debug, Clone, Copy)]

@@ -57,8 +57,13 @@ impl DiscoveryManager {
                 symbol: token.symbol.clone(),
                 decimals: token.decimals,
                 is_stable: token.is_stable,
+                is_cycle_anchor: token.is_cycle_anchor,
+                flash_loan_enabled: token.flash_loan_enabled,
+                allow_self_funded: token.allow_self_funded,
                 behavior: TokenBehavior::default(),
                 manual_price_usd_e8: token.manual_price_usd_e8,
+                max_position_usd_e8: token.max_position_usd_e8,
+                max_flash_loan_usd_e8: token.max_flash_loan_usd_e8,
             })
             .collect::<Vec<_>>();
 
