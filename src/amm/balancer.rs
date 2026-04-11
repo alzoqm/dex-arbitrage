@@ -1,6 +1,9 @@
 use alloy::primitives::U256;
 
-use crate::{amm::{q128_from_f64, weight_log_q32}, types::{BalancerPoolState, LiquidityInfo}};
+use crate::{
+    amm::{q128_from_f64, weight_log_q32},
+    types::{BalancerPoolState, LiquidityInfo},
+};
 
 pub fn spot_rate(state: &BalancerPoolState, i: usize, j: usize) -> (U256, i64, LiquidityInfo) {
     let bi = state.balances.get(i).copied().unwrap_or(0) as f64;
@@ -13,7 +16,11 @@ pub fn spot_rate(state: &BalancerPoolState, i: usize, j: usize) -> (U256, i64, L
         (bi / wi) / (bj / wj)
     };
     let fee_factor = 1.0 - (state.swap_fee_ppm as f64 / 1_000_000.0);
-    let net = if raw == 0.0 { 0.0 } else { (1.0 / raw) * fee_factor };
+    let net = if raw == 0.0 {
+        0.0
+    } else {
+        (1.0 / raw) * fee_factor
+    };
 
     (
         q128_from_f64(net),
@@ -25,7 +32,8 @@ pub fn spot_rate(state: &BalancerPoolState, i: usize, j: usize) -> (U256, i64, L
                 .min()
                 .copied()
                 .unwrap_or(0)
-                .min(u128::from(u64::MAX)) as u64 * 100,
+                .min(u128::from(u64::MAX)) as u64
+                * 100,
             safe_capacity_in: state.balances.get(i).copied().unwrap_or(0) / 10,
         },
     )

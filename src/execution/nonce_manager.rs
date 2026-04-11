@@ -1,4 +1,7 @@
-use std::{collections::HashMap, sync::atomic::{AtomicU64, Ordering}};
+use std::{
+    collections::HashMap,
+    sync::atomic::{AtomicU64, Ordering},
+};
 
 use parking_lot::Mutex;
 
@@ -26,7 +29,11 @@ impl NonceManager {
         }
     }
 
-    pub async fn sync(&self, rpc: &RpcClient, address: alloy::primitives::Address) -> anyhow::Result<()> {
+    pub async fn sync(
+        &self,
+        rpc: &RpcClient,
+        address: alloy::primitives::Address,
+    ) -> anyhow::Result<()> {
         let onchain = rpc.get_transaction_count(address, "pending").await?;
         self.next_nonce.store(onchain, Ordering::SeqCst);
         Ok(())

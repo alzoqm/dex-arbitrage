@@ -1,6 +1,6 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use alloy::primitives::{Address, B256, Bytes, U256};
+use alloy::primitives::{Address, Bytes, B256, U256};
 use anyhow::{Context, Result};
 use reqwest::header::{HeaderMap, HeaderValue, CONTENT_TYPE};
 use serde::{Deserialize, Serialize};
@@ -85,7 +85,9 @@ impl RpcClients {
     }
 
     pub fn best_write(&self) -> std::sync::Arc<RpcClient> {
-        self.protected.clone().unwrap_or_else(|| self.public.clone())
+        self.protected
+            .clone()
+            .unwrap_or_else(|| self.public.clone())
     }
 }
 
@@ -134,7 +136,12 @@ impl RpcClient {
         let parsed: RpcResponse = serde_json::from_str(&body)
             .with_context(|| format!("invalid rpc response body: {body}"))?;
         if let Some(err) = parsed.error {
-            anyhow::bail!("rpc error {} {} for method {}", err.code, err.message, method);
+            anyhow::bail!(
+                "rpc error {} {} for method {}",
+                err.code,
+                err.message,
+                method
+            );
         }
 
         parsed.result.context("missing rpc result")
@@ -151,7 +158,11 @@ impl RpcClient {
             .await?;
         let number = parse_hex_u64(value.get("number").context("block missing number")?)?;
         let hash = parse_b256(value.get("hash").context("block missing hash")?)?;
-        let parent = parse_b256(value.get("parentHash").context("block missing parentHash")?)?;
+        let parent = parse_b256(
+            value
+                .get("parentHash")
+                .context("block missing parentHash")?,
+        )?;
         Ok((number, hash, parent))
     }
 
@@ -182,7 +193,9 @@ impl RpcClient {
 
         let value = self.request("eth_getLogs", json!([filter])).await?;
 
-        let logs = value.as_array().context("eth_getLogs did not return array")?;
+        let logs = value
+            .as_array()
+            .context("eth_getLogs did not return array")?;
         logs.iter().map(parse_log).collect()
     }
 
@@ -225,9 +238,7 @@ impl RpcClient {
     }
 
     pub async fn max_priority_fee_per_gas(&self) -> Result<u128> {
-        let value = self
-            .request("eth_maxPriorityFeePerGas", json!([]))
-            .await?;
+        let value = self.request("eth_maxPriorityFeePerGas", json!([])).await?;
         parse_hex_u128_value(&value)
     }
 
@@ -262,7 +273,9 @@ fn parse_log(value: &Value) -> Result<RpcLog> {
     let data = parse_bytes(value.get("data").context("log missing data")?.clone())?;
     let block_number = value.get("blockNumber").and_then(|v| parse_hex_u64(v).ok());
     let block_hash = value.get("blockHash").and_then(|v| parse_b256(v).ok());
-    let tx_hash = value.get("transactionHash").and_then(|v| parse_b256(v).ok());
+    let tx_hash = value
+        .get("transactionHash")
+        .and_then(|v| parse_b256(v).ok());
 
     Ok(RpcLog {
         address,
@@ -276,17 +289,20 @@ fn parse_log(value: &Value) -> Result<RpcLog> {
 
 pub fn parse_address(value: &Value) -> Result<Address> {
     let text = value.as_str().context("address must be hex string")?;
-    text.parse().with_context(|| format!("invalid address: {text}"))
+    text.parse()
+        .with_context(|| format!("invalid address: {text}"))
 }
 
 pub fn parse_b256(value: &Value) -> Result<B256> {
     let text = value.as_str().context("hash must be hex string")?;
-    text.parse().with_context(|| format!("invalid hash: {text}"))
+    text.parse()
+        .with_context(|| format!("invalid hash: {text}"))
 }
 
 pub fn parse_bytes(value: Value) -> Result<Bytes> {
     let text = value.as_str().context("bytes must be hex string")?;
-    text.parse().with_context(|| format!("invalid bytes: {text}"))
+    text.parse()
+        .with_context(|| format!("invalid bytes: {text}"))
 }
 
 pub fn parse_hex_u64_value(value: &Value) -> Result<u64> {

@@ -1,6 +1,9 @@
 use std::sync::Arc;
 
-use alloy::primitives::{Address, Bytes};
+use alloy::{
+    primitives::{Address, Bytes, U256},
+    sol_types::SolCall,
+};
 use anyhow::Result;
 
 use crate::{
@@ -32,8 +35,8 @@ impl TxBuilder {
                         target: split.pool_id,
                         tokenIn: split.token_in,
                         tokenOut: split.token_out,
-                        amountIn: split.amount_in.into(),
-                        minAmountOut: split.min_amount_out.into(),
+                        amountIn: U256::saturating_from(split.amount_in),
+                        minAmountOut: U256::saturating_from(split.min_amount_out),
                         extraData: encode_extra(&split.extra),
                     })
                     .collect(),
@@ -42,20 +45,21 @@ impl TxBuilder {
 
         let execution = IArbitrageExecutor::ExecutionParams {
             inputToken: plan.input_token,
-            inputAmount: plan.input_amount.into(),
+            inputAmount: U256::saturating_from(plan.input_amount),
             hops,
-            minProfit: (((plan.expected_profit as f64) * 0.90).max(0.0) as u128).into(),
-            deadline: (deadline_unix as u128).into(),
+            minProfit: U256::saturating_from(plan.contract_min_profit_raw),
+            deadline: U256::saturating_from(deadline_unix),
             snapshotId: plan.snapshot_id,
         };
 
         let calldata = match plan.capital_source {
-            CapitalSource::SelfFunded => IArbitrageExecutor::executeSelfFundedCall { params: execution }
-                .abi_encode(),
+            CapitalSource::SelfFunded => {
+                IArbitrageExecutor::executeSelfFundedCall { params: execution }.abi_encode()
+            }
             CapitalSource::FlashLoan => IArbitrageExecutor::executeFlashLoanCall {
                 params: IArbitrageExecutor::FlashLoanParams {
                     loanAsset: plan.input_token,
-                    loanAmount: plan.input_amount.into(),
+                    loanAmount: U256::saturating_from(plan.input_amount),
                     execution,
                 },
             }
@@ -77,7 +81,9 @@ fn map_adapter(adapter: crate::types::AdapterType) -> IArbitrageExecutor::Adapte
         crate::types::AdapterType::UniswapV2Like => IArbitrageExecutor::AdapterType::UniswapV2Like,
         crate::types::AdapterType::UniswapV3Like => IArbitrageExecutor::AdapterType::UniswapV3Like,
         crate::types::AdapterType::CurvePlain => IArbitrageExecutor::AdapterType::CurvePlain,
-        crate::types::AdapterType::BalancerWeighted => IArbitrageExecutor::AdapterType::BalancerWeighted,
+        crate::types::AdapterType::BalancerWeighted => {
+            IArbitrageExecutor::AdapterType::BalancerWeighted
+        }
     }
 }
 

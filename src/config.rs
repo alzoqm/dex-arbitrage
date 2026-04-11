@@ -1,4 +1,4 @@
-use std::{collections::HashMap, env, fs, path::Path, str::FromStr};
+use std::{collections::HashMap, env, fs, str::FromStr};
 
 use alloy::primitives::Address;
 use anyhow::{Context, Result};
@@ -47,14 +47,20 @@ pub struct RiskSettings {
     pub max_hops: usize,
     pub screening_margin_bps: u32,
     pub min_net_profit: i128,
+    pub min_net_profit_usd_e8: u128,
+    pub min_trade_usd_e8: u128,
     pub poll_interval_ms: u64,
     pub event_backfill_blocks: u64,
     pub staleness_timeout_ms: u64,
     pub gas_risk_buffer_pct: f64,
     pub gas_price_ceiling_wei: u128,
     pub max_position: u128,
+    pub max_position_usd_e8: u128,
     pub max_flash_loan: u128,
+    pub max_flash_loan_usd_e8: u128,
     pub daily_loss_limit: i128,
+    pub daily_loss_limit_usd_e8: u128,
+    pub min_profit_realization_bps: u32,
     pub max_concurrent_tx: usize,
     pub pool_health_min_bps: u16,
     pub stable_depeg_cutoff_e6: u32,
@@ -96,14 +102,20 @@ struct FileConfig {
     max_hops: usize,
     screening_margin_bps: u32,
     min_net_profit_default: i128,
+    min_net_profit_usd_e8: Option<u128>,
+    min_trade_usd_e8: Option<u128>,
     poll_interval_ms: u64,
     event_backfill_blocks: u64,
     staleness_timeout_ms: u64,
     gas_risk_buffer_pct: f64,
     gas_price_ceiling_wei: u128,
     max_position_default: u128,
+    max_position_usd_e8: Option<u128>,
     max_flash_loan_default: u128,
+    max_flash_loan_usd_e8: Option<u128>,
     daily_loss_limit_default: i128,
+    daily_loss_limit_usd_e8: Option<u128>,
+    min_profit_realization_bps: Option<u32>,
     pool_health_min_bps: u16,
     stable_depeg_cutoff_e6: u32,
     strict_target_allowlist: bool,
@@ -208,6 +220,24 @@ impl Settings {
                 "POLYGON_MIN_NET_PROFIT"
             })
             .unwrap_or(file_cfg.min_net_profit_default),
+            min_net_profit_usd_e8: env_opt_u128(if chain == Chain::Base {
+                "BASE_MIN_NET_PROFIT_USD_E8"
+            } else {
+                "POLYGON_MIN_NET_PROFIT_USD_E8"
+            })
+            .or(file_cfg.min_net_profit_usd_e8)
+            .unwrap_or_else(|| {
+                // Backward compatible default: convert old raw USDC value
+                // 100000 raw USDC (6 decimals) at $1 = $0.10 = 10_000_000 e8
+                10_000_000
+            }),
+            min_trade_usd_e8: env_opt_u128(if chain == Chain::Base {
+                "BASE_MIN_TRADE_USD_E8"
+            } else {
+                "POLYGON_MIN_TRADE_USD_E8"
+            })
+            .or(file_cfg.min_trade_usd_e8)
+            .unwrap_or(1_000_000_000), // $10 default
             poll_interval_ms: env_opt_u64("POLL_INTERVAL_MS").unwrap_or(file_cfg.poll_interval_ms),
             event_backfill_blocks: env_opt_u64("EVENT_BACKFILL_BLOCKS")
                 .unwrap_or(file_cfg.event_backfill_blocks),
@@ -227,20 +257,47 @@ impl Settings {
                 "POLYGON_MAX_POSITION"
             })
             .unwrap_or(file_cfg.max_position_default),
+            max_position_usd_e8: env_opt_u128(if chain == Chain::Base {
+                "BASE_MAX_POSITION_USD_E8"
+            } else {
+                "POLYGON_MAX_POSITION_USD_E8"
+            })
+            .or(file_cfg.max_position_usd_e8)
+            .unwrap_or(200_000_000_000), // $2000 default
             max_flash_loan: env_opt_u128(if chain == Chain::Base {
                 "BASE_MAX_FLASH_LOAN"
             } else {
                 "POLYGON_MAX_FLASH_LOAN"
             })
             .unwrap_or(file_cfg.max_flash_loan_default),
+            max_flash_loan_usd_e8: env_opt_u128(if chain == Chain::Base {
+                "BASE_MAX_FLASH_LOAN_USD_E8"
+            } else {
+                "POLYGON_MAX_FLASH_LOAN_USD_E8"
+            })
+            .or(file_cfg.max_flash_loan_usd_e8)
+            .unwrap_or(1_000_000_000_000), // $10000 default
             daily_loss_limit: env_opt_i128("DAILY_LOSS_LIMIT")
                 .unwrap_or(file_cfg.daily_loss_limit_default),
+            daily_loss_limit_usd_e8: env_opt_u128("DAILY_LOSS_LIMIT_USD_E8")
+                .or(file_cfg.daily_loss_limit_usd_e8)
+                .unwrap_or(50_000_000_000), // $500 default
+            min_profit_realization_bps: env_opt_u32("MIN_PROFIT_REALIZATION_BPS")
+                .or(file_cfg.min_profit_realization_bps)
+                .unwrap_or(9000), // 90% default
             max_concurrent_tx: env_opt_usize("MAX_CONCURRENT_TX").unwrap_or(1),
             pool_health_min_bps: env_opt_u16("POOL_HEALTH_MIN_BPS")
                 .unwrap_or(file_cfg.pool_health_min_bps),
             stable_depeg_cutoff_e6: env_opt_u32("STABLE_DEPEG_CUTOFF_E6")
                 .unwrap_or(file_cfg.stable_depeg_cutoff_e6),
         };
+
+        if risk.min_profit_realization_bps > 10_000 {
+            anyhow::bail!(
+                "MIN_PROFIT_REALIZATION_BPS must be between 0 and 10000, got {}",
+                risk.min_profit_realization_bps
+            );
+        }
 
         let tokens = file_cfg
             .tokens

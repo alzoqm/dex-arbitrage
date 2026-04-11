@@ -124,6 +124,13 @@ pub enum CapitalSource {
     FlashLoan,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct CapitalChoice {
+    pub source: CapitalSource,
+    pub flash_fee_raw: u128,
+    pub net_profit_before_gas_raw: i128,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AdapterType {
     UniswapV2Like = 0,
@@ -333,6 +340,7 @@ pub struct CandidatePath {
     pub start_token: Address,
     pub start_symbol: String,
     pub screening_score_q32: i64,
+    pub cycle_key: String,
     pub path: SmallVec<[CandidateHop; 8]>,
 }
 
@@ -382,7 +390,23 @@ pub struct ExactPlan {
     pub output_token: Address,
     pub input_amount: u128,
     pub output_amount: u128,
+
+    // Raw input-token units (for contract)
+    pub gross_profit_raw: i128,
+    pub flash_fee_raw: u128,
+    pub net_profit_before_gas_raw: i128,
+    pub contract_min_profit_raw: u128,
+
+    // USD e8 decision units (for off-chain risk checks)
+    pub input_value_usd_e8: u128,
+    pub gross_profit_usd_e8: i128,
+    pub flash_fee_usd_e8: i128,
+    pub gas_cost_usd_e8: i128,
+    pub net_profit_usd_e8: i128,
+
+    // Legacy field for backward compatibility during transition
     pub expected_profit: i128,
+
     pub gas_limit: u64,
     pub gas_cost_wei: U256,
     pub capital_source: CapitalSource,

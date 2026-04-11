@@ -1,11 +1,18 @@
 use alloy::primitives::U256;
 
-use crate::{amm::{apply_fee_rate, q128_from_f64, weight_log_q32}, types::{LiquidityInfo, V3PoolState}};
+use crate::{
+    amm::{apply_fee_rate, q128_from_f64, weight_log_q32},
+    types::{LiquidityInfo, V3PoolState},
+};
 
 pub fn spot_rate(state: &V3PoolState, zero_for_one: bool) -> (U256, i64, LiquidityInfo) {
     let sqrt_price = u256_to_f64(state.sqrt_price_x96);
     let q96 = 2f64.powi(96);
-    let price_0_to_1 = if sqrt_price <= 0.0 { 0.0 } else { (sqrt_price / q96).powi(2) };
+    let price_0_to_1 = if sqrt_price <= 0.0 {
+        0.0
+    } else {
+        (sqrt_price / q96).powi(2)
+    };
     let raw = if zero_for_one {
         price_0_to_1
     } else if price_0_to_1 == 0.0 {

@@ -138,12 +138,13 @@ impl PathFinder {
                     .map(|hop| format!("{}:{}:{}", hop.from, hop.to, hop.pool_id))
                     .collect::<Vec<_>>()
                     .join("|");
-                if dedup.insert(key) {
+                if dedup.insert(key.clone()) {
                     candidates.push(CandidatePath {
                         snapshot_id: snapshot.snapshot_id,
                         start_token: start_addr,
                         start_symbol: start_symbol.to_string(),
                         screening_score_q32: next_score,
+                        cycle_key: key,
                         path: current_path.iter().cloned().collect(),
                     });
                 }

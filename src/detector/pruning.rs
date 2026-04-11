@@ -1,11 +1,16 @@
 use crate::{graph::GraphSnapshot, types::EdgeRef};
 
-pub fn ranked_outgoing(snapshot: &GraphSnapshot, vertex: usize, max_branching: usize) -> Vec<EdgeRef> {
+pub fn ranked_outgoing(
+    snapshot: &GraphSnapshot,
+    vertex: usize,
+    max_branching: usize,
+) -> Vec<EdgeRef> {
     let mut refs = snapshot
         .adjacency
         .get(vertex)
         .map(|edges| {
-            edges.iter()
+            edges
+                .iter()
                 .enumerate()
                 .map(|(edge_idx, edge)| (edge_idx, edge))
                 .collect::<Vec<_>>()
@@ -13,11 +18,17 @@ pub fn ranked_outgoing(snapshot: &GraphSnapshot, vertex: usize, max_branching: u
         .unwrap_or_default();
 
     refs.sort_by(|(_, a), (_, b)| {
-        let health_cmp = b.pool_health.confidence_bps.cmp(&a.pool_health.confidence_bps);
+        let health_cmp = b
+            .pool_health
+            .confidence_bps
+            .cmp(&a.pool_health.confidence_bps);
         if health_cmp != std::cmp::Ordering::Equal {
             return health_cmp;
         }
-        let liq_cmp = b.liquidity.safe_capacity_in.cmp(&a.liquidity.safe_capacity_in);
+        let liq_cmp = b
+            .liquidity
+            .safe_capacity_in
+            .cmp(&a.liquidity.safe_capacity_in);
         if liq_cmp != std::cmp::Ordering::Equal {
             return liq_cmp;
         }
@@ -26,6 +37,9 @@ pub fn ranked_outgoing(snapshot: &GraphSnapshot, vertex: usize, max_branching: u
 
     refs.into_iter()
         .take(max_branching)
-        .map(|(edge_idx, _)| EdgeRef { from: vertex, edge_idx })
+        .map(|(edge_idx, _)| EdgeRef {
+            from: vertex,
+            edge_idx,
+        })
         .collect()
 }

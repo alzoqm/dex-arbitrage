@@ -57,7 +57,9 @@ impl Submitter {
             .with_max_fee_per_gas(plan.max_fee_per_gas);
 
         for (name, url) in self.channels() {
-            let provider = ProviderBuilder::new().wallet(signer.clone()).connect_http(url.parse()?);
+            let provider = ProviderBuilder::new()
+                .wallet(signer.clone())
+                .connect_http(url.parse()?);
             let envelope = tx.clone().build(&provider.wallet()).await?;
             match provider.send_tx_envelope(envelope).await {
                 Ok(pending) => {
@@ -84,7 +86,10 @@ impl Submitter {
                 if let Some(url) = self.settings.rpc.protected_rpc_url.clone() {
                     out.push(("base-protected".to_string(), url));
                 }
-                out.push(("base-public".to_string(), self.settings.rpc.public_rpc_url.clone()));
+                out.push((
+                    "base-public".to_string(),
+                    self.settings.rpc.public_rpc_url.clone(),
+                ));
                 if let Some(url) = self.settings.rpc.fallback_rpc_url.clone() {
                     out.push(("base-fallback".to_string(), url));
                 }
@@ -93,7 +98,10 @@ impl Submitter {
                 if let Some(url) = self.settings.rpc.protected_rpc_url.clone() {
                     out.push(("polygon-private".to_string(), url));
                 }
-                out.push(("polygon-public".to_string(), self.settings.rpc.public_rpc_url.clone()));
+                out.push((
+                    "polygon-public".to_string(),
+                    self.settings.rpc.public_rpc_url.clone(),
+                ));
                 if let Some(url) = self.settings.rpc.fallback_rpc_url.clone() {
                     out.push(("polygon-fallback".to_string(), url));
                 }

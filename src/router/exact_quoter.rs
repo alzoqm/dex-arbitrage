@@ -1,6 +1,9 @@
 use std::sync::Arc;
 
-use alloy::sol_types::SolCall;
+use alloy::{
+    primitives::{Uint, U160, U256},
+    sol_types::SolCall,
+};
 use anyhow::Result;
 
 use crate::{
@@ -58,17 +61,17 @@ impl ExactQuoter {
                             IV3QuoterV2::quoteExactInputSingleCall {
                                 tokenIn: token_in,
                                 tokenOut: token_out,
-                                fee: state.fee,
-                                amountIn: amount_in.into(),
-                                sqrtPriceLimitX96: 0,
+                                fee: Uint::<24, 1>::saturating_from(state.fee),
+                                amountIn: U256::saturating_from(amount_in),
+                                sqrtPriceLimitX96: U160::ZERO,
                             }
                             .abi_encode()
                             .into(),
                             "latest",
                         )
                         .await?;
-                    let ret = IV3QuoterV2::quoteExactInputSingleCall::abi_decode_returns(&raw, true)?;
-                    u256_to_u128(ret.amountOut)
+                    let ret = IV3QuoterV2::quoteExactInputSingleCall::abi_decode_returns(&raw)?;
+                    u256_to_u128(ret)
                 } else {
                     let zero_for_one = pool.token_addresses.first().copied() == Some(token_in);
                     amm::uniswap_v3::fallback_quote(state, zero_for_one, amount_in)
@@ -86,7 +89,7 @@ impl ExactQuoter {
                             ICurvePool::get_dy_underlyingCall {
                                 i: i as i128,
                                 j: j as i128,
-                                dx: amount_in.into(),
+                                dx: U256::saturating_from(amount_in),
                             }
                             .abi_encode()
                             .into(),
@@ -95,8 +98,8 @@ impl ExactQuoter {
                         .await;
                     match raw {
                         Ok(raw) => {
-                            let ret = ICurvePool::get_dy_underlyingCall::abi_decode_returns(&raw, true)?;
-                            u256_to_u128(ret._0)
+                            let ret = ICurvePool::get_dy_underlyingCall::abi_decode_returns(&raw)?;
+                            u256_to_u128(ret)
                         }
                         Err(_) => {
                             let raw = self
@@ -108,15 +111,15 @@ impl ExactQuoter {
                                     ICurvePool::get_dyCall {
                                         i: i as i128,
                                         j: j as i128,
-                                        dx: amount_in.into(),
+                                        dx: U256::saturating_from(amount_in),
                                     }
                                     .abi_encode()
                                     .into(),
                                     "latest",
                                 )
                                 .await?;
-                            let ret = ICurvePool::get_dyCall::abi_decode_returns(&raw, true)?;
-                            u256_to_u128(ret._0)
+                            let ret = ICurvePool::get_dyCall::abi_decode_returns(&raw)?;
+                            u256_to_u128(ret)
                         }
                     }
                 } else {
@@ -129,19 +132,21 @@ impl ExactQuoter {
                             ICurvePool::get_dyCall {
                                 i: i as i128,
                                 j: j as i128,
-                                dx: amount_in.into(),
+                                dx: U256::saturating_from(amount_in),
                             }
                             .abi_encode()
                             .into(),
                             "latest",
                         )
                         .await?;
-                    let ret = ICurvePool::get_dyCall::abi_decode_returns(&raw, true)?;
-                    u256_to_u128(ret._0)
+                    let ret = ICurvePool::get_dyCall::abi_decode_returns(&raw)?;
+                    u256_to_u128(ret)
                 };
                 amount
             }
-            PoolSpecificState::BalancerWeighted(state) => amm::balancer::fallback_quote(state, i, j, amount_in),
+            PoolSpecificState::BalancerWeighted(state) => {
+                amm::balancer::fallback_quote(state, i, j, amount_in)
+            }
         };
 
         let _ = snapshot.snapshot_id;

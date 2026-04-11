@@ -5,13 +5,18 @@ use std::{
 
 use anyhow::Result;
 use serde_json::json;
+use tracing::{debug, warn};
 
 use crate::{
     config::Settings,
     execution::{capital_selector::CapitalSelector, tx_builder::TxBuilder},
-    risk::gas_tracker::{GasQuote, GasTracker},
+    graph::GraphSnapshot,
+    risk::{
+        gas_tracker::{GasQuote, GasTracker},
+        valuation::{amount_to_usd_e8, calculate_contract_min_profit_raw, native_gas_to_usd_e8},
+    },
     rpc::RpcClients,
-    types::{ExactPlan, ExecutablePlan},
+    types::{Chain, ExactPlan, ExecutablePlan},
 };
 
 #[derive(Debug)]
@@ -41,14 +46,57 @@ impl Validator {
         self.capital_selector.operator_address()
     }
 
-    pub async fn prepare(&self, mut plan: ExactPlan) -> Result<Option<ExecutablePlan>> {
-        let Some((capital_source, capital_profit)) = self.capital_selector.choose(&plan).await?
+    pub async fn prepare(
+        &self,
+        mut plan: ExactPlan,
+        snapshot: &GraphSnapshot,
+    ) -> Result<Option<ExecutablePlan>> {
+        // Get token metadata for valuation
+        let Some(token) = snapshot
+            .tokens
+            .iter()
+            .find(|t| t.address == plan.input_token)
         else {
+            debug!(input_token = %plan.input_token, "input token not found in snapshot");
             return Ok(None);
         };
-        plan.capital_source = capital_source;
-        plan.expected_profit = capital_profit;
-        if plan.expected_profit < self.settings.risk.min_net_profit {
+
+        let Some(input_value_usd_e8) = amount_to_usd_e8(plan.input_amount, token) else {
+            debug!(
+                input_token = %plan.input_token,
+                input_symbol = %token.symbol,
+                "input token price missing, cannot apply USD risk checks"
+            );
+            return Ok(None);
+        };
+        plan.input_value_usd_e8 = input_value_usd_e8;
+
+        // Step 1: Capital selection (self-funded vs flash loan)
+        let Some(choice) = self.capital_selector.choose(&plan, token).await? else {
+            debug!(
+                input_token = %plan.input_token,
+                input_amount = plan.input_amount,
+                "no valid capital source available"
+            );
+            return Ok(None);
+        };
+
+        // Update plan with capital choice
+        plan.capital_source = choice.source;
+        plan.flash_fee_raw = choice.flash_fee_raw;
+        plan.net_profit_before_gas_raw = choice.net_profit_before_gas_raw;
+
+        // Step 2: Build preliminary calldata with contract min profit
+        plan.contract_min_profit_raw = calculate_contract_min_profit_raw(
+            plan.net_profit_before_gas_raw,
+            self.settings.risk.min_profit_realization_bps,
+        );
+
+        if plan.contract_min_profit_raw == 0 {
+            debug!(
+                net_profit_before_gas_raw = plan.net_profit_before_gas_raw,
+                "contract min profit is zero, rejecting"
+            );
             return Ok(None);
         }
 
@@ -57,31 +105,136 @@ impl Validator {
             .unwrap_or_default()
             .as_secs()
             + 30;
+
         let calldata = self.tx_builder.build_calldata(&plan, deadline_unix)?;
         let executor = self.tx_builder.executor_address()?;
         let operator = self.capital_selector.operator_address()?;
 
+        // Step 3: Estimate gas
         let gas_estimate = self
             .rpc
             .best_read()
             .estimate_gas(executor, Some(operator), calldata.clone())
             .await
             .unwrap_or(plan.gas_limit);
+
         let gas_quote = self
             .gas_tracker
             .quote(&self.rpc.best_read(), gas_estimate)
             .await?;
+
         if self.gas_tracker.above_ceiling(&gas_quote) {
+            debug!(
+                gas_quote_max_fee = gas_quote.max_fee_per_gas,
+                gas_ceiling = self.settings.risk.gas_price_ceiling_wei,
+                "gas price above ceiling, rejecting"
+            );
             return Ok(None);
         }
 
+        // Step 4: Convert all values to USD for profitability check
+        let Some(gross_profit_abs_usd_e8) =
+            amount_to_usd_e8(plan.gross_profit_raw.unsigned_abs(), token)
+        else {
+            debug!(
+                input_token = %plan.input_token,
+                input_symbol = %token.symbol,
+                "input token price missing, cannot value gross profit"
+            );
+            return Ok(None);
+        };
+        let Ok(gross_profit_abs_usd_e8) = i128::try_from(gross_profit_abs_usd_e8) else {
+            debug!("gross profit USD value exceeds i128 range");
+            return Ok(None);
+        };
+        let gross_profit_usd_e8 = if plan.gross_profit_raw >= 0 {
+            gross_profit_abs_usd_e8
+        } else {
+            -gross_profit_abs_usd_e8
+        };
+
+        let Some(flash_fee_usd_e8) = amount_to_usd_e8(plan.flash_fee_raw, token) else {
+            debug!(
+                input_token = %plan.input_token,
+                input_symbol = %token.symbol,
+                "input token price missing, cannot value flash fee"
+            );
+            return Ok(None);
+        };
+        let Ok(flash_fee_usd_e8) = i128::try_from(flash_fee_usd_e8) else {
+            debug!("flash fee USD value exceeds i128 range");
+            return Ok(None);
+        };
+
+        let Some((native_symbol, native_price_usd_e8, native_decimals)) =
+            self.native_gas_pricing(snapshot)
+        else {
+            debug!(
+                chain = %self.settings.chain,
+                wrapped_native_symbol = %self.wrapped_native_symbol(),
+                "wrapped native token price not configured, cannot compute gas cost in USD"
+            );
+            return Ok(None);
+        };
+        let Some(gas_cost_usd_e8) = native_gas_to_usd_e8(
+            gas_quote.buffered_total_cost_wei,
+            native_price_usd_e8,
+            native_decimals,
+        ) else {
+            debug!(
+                native_symbol = %native_symbol,
+                "failed to convert gas cost to USD"
+            );
+            return Ok(None);
+        };
+        let Ok(gas_cost_usd_e8) = i128::try_from(gas_cost_usd_e8) else {
+            debug!("gas cost USD value exceeds i128 range");
+            return Ok(None);
+        };
+
+        let net_profit_usd_e8 = gross_profit_usd_e8 - flash_fee_usd_e8 - gas_cost_usd_e8;
+
+        // Fill USD fields in plan
+        plan.gross_profit_usd_e8 = gross_profit_usd_e8;
+        plan.flash_fee_usd_e8 = flash_fee_usd_e8;
+        plan.gas_cost_usd_e8 = gas_cost_usd_e8;
+        plan.net_profit_usd_e8 = net_profit_usd_e8;
+
+        // Step 5: Check USD profitability
+        if net_profit_usd_e8 < self.settings.risk.min_net_profit_usd_e8 as i128 {
+            debug!(
+                net_profit_usd_e8 = net_profit_usd_e8,
+                min_profit_usd_e8 = self.settings.risk.min_net_profit_usd_e8,
+                "net profit below USD threshold, rejecting"
+            );
+            return Ok(None);
+        }
+
+        // Step 6: Recompute contract min profit after gas is known (optional stricter floor)
+        plan.contract_min_profit_raw = calculate_contract_min_profit_raw(
+            plan.net_profit_before_gas_raw,
+            self.settings.risk.min_profit_realization_bps,
+        );
+
+        // Rebuild calldata with final contract_min_profit_raw
+        let calldata = self.tx_builder.build_calldata(&plan, deadline_unix)?;
+
+        // Step 7: Simulation
         let simulation_ok = self
             .simulate(executor, operator, &calldata, &gas_quote)
             .await?;
+
         if !simulation_ok {
+            warn!(
+                input_token = %plan.input_token,
+                input_amount = plan.input_amount,
+                net_profit_usd_e8 = net_profit_usd_e8,
+                "simulation failed for executable plan"
+            );
             return Ok(None);
         }
 
+        // Step 8: Return executable plan
         Ok(Some(ExecutablePlan {
             exact: ExactPlan {
                 gas_limit: gas_estimate,
@@ -94,6 +247,26 @@ impl Validator {
             nonce: 0,
             deadline_unix,
         }))
+    }
+
+    fn wrapped_native_symbol(&self) -> &'static str {
+        match self.settings.chain {
+            Chain::Base => "WETH",
+            Chain::Polygon => "WMATIC",
+        }
+    }
+
+    fn native_gas_pricing(&self, snapshot: &GraphSnapshot) -> Option<(String, u64, u8)> {
+        let wrapped_native = self.wrapped_native_symbol();
+        snapshot
+            .tokens
+            .iter()
+            .find(|token| token.symbol.eq_ignore_ascii_case(wrapped_native))
+            .and_then(|token| {
+                token
+                    .manual_price_usd_e8
+                    .map(|price| (token.symbol.clone(), price, token.decimals))
+            })
     }
 
     async fn simulate(

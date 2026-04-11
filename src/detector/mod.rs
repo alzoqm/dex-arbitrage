@@ -3,7 +3,11 @@ pub mod pruning;
 
 use std::sync::Arc;
 
-use crate::{config::Settings, graph::{DistanceCache, GraphSnapshot}, types::{CandidatePath, EdgeRef}};
+use crate::{
+    config::Settings,
+    graph::{DistanceCache, GraphSnapshot},
+    types::{CandidatePath, EdgeRef},
+};
 
 use self::path_finder::PathFinder;
 
@@ -25,6 +29,7 @@ impl Detector {
         changed_edges: &[EdgeRef],
         distance_cache: &DistanceCache,
     ) -> Vec<CandidatePath> {
-        self.inner.find_candidates(snapshot, changed_edges, distance_cache)
+        self.inner
+            .find_candidates(snapshot, changed_edges, distance_cache)
     }
 }

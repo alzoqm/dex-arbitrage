@@ -23,10 +23,17 @@ impl FlashLoanEngine {
         let raw = self
             .rpc
             .best_read()
-            .eth_call(aave_pool, None, IAavePool::FLASHLOAN_PREMIUM_TOTALCall {}.abi_encode().into(), "latest")
+            .eth_call(
+                aave_pool,
+                None,
+                IAavePool::FLASHLOAN_PREMIUM_TOTALCall {}
+                    .abi_encode()
+                    .into(),
+                "latest",
+            )
             .await?;
-        let ret = IAavePool::FLASHLOAN_PREMIUM_TOTALCall::abi_decode_returns(&raw, true)?;
-        Ok(ret._0 as u128 * 100)
+        let ret = IAavePool::FLASHLOAN_PREMIUM_TOTALCall::abi_decode_returns(&raw)?;
+        Ok(ret as u128 * 100)
     }
 
     pub async fn fee_for_amount(&self, amount: u128) -> Result<u128> {

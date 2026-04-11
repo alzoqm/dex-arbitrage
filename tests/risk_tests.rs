@@ -39,14 +39,20 @@ fn depeg_guard_blocks_unhealthy_stable_token() {
             max_hops: 4,
             screening_margin_bps: 3,
             min_net_profit: 1,
+            min_net_profit_usd_e8: 10_000_000,
+            min_trade_usd_e8: 1_000_000_000,
             poll_interval_ms: 400,
             event_backfill_blocks: 10,
             staleness_timeout_ms: 60_000,
             gas_risk_buffer_pct: 0.15,
             gas_price_ceiling_wei: 3_000_000_000,
             max_position: 1_000_000_000,
+            max_position_usd_e8: 200_000_000_000,
             max_flash_loan: 1_000_000_000,
+            max_flash_loan_usd_e8: 1_000_000_000_000,
             daily_loss_limit: -1_000_000,
+            daily_loss_limit_usd_e8: 50_000_000_000,
+            min_profit_realization_bps: 9000,
             max_concurrent_tx: 1,
             pool_health_min_bps: 9_000,
             stable_depeg_cutoff_e6: 995_000,
@@ -76,6 +82,18 @@ fn depeg_guard_blocks_unhealthy_stable_token() {
                 max_position_usd_e8: None,
                 max_flash_loan_usd_e8: None,
             },
+            dex_arbitrage::config::TokenConfig {
+                symbol: "WMATIC".to_string(),
+                address: addr(3),
+                decimals: 18,
+                is_stable: false,
+                is_cycle_anchor: true,
+                flash_loan_enabled: true,
+                allow_self_funded: false,
+                manual_price_usd_e8: Some(80_000_000),
+                max_position_usd_e8: None,
+                max_flash_loan_usd_e8: None,
+            },
         ],
         dexes: vec![dex_arbitrage::config::DexConfig {
             name: "uniswap_v2".to_string(),
@@ -95,4 +113,5 @@ fn depeg_guard_blocks_unhealthy_stable_token() {
     assert!(!guard.stable_routes_allowed());
     assert!(!guard.token_is_healthy(addr(2)));
     assert!(guard.token_is_healthy(addr(1)));
+    assert!(guard.token_is_healthy(addr(3)));
 }

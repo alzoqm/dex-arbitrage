@@ -5,7 +5,7 @@ use crate::config::Settings;
 
 pub fn install(settings: &Settings) -> Result<()> {
     let builder = PrometheusBuilder::new();
-    let addr = settings
+    let addr: std::net::SocketAddr = settings
         .prometheus_bind
         .parse()
         .with_context(|| format!("invalid PROMETHEUS_BIND: {}", settings.prometheus_bind))?;

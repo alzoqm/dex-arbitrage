@@ -1,4 +1,7 @@
-use std::{collections::{HashMap, HashSet}, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
 
 use alloy::primitives::{keccak256, Address, B256};
 use anyhow::Result;
@@ -21,7 +24,11 @@ impl EventStream {
         Self { settings, rpc }
     }
 
-    pub async fn poll_once(&self, snapshot: &GraphSnapshot, from_block: u64) -> Result<(u64, RefreshBatch)> {
+    pub async fn poll_once(
+        &self,
+        snapshot: &GraphSnapshot,
+        from_block: u64,
+    ) -> Result<(u64, RefreshBatch)> {
         let latest = self.rpc.best_read().block_number().await?;
         if latest <= from_block {
             return Ok((from_block, RefreshBatch::default()));
@@ -47,7 +54,9 @@ impl EventStream {
             .pools
             .values()
             .filter_map(|pool| match &pool.state {
-                crate::types::PoolSpecificState::BalancerWeighted(state) => Some((state.pool_id, pool.pool_id)),
+                crate::types::PoolSpecificState::BalancerWeighted(state) => {
+                    Some((state.pool_id, pool.pool_id))
+                }
                 _ => None,
             })
             .collect::<HashMap<_, _>>();

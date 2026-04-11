@@ -37,7 +37,9 @@ impl SplitOptimizer {
         }
         let min_slice = (total_in / 8).max(1);
         if !should_split(edge_refs.len(), total_in, min_slice) {
-            return self.single_best(snapshot, edge_refs, token_in, token_out, total_in).await;
+            return self
+                .single_best(snapshot, edge_refs, token_in, token_out, total_in)
+                .await;
         }
 
         let mut allocations = vec![0u128; edge_refs.len()];
@@ -57,16 +59,26 @@ impl SplitOptimizer {
                 {
                     continue;
                 }
-                let Some(pool) = snapshot.pool(edge.pool_id) else { continue };
+                let Some(pool) = snapshot.pool(edge.pool_id) else {
+                    continue;
+                };
                 let total_quote = self
                     .exact_quoter
-                    .quote_pool(snapshot, pool, token_in, token_out, allocations[idx].saturating_add(slice))
+                    .quote_pool(
+                        snapshot,
+                        pool,
+                        token_in,
+                        token_out,
+                        allocations[idx].saturating_add(slice),
+                    )
                     .await?;
                 let marginal = total_quote.saturating_sub(quoted_outputs[idx]);
                 ranked.push((idx, marginal));
             }
             ranked.sort_by(|a, b| b.1.cmp(&a.1));
-            let Some((winner, marginal)) = ranked.first().copied() else { break };
+            let Some((winner, marginal)) = ranked.first().copied() else {
+                break;
+            };
             if marginal == 0 {
                 break;
             }
@@ -75,7 +87,9 @@ impl SplitOptimizer {
                 .exact_quoter
                 .quote_pool(
                     snapshot,
-                    snapshot.pool(snapshot.edge(edge_refs[winner]).unwrap().pool_id).unwrap(),
+                    snapshot
+                        .pool(snapshot.edge(edge_refs[winner]).unwrap().pool_id)
+                        .unwrap(),
                     token_in,
                     token_out,
                     allocations[winner],
@@ -102,7 +116,9 @@ impl SplitOptimizer {
                 Some(edge) => edge,
                 None => continue,
             };
-            let Some(pool) = snapshot.pool(edge.pool_id) else { continue };
+            let Some(pool) = snapshot.pool(edge.pool_id) else {
+                continue;
+            };
             let quote = self
                 .exact_quoter
                 .quote_pool(snapshot, pool, token_in, token_out, total_in)
@@ -135,8 +151,12 @@ impl SplitOptimizer {
             if allocation == 0 {
                 continue;
             }
-            let Some(edge) = snapshot.edge(edge_refs[idx]) else { continue };
-            let Some(pool) = snapshot.pool(edge.pool_id) else { continue };
+            let Some(edge) = snapshot.edge(edge_refs[idx]) else {
+                continue;
+            };
+            let Some(pool) = snapshot.pool(edge.pool_id) else {
+                continue;
+            };
             let expected = self
                 .exact_quoter
                 .quote_pool(snapshot, pool, token_in, token_out, allocation)
@@ -152,8 +172,16 @@ impl SplitOptimizer {
                     sqrt_price_limit_x96: alloy::primitives::U256::ZERO,
                 },
                 crate::types::PoolSpecificState::CurvePlain(state) => SplitExtra::Curve {
-                    i: pool.token_addresses.iter().position(|token| *token == token_in).unwrap_or(0) as i128,
-                    j: pool.token_addresses.iter().position(|token| *token == token_out).unwrap_or(1) as i128,
+                    i: pool
+                        .token_addresses
+                        .iter()
+                        .position(|token| *token == token_in)
+                        .unwrap_or(0) as i128,
+                    j: pool
+                        .token_addresses
+                        .iter()
+                        .position(|token| *token == token_out)
+                        .unwrap_or(1) as i128,
                     underlying: state.supports_underlying,
                 },
                 crate::types::PoolSpecificState::BalancerWeighted(state) => SplitExtra::Balancer {

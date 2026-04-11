@@ -16,7 +16,11 @@ impl DepegGuard {
         let manual_prices = settings
             .tokens
             .iter()
-            .filter_map(|token| token.manual_price_usd_e8.map(|price| (token.address, price)))
+            .filter_map(|token| {
+                token
+                    .manual_price_usd_e8
+                    .map(|price| (token.address, price))
+            })
             .collect();
         let stable_tokens = settings
             .tokens
@@ -33,10 +37,16 @@ impl DepegGuard {
     }
 
     pub fn stable_routes_allowed(&self) -> bool {
-        self.stable_tokens.iter().all(|token| self.token_is_healthy(*token))
+        self.stable_tokens
+            .iter()
+            .all(|token| self.token_is_healthy(*token))
     }
 
     pub fn token_is_healthy(&self, token: Address) -> bool {
+        if !self.stable_tokens.contains(&token) {
+            return true;
+        }
+
         match self.manual_prices.get(&token).copied() {
             Some(price_e8) => {
                 let cutoff_e8 = (self.stable_depeg_cutoff_e6 as u64) * 100;

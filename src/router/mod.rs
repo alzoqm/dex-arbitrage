@@ -14,9 +14,7 @@ use crate::{
 };
 
 use self::{
-    exact_quoter::ExactQuoter,
-    quantity_search::QuantitySearcher,
-    split_optimizer::SplitOptimizer,
+    exact_quoter::ExactQuoter, quantity_search::QuantitySearcher, split_optimizer::SplitOptimizer,
 };
 
 #[derive(Debug)]
@@ -57,7 +55,11 @@ impl Router {
         }
 
         if let Some(center) = best.as_ref().map(|plan| plan.input_amount) {
-            for amount in self.quantity_searcher.refinement_points(center) {
+            let max_position_raw = self.quantity_searcher.max_position_raw(snapshot, candidate);
+            for amount in self
+                .quantity_searcher
+                .refinement_points(center, max_position_raw)
+            {
                 if let Some(plan) = self.quote_candidate(snapshot, candidate, amount).await? {
                     if best
                         .as_ref()
@@ -101,18 +103,29 @@ impl Router {
         }
 
         let rough_gas_limit = estimate_gas_limit(candidate, &hops);
-        let expected_profit = next_amount as i128 - input_amount as i128;
-        if expected_profit <= 0 {
+        let gross_profit_raw = next_amount as i128 - input_amount as i128;
+        if gross_profit_raw <= 0 {
             return Ok(None);
         }
 
+        // Router only computes raw gross profit; USD conversion and gas costs
+        // are handled later in the Validator
         Ok(Some(ExactPlan {
             snapshot_id: candidate.snapshot_id,
             input_token: candidate.start_token,
             output_token: candidate.start_token,
             input_amount,
             output_amount: next_amount,
-            expected_profit,
+            gross_profit_raw,
+            flash_fee_raw: 0,
+            net_profit_before_gas_raw: gross_profit_raw,
+            contract_min_profit_raw: 0, // Set later in validator
+            input_value_usd_e8: 0,      // Calculated later in validator
+            gross_profit_usd_e8: 0,     // Calculated later in validator
+            flash_fee_usd_e8: 0,
+            gas_cost_usd_e8: 0,
+            net_profit_usd_e8: 0,
+            expected_profit: gross_profit_raw, // Legacy: same as gross profit before capital selection
             gas_limit: rough_gas_limit,
             gas_cost_wei: alloy::primitives::U256::ZERO,
             capital_source: CapitalSource::SelfFunded,
@@ -131,7 +144,9 @@ fn estimate_gas_limit(candidate: &CandidatePath, hops: &[HopPlan]) -> u64 {
             crate::types::AmmKind::CurvePlain => 220_000,
             crate::types::AmmKind::BalancerWeighted => 130_000,
         };
-        gas = gas.saturating_add(base).saturating_add(split_count.saturating_sub(1) * 30_000);
+        gas = gas
+            .saturating_add(base)
+            .saturating_add(split_count.saturating_sub(1) * 30_000);
     }
     gas
 }

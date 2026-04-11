@@ -1,6 +1,9 @@
 use alloy::primitives::U256;
 
-use crate::{amm::{q128_from_f64, weight_log_q32}, types::{CurvePoolState, LiquidityInfo}};
+use crate::{
+    amm::{q128_from_f64, weight_log_q32},
+    types::{CurvePoolState, LiquidityInfo},
+};
 
 pub fn spot_rate(state: &CurvePoolState, i: usize, j: usize) -> (U256, i64, LiquidityInfo) {
     let balance_in = state.balances.get(i).copied().unwrap_or(0);

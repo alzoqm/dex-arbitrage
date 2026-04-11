@@ -1,10 +1,13 @@
 use std::sync::Arc;
 
-use alloy::{primitives::{keccak256, Address, B256}, sol_types::SolCall};
+use alloy::{
+    primitives::{keccak256, Address, B256, U256},
+    sol_types::SolCall,
+};
 use anyhow::{Context, Result};
 
 use crate::{
-    abi::{IBalancerVault, ICurveRegistry, IUniswapV2Factory},
+    abi::{ICurveRegistry, IUniswapV2Factory},
     config::{DexConfig, Settings},
     rpc::RpcClients,
     types::{AmmKind, BlockRef, DiscoveryKind, FinalityLevel},
@@ -53,7 +56,8 @@ impl FactoryScanner {
     }
 
     pub async fn current_block_ref(&self) -> Result<BlockRef> {
-        let (number, hash, parent_hash) = self.rpc.best_read().get_block_by_number("latest").await?;
+        let (number, hash, parent_hash) =
+            self.rpc.best_read().get_block_by_number("latest").await?;
         Ok(BlockRef {
             number,
             hash,
@@ -62,7 +66,11 @@ impl FactoryScanner {
         })
     }
 
-    pub fn spec_for_pool(&self, snapshot: &crate::graph::GraphSnapshot, pool_id: Address) -> Option<DiscoveredPool> {
+    pub fn spec_for_pool(
+        &self,
+        snapshot: &crate::graph::GraphSnapshot,
+        pool_id: Address,
+    ) -> Option<DiscoveredPool> {
         let pool = snapshot.pool(pool_id)?;
         Some(DiscoveredPool {
             address: pool.pool_id,
@@ -80,21 +88,34 @@ impl FactoryScanner {
     }
 
     async fn scan_v2_factory(&self, dex: &DexConfig) -> Result<Vec<DiscoveredPool>> {
-        let Some(factory) = dex.factory else { return Ok(Vec::new()) };
+        let Some(factory) = dex.factory else {
+            return Ok(Vec::new());
+        };
         let data = IUniswapV2Factory::allPairsLengthCall {}.abi_encode();
-        let raw = self.rpc.best_read().eth_call(factory, None, data.into(), "latest").await?;
-        let ret = IUniswapV2Factory::allPairsLengthCall::abi_decode_returns(&raw, true)
+        let raw = self
+            .rpc
+            .best_read()
+            .eth_call(factory, None, data.into(), "latest")
+            .await?;
+        let ret = IUniswapV2Factory::allPairsLengthCall::abi_decode_returns(&raw)
             .context("decode allPairsLength failed")?;
-        let len = u256_to_u64(ret._0);
+        let len = u256_to_u64(ret);
 
         let mut pools = Vec::with_capacity(len as usize);
         for idx in 0..len {
-            let data = IUniswapV2Factory::allPairsCall { index: idx.into() }.abi_encode();
-            let raw = self.rpc.best_read().eth_call(factory, None, data.into(), "latest").await?;
-            let ret = IUniswapV2Factory::allPairsCall::abi_decode_returns(&raw, true)
+            let data = IUniswapV2Factory::allPairsCall {
+                index: U256::saturating_from(idx),
+            }
+            .abi_encode();
+            let raw = self
+                .rpc
+                .best_read()
+                .eth_call(factory, None, data.into(), "latest")
+                .await?;
+            let ret = IUniswapV2Factory::allPairsCall::abi_decode_returns(&raw)
                 .context("decode allPairs failed")?;
             pools.push(DiscoveredPool {
-                address: ret._0,
+                address: ret,
                 dex_name: dex.name.clone(),
                 amm_kind: dex.amm_kind,
                 factory: dex.factory,
@@ -108,7 +129,9 @@ impl FactoryScanner {
     }
 
     async fn scan_v3_factory_logs(&self, dex: &DexConfig) -> Result<Vec<DiscoveredPool>> {
-        let Some(factory) = dex.factory else { return Ok(Vec::new()) };
+        let Some(factory) = dex.factory else {
+            return Ok(Vec::new());
+        };
         let latest = self.latest_block().await?;
         let topic = signature_hash("PoolCreated(address,address,uint24,int24,address)");
         let logs = self
@@ -139,20 +162,33 @@ impl FactoryScanner {
     }
 
     async fn scan_curve_registry(&self, dex: &DexConfig) -> Result<Vec<DiscoveredPool>> {
-        let Some(registry) = dex.registry else { return Ok(Vec::new()) };
+        let Some(registry) = dex.registry else {
+            return Ok(Vec::new());
+        };
         let data = ICurveRegistry::pool_countCall {}.abi_encode();
-        let raw = self.rpc.best_read().eth_call(registry, None, data.into(), "latest").await?;
-        let ret = ICurveRegistry::pool_countCall::abi_decode_returns(&raw, true)
+        let raw = self
+            .rpc
+            .best_read()
+            .eth_call(registry, None, data.into(), "latest")
+            .await?;
+        let ret = ICurveRegistry::pool_countCall::abi_decode_returns(&raw)
             .context("decode curve pool_count failed")?;
-        let len = u256_to_u64(ret._0);
+        let len = u256_to_u64(ret);
         let mut pools = Vec::with_capacity(len as usize);
         for idx in 0..len {
-            let data = ICurveRegistry::pool_listCall { index: idx.into() }.abi_encode();
-            let raw = self.rpc.best_read().eth_call(registry, None, data.into(), "latest").await?;
-            let ret = ICurveRegistry::pool_listCall::abi_decode_returns(&raw, true)
+            let data = ICurveRegistry::pool_listCall {
+                index: U256::saturating_from(idx),
+            }
+            .abi_encode();
+            let raw = self
+                .rpc
+                .best_read()
+                .eth_call(registry, None, data.into(), "latest")
+                .await?;
+            let ret = ICurveRegistry::pool_listCall::abi_decode_returns(&raw)
                 .context("decode curve pool_list failed")?;
             pools.push(DiscoveredPool {
-                address: ret._0,
+                address: ret,
                 dex_name: dex.name.clone(),
                 amm_kind: dex.amm_kind,
                 factory: dex.factory,
@@ -166,7 +202,9 @@ impl FactoryScanner {
     }
 
     async fn scan_balancer_vault_logs(&self, dex: &DexConfig) -> Result<Vec<DiscoveredPool>> {
-        let Some(vault) = dex.vault else { return Ok(Vec::new()) };
+        let Some(vault) = dex.vault else {
+            return Ok(Vec::new());
+        };
         let latest = self.latest_block().await?;
         let topic = signature_hash("PoolRegistered(bytes32,address,uint8)");
         let logs = self

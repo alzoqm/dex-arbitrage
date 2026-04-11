@@ -1,8 +1,4 @@
-use std::{
-    collections::HashSet,
-    sync::Arc,
-    time::Duration,
-};
+use std::{collections::HashSet, sync::Arc, time::Duration};
 
 use alloy::primitives::Address;
 use anyhow::{Context, Result};
@@ -24,7 +20,11 @@ use crate::{
     },
 };
 
-pub async fn run_chain(settings: Arc<Settings>, once: bool, simulate_only_flag: bool) -> Result<()> {
+pub async fn run_chain(
+    settings: Arc<Settings>,
+    once: bool,
+    simulate_only_flag: bool,
+) -> Result<()> {
     let simulate_only = simulate_only_flag || settings.simulation_only;
     validate_runtime_prerequisites(&settings)?;
 
@@ -49,7 +49,10 @@ pub async fn run_chain(settings: Arc<Settings>, once: bool, simulate_only_flag: 
         .context("failed to sync operator nonce")?;
 
     info!(chain = %settings.chain, simulate_only, "bootstrapping discovery");
-    let bootstrap = discovery.bootstrap().await.context("bootstrap discovery failed")?;
+    let bootstrap = discovery
+        .bootstrap()
+        .await
+        .context("bootstrap discovery failed")?;
     info!(
         chain = %settings.chain,
         token_count = bootstrap.tokens.len(),
@@ -85,12 +88,18 @@ pub async fn run_chain(settings: Arc<Settings>, once: bool, simulate_only_flag: 
         .load()
         .block_ref
         .as_ref()
-        .map(|block| block.number.saturating_sub(settings.risk.event_backfill_blocks))
+        .map(|block| {
+            block
+                .number
+                .saturating_sub(settings.risk.event_backfill_blocks)
+        })
         .unwrap_or(0);
 
     loop {
         let snapshot = store.load();
-        let poll_result = event_stream.poll_once(snapshot.as_ref(), poll_from_block).await;
+        let poll_result = event_stream
+            .poll_once(snapshot.as_ref(), poll_from_block)
+            .await;
         let (latest_block, batch) = match poll_result {
             Ok(result) => result,
             Err(err) => {
@@ -108,7 +117,10 @@ pub async fn run_chain(settings: Arc<Settings>, once: bool, simulate_only_flag: 
 
         let changed_specs = collect_changed_specs(snapshot.as_ref(), &batch);
         if changed_specs.is_empty() {
-            debug!(trigger_count = batch.triggers.len(), "no matching pool specs for refresh batch");
+            debug!(
+                trigger_count = batch.triggers.len(),
+                "no matching pool specs for refresh batch"
+            );
             sleep(Duration::from_millis(settings.risk.poll_interval_ms)).await;
             continue;
         }
@@ -188,10 +200,11 @@ async fn process_refresh(
         return Ok(());
     }
 
-    if !depeg_guard.stable_routes_allowed() {
-        warn!("stable depeg guard disabled route processing");
-        return Ok(());
-    }
+    // Removed global depeg gate - now handled at candidate level
+    // if !depeg_guard.stable_routes_allowed() {
+    //     warn!("stable depeg guard disabled route processing");
+    //     return Ok(());
+    // }
 
     let distance_cache = DistanceCache::recompute(snapshot.as_ref());
     let mut candidates = detector.detect(snapshot.as_ref(), &changed_edges, &distance_cache);
@@ -210,6 +223,15 @@ async fn process_refresh(
     );
 
     for candidate in candidates.into_iter().take(32) {
+        // Candidate-level depeg check: reject if path touches unhealthy stable token
+        if !candidate_stables_healthy(&candidate, depeg_guard) {
+            debug!(
+                start_symbol = %candidate.start_symbol,
+                "candidate rejected - touches unhealthy stable token"
+            );
+            continue;
+        }
+
         if let Some(result) = process_candidate(
             settings.clone(),
             snapshot.as_ref(),
@@ -230,6 +252,14 @@ async fn process_refresh(
     Ok(())
 }
 
+/// Check if all stable tokens in the candidate path are healthy
+fn candidate_stables_healthy(candidate: &CandidatePath, depeg_guard: &DepegGuard) -> bool {
+    candidate
+        .path
+        .iter()
+        .all(|hop| depeg_guard.token_is_healthy(hop.from) && depeg_guard.token_is_healthy(hop.to))
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn process_candidate(
     settings: Arc<Settings>,
@@ -246,7 +276,7 @@ async fn process_candidate(
         return Ok(None);
     };
 
-    let Some(mut executable) = validator.prepare(plan).await? else {
+    let Some(mut executable) = validator.prepare(plan, snapshot).await? else {
         return Ok(None);
     };
 
@@ -259,12 +289,18 @@ async fn process_candidate(
         info!(
             chain = %settings.chain,
             snapshot_id = executable.exact.snapshot_id,
-            token = %candidate.start_symbol,
+            anchor_symbol = %candidate.start_symbol,
+            input_token = %candidate.start_token,
             path_len = candidate.path.len(),
             input_amount = executable.exact.input_amount,
             output_amount = executable.exact.output_amount,
-            expected_profit = executable.exact.expected_profit,
-            gas_limit = executable.exact.gas_limit,
+            gross_profit_raw = executable.exact.gross_profit_raw,
+            gross_profit_usd_e8 = executable.exact.gross_profit_usd_e8,
+            flash_fee_raw = executable.exact.flash_fee_raw,
+            flash_fee_usd_e8 = executable.exact.flash_fee_usd_e8,
+            gas_cost_usd_e8 = executable.exact.gas_cost_usd_e8,
+            net_profit_usd_e8 = executable.exact.net_profit_usd_e8,
+            contract_min_profit_raw = executable.exact.contract_min_profit_raw,
             capital_source = ?executable.exact.capital_source,
             "validated opportunity (simulation only)"
         );
@@ -306,9 +342,7 @@ fn all_edge_refs(snapshot: &GraphSnapshot) -> Vec<EdgeRef> {
         .adjacency
         .iter()
         .enumerate()
-        .flat_map(|(from, edges)| {
-            (0..edges.len()).map(move |edge_idx| EdgeRef { from, edge_idx })
-        })
+        .flat_map(|(from, edges)| (0..edges.len()).map(move |edge_idx| EdgeRef { from, edge_idx }))
         .collect()
 }
 
@@ -324,7 +358,9 @@ fn collect_changed_specs(snapshot: &GraphSnapshot, batch: &RefreshBatch) -> Vec<
     let mut seen = HashSet::<Address>::new();
     let mut out = Vec::new();
     for trigger in &batch.triggers {
-        let Some(pool_id) = trigger.pool_id else { continue };
+        let Some(pool_id) = trigger.pool_id else {
+            continue;
+        };
         if !seen.insert(pool_id) {
             continue;
         }

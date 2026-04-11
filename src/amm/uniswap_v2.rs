@@ -1,6 +1,9 @@
 use alloy::primitives::U256;
 
-use crate::{amm::{apply_fee_rate, q128_from_f64, weight_log_q32}, types::{LiquidityInfo, V2PoolState}};
+use crate::{
+    amm::{apply_fee_rate, q128_from_f64, weight_log_q32},
+    types::{LiquidityInfo, V2PoolState},
+};
 
 pub fn quote_exact_in(state: &V2PoolState, zero_for_one: bool, amount_in: u128) -> Option<u128> {
     if amount_in == 0 {
@@ -33,7 +36,11 @@ pub fn spot_rate(state: &V2PoolState, zero_for_one: bool) -> (U256, i64, Liquidi
         (state.reserve1, state.reserve0)
     };
 
-    let raw = if reserve_in == 0 { 0.0 } else { reserve_out as f64 / reserve_in as f64 };
+    let raw = if reserve_in == 0 {
+        0.0
+    } else {
+        reserve_out as f64 / reserve_in as f64
+    };
     let net = apply_fee_rate(raw, state.fee_ppm);
     let capacity = reserve_in / 10;
     let estimated_usd_e8 = (reserve_out.min(reserve_in) as u64).saturating_mul(100);

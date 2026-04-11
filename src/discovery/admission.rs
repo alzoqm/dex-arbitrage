@@ -41,7 +41,9 @@ impl AdmissionEngine {
 
 fn estimated_liquidity_floor_ok(pool: &PoolState) -> bool {
     match &pool.state {
-        PoolSpecificState::UniswapV2Like(state) => state.reserve0 > 10_000 && state.reserve1 > 10_000,
+        PoolSpecificState::UniswapV2Like(state) => {
+            state.reserve0 > 10_000 && state.reserve1 > 10_000
+        }
         PoolSpecificState::UniswapV3Like(state) => state.liquidity > 10_000,
         PoolSpecificState::CurvePlain(state) => state.balances.iter().all(|b| *b > 10_000),
         PoolSpecificState::BalancerWeighted(state) => state.balances.iter().all(|b| *b > 10_000),
