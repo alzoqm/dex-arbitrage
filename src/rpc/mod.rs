@@ -284,6 +284,26 @@ impl RpcClient {
         parse_hex_u64_value(&value)
     }
 
+    pub async fn get_transaction_receipt_status(&self, tx_hash: B256) -> Result<Option<bool>> {
+        let value = self
+            .request("eth_getTransactionReceipt", json!([tx_hash.to_string()]))
+            .await?;
+        parse_receipt_status(&value)
+    }
+
+    pub async fn send_raw_transaction_with_method(
+        &self,
+        method: &str,
+        raw_tx: &str,
+    ) -> Result<B256> {
+        let params = match method {
+            "eth_sendPrivateTransaction" => json!([{ "tx": raw_tx }]),
+            _ => json!([raw_tx]),
+        };
+        let value = self.request(method, params).await?;
+        parse_tx_hash_result(&value)
+    }
+
     pub async fn get_code(&self, address: Address, tag: &str) -> Result<Bytes> {
         let value = self
             .request("eth_getCode", json!([address.to_string(), tag]))
@@ -372,6 +392,28 @@ pub fn parse_hex_u256(value: &Value) -> Result<U256> {
         .with_context(|| format!("invalid hex u256: {text}"))
 }
 
+fn parse_tx_hash_result(value: &Value) -> Result<B256> {
+    if value.is_string() {
+        return parse_b256(value);
+    }
+    if let Some(hash) = value.get("txHash").or_else(|| value.get("transactionHash")) {
+        return parse_b256(hash);
+    }
+    anyhow::bail!("submit result did not contain tx hash: {value}")
+}
+
+fn parse_receipt_status(value: &Value) -> Result<Option<bool>> {
+    if value.is_null() {
+        return Ok(None);
+    }
+    let status = value
+        .get("status")
+        .map(parse_hex_u64)
+        .transpose()?
+        .unwrap_or(1);
+    Ok(Some(status == 1))
+}
+
 fn rpc_compute_units(method: &str) -> u64 {
     match method {
         "net_version" | "eth_chainId" | "eth_syncing" | "eth_protocolVersion" | "net_listening" => {
@@ -400,5 +442,70 @@ fn rpc_compute_units(method: &str) -> u64 {
         "eth_getLogs" | "eth_getFilterLogs" => 60,
         "eth_callMany" => 20,
         _ => 20,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use alloy::primitives::B256;
+    use serde_json::{json, Value};
+
+    use super::{parse_receipt_status, parse_tx_hash_result};
+
+    #[test]
+    fn parses_string_submit_tx_hash() {
+        let hash = B256::from([7u8; 32]);
+
+        assert_eq!(
+            parse_tx_hash_result(&json!(hash.to_string())).unwrap(),
+            hash
+        );
+    }
+
+    #[test]
+    fn parses_object_submit_tx_hash() {
+        let hash = B256::from([8u8; 32]);
+
+        assert_eq!(
+            parse_tx_hash_result(&json!({ "txHash": hash.to_string() })).unwrap(),
+            hash
+        );
+    }
+
+    #[test]
+    fn parses_transaction_hash_submit_tx_hash() {
+        let hash = B256::from([9u8; 32]);
+
+        assert_eq!(
+            parse_tx_hash_result(&json!({ "transactionHash": hash.to_string() })).unwrap(),
+            hash
+        );
+    }
+
+    #[test]
+    fn rejects_missing_submit_tx_hash() {
+        assert!(parse_tx_hash_result(&json!({ "status": "0x1" })).is_err());
+    }
+
+    #[test]
+    fn parses_receipt_status_null_as_pending() {
+        assert_eq!(parse_receipt_status(&Value::Null).unwrap(), None);
+    }
+
+    #[test]
+    fn parses_receipt_status_with_default_success_when_missing_status() {
+        assert_eq!(parse_receipt_status(&json!({})).unwrap(), Some(true));
+    }
+
+    #[test]
+    fn parses_receipt_status_reverted_and_included() {
+        assert_eq!(
+            parse_receipt_status(&json!({ "status": "0x0" })).unwrap(),
+            Some(false)
+        );
+        assert_eq!(
+            parse_receipt_status(&json!({ "status": "0x1" })).unwrap(),
+            Some(true)
+        );
     }
 }
