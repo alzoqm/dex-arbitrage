@@ -1,6 +1,7 @@
 use std::{
     collections::{HashMap, HashSet},
     sync::Arc,
+    time::Duration,
 };
 
 use smallvec::SmallVec;
@@ -16,6 +17,8 @@ use crate::{
 pub struct PathFinder {
     max_hops: usize,
     screening_cutoff_q32: i64,
+    min_pool_confidence_bps: u16,
+    staleness_timeout: Duration,
     tuning: SearchTuning,
 }
 
@@ -42,6 +45,8 @@ impl PathFinder {
         Self {
             max_hops: settings.risk.max_hops,
             screening_cutoff_q32: screening_cutoff_q32(settings.risk.screening_margin_bps),
+            min_pool_confidence_bps: settings.risk.pool_health_min_bps,
+            staleness_timeout: Duration::from_millis(settings.risk.staleness_timeout_ms),
             tuning: SearchTuning {
                 top_k_paths_per_side: search.top_k_paths_per_side,
                 max_virtual_branches_per_node: search.max_virtual_branches_per_node,
@@ -76,8 +81,14 @@ impl PathFinder {
             {
                 continue;
             }
-            let changed_candidate_edges =
-                candidate_pair_edges(snapshot, from, to, self.tuning.max_pair_edges_per_pair);
+            let changed_candidate_edges = candidate_pair_edges(
+                snapshot,
+                from,
+                to,
+                self.tuning.max_pair_edges_per_pair,
+                self.min_pool_confidence_bps,
+                self.staleness_timeout,
+            );
             if changed_candidate_edges.is_empty() {
                 continue;
             }
@@ -220,15 +231,20 @@ impl PathFinder {
             let mut next_frontier = Vec::new();
             for current in &frontier {
                 let current_node = *current.tokens.last().expect("path always has a node");
-                for edge_ref in
-                    virtual_outgoing(snapshot, current_node, self.tuning.max_pair_edges_per_pair)
-                        .into_iter()
-                        .take(self.tuning.max_virtual_branches_per_node)
+                for edge_ref in virtual_outgoing(
+                    snapshot,
+                    current_node,
+                    self.tuning.max_pair_edges_per_pair,
+                    self.min_pool_confidence_bps,
+                    self.staleness_timeout,
+                )
+                .into_iter()
+                .take(self.tuning.max_virtual_branches_per_node)
                 {
                     let Some(edge) = snapshot.edge(edge_ref) else {
                         continue;
                     };
-                    if !edge_is_usable(edge) {
+                    if !edge_is_usable(edge, self.min_pool_confidence_bps, self.staleness_timeout) {
                         continue;
                     }
                     if current.tokens.contains(&edge.to) {
@@ -351,13 +367,15 @@ fn virtual_outgoing(
     snapshot: &GraphSnapshot,
     vertex: usize,
     max_pair_edges_per_pair: usize,
+    min_confidence_bps: u16,
+    staleness_timeout: Duration,
 ) -> Vec<EdgeRef> {
     let mut by_to = HashMap::<usize, Vec<EdgeRef>>::new();
     for edge_ref in pruning::ranked_outgoing(snapshot, vertex) {
         let Some(edge) = snapshot.edge(edge_ref) else {
             continue;
         };
-        if !edge_is_usable(edge) {
+        if !edge_is_usable(edge, min_confidence_bps, staleness_timeout) {
             continue;
         }
         by_to.entry(edge.to).or_default().push(edge_ref);
@@ -378,6 +396,8 @@ fn candidate_pair_edges(
     from: usize,
     to: usize,
     max_pair_edges_per_pair: usize,
+    min_confidence_bps: u16,
+    staleness_timeout: Duration,
 ) -> Vec<EdgeRef> {
     let Some(edges) = snapshot.pair_to_edges.get(&(from, to)) else {
         return Vec::new();
@@ -388,7 +408,7 @@ fn candidate_pair_edges(
         .filter(|edge_ref| {
             snapshot
                 .edge(*edge_ref)
-                .map(edge_is_usable)
+                .map(|edge| edge_is_usable(edge, min_confidence_bps, staleness_timeout))
                 .unwrap_or(false)
         })
         .collect::<Vec<_>>();
@@ -428,8 +448,9 @@ fn compare_edge_refs(
         .then_with(|| a.pool_id.cmp(&b.pool_id))
 }
 
-fn edge_is_usable(edge: &Edge) -> bool {
-    !edge.pool_health.paused && !edge.pool_health.quarantined && !edge.pool_health.stale
+fn edge_is_usable(edge: &Edge, min_confidence_bps: u16, staleness_timeout: Duration) -> bool {
+    edge.pool_health
+        .healthy(min_confidence_bps, staleness_timeout)
 }
 
 fn forms_simple_cycle(prefix: &SearchPath, changed_to: usize, suffix: &SearchPath) -> bool {

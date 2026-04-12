@@ -28,7 +28,7 @@ pub struct EventStream {
     settings: Arc<Settings>,
     rpc: Arc<RpcClients>,
     ws_started: AtomicBool,
-    ws_rx: Arc<Mutex<Option<mpsc::UnboundedReceiver<RpcLog>>>>,
+    ws_rx: Arc<Mutex<Option<mpsc::Receiver<RpcLog>>>>,
 }
 
 impl EventStream {
@@ -52,14 +52,19 @@ impl EventStream {
         }
 
         if matches!(event_ingest_mode(), EventIngestMode::Wss) {
-            let logs = self
-                .poll_logs(from_block + 1, from_block + 1, &addresses, &event_topics())
-                .await?;
-            let latest = logs
-                .iter()
-                .filter_map(|log| log.block_number)
-                .max()
-                .unwrap_or(from_block);
+            let latest = self.rpc.best_read().block_number().await?;
+            self.start_wss(&addresses, &event_topics());
+            let mut logs = if latest > from_block {
+                self.get_address_logs_chunked(from_block + 1, latest, &addresses, &event_topics())
+                    .await?
+            } else {
+                Vec::new()
+            };
+            logs.extend(filter_watched_logs(
+                self.drain_wss_logs(),
+                &addresses,
+                &event_topics(),
+            ));
             let batch = self.build_refresh_batch(snapshot, logs);
             return Ok((latest, batch));
         }
@@ -85,7 +90,7 @@ impl EventStream {
     ) -> Result<Vec<RpcLog>> {
         match event_ingest_mode() {
             EventIngestMode::Wss => {
-                self.start_wss(topics);
+                self.start_wss(addresses, topics);
                 Ok(filter_watched_logs(
                     self.drain_wss_logs(),
                     addresses,
@@ -129,7 +134,7 @@ impl EventStream {
         }
     }
 
-    fn start_wss(&self, topics: &[B256]) {
+    fn start_wss(&self, addresses: &[Address], topics: &[B256]) {
         if self.ws_started.swap(true, Ordering::SeqCst) {
             return;
         }
@@ -138,10 +143,16 @@ impl EventStream {
             return;
         };
         let topics = topics.to_vec();
-        let (tx, rx) = mpsc::unbounded_channel();
+        let addresses = addresses.to_vec();
+        let capacity = std::env::var("EVENT_WSS_CHANNEL_CAPACITY")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(16_384);
+        let (tx, rx) = mpsc::channel(capacity);
         *self.ws_rx.lock() = Some(rx);
         tokio::spawn(async move {
-            if let Err(err) = run_wss_log_subscription(ws_url, topics, tx).await {
+            if let Err(err) = run_wss_log_subscription(ws_url, addresses, topics, tx).await {
                 warn!(error = %err, "WSS log subscription stopped");
             }
         });
@@ -316,7 +327,7 @@ enum EventIngestMode {
 
 fn event_ingest_mode() -> EventIngestMode {
     match std::env::var("EVENT_INGEST_MODE")
-        .unwrap_or_else(|_| "block_receipts".to_string())
+        .unwrap_or_else(|_| "address_logs".to_string())
         .to_ascii_lowercase()
         .as_str()
     {
@@ -329,13 +340,14 @@ fn event_ingest_mode() -> EventIngestMode {
 
 async fn run_wss_log_subscription(
     ws_url: String,
+    addresses: Vec<Address>,
     topics: Vec<B256>,
-    tx: mpsc::UnboundedSender<RpcLog>,
+    tx: mpsc::Sender<RpcLog>,
 ) -> Result<()> {
     let provider = ProviderBuilder::new()
         .connect_ws(WsConnect::new(ws_url))
         .await?;
-    let filter = Filter::new().event_signature(topics);
+    let filter = Filter::new().address(addresses).event_signature(topics);
     let sub = provider.subscribe_logs(&filter).await?;
     let mut stream = sub.into_stream();
     while let Some(log) = stream.next().await {
@@ -347,7 +359,7 @@ async fn run_wss_log_subscription(
             block_hash: log.block_hash,
             tx_hash: log.transaction_hash,
         };
-        if tx.send(rpc_log).is_err() {
+        if tx.send(rpc_log).await.is_err() {
             break;
         }
     }
@@ -585,7 +597,11 @@ fn word_u128_at_offset(data: &[u8], byte_offset: usize) -> Option<u128> {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::HashMap, time::SystemTime};
+    use std::{
+        collections::HashMap,
+        sync::{Mutex, OnceLock},
+        time::SystemTime,
+    };
 
     use alloy::primitives::{Address, Bytes, B256};
 
@@ -598,6 +614,8 @@ mod tests {
     };
 
     use super::*;
+
+    static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
     #[test]
     fn decodes_v2_sync_as_pool_state_patch() {
@@ -653,6 +671,63 @@ mod tests {
         assert_eq!(reserve0, 123);
         assert_eq!(reserve1, 456);
         assert_eq!(block_number, Some(10));
+    }
+
+    #[test]
+    fn filter_watched_logs_requires_matching_address_and_topic() {
+        let watched_address = addr(7);
+        let watched_topic =
+            signature_hash("Swap(address,address,int256,int256,uint160,uint128,int24)");
+        let ignored_topic = signature_hash("Sync(uint112,uint112)");
+        let logs = vec![
+            RpcLog {
+                address: watched_address,
+                topics: vec![watched_topic],
+                data: Bytes::new(),
+                block_number: Some(1),
+                block_hash: None,
+                tx_hash: None,
+            },
+            RpcLog {
+                address: watched_address,
+                topics: vec![ignored_topic],
+                data: Bytes::new(),
+                block_number: Some(2),
+                block_hash: None,
+                tx_hash: None,
+            },
+            RpcLog {
+                address: addr(8),
+                topics: vec![watched_topic],
+                data: Bytes::new(),
+                block_number: Some(3),
+                block_hash: None,
+                tx_hash: None,
+            },
+        ];
+
+        let filtered = filter_watched_logs(logs, &[watched_address], &[watched_topic]);
+
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].block_number, Some(1));
+        assert_eq!(filtered[0].address, watched_address);
+    }
+
+    #[test]
+    fn event_ingest_mode_defaults_to_address_logs_when_unset() {
+        let _guard = ENV_LOCK.get_or_init(Mutex::default).lock().unwrap();
+        let key = "EVENT_INGEST_MODE";
+        let previous = std::env::var_os(key);
+        std::env::remove_var(key);
+
+        let mode = event_ingest_mode();
+
+        match previous {
+            Some(value) => std::env::set_var(key, value),
+            None => std::env::remove_var(key),
+        }
+
+        assert!(matches!(mode, EventIngestMode::AddressLogs));
     }
 
     #[test]

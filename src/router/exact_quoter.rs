@@ -40,7 +40,7 @@ impl ExactQuoter {
             curve_underlying_support: Arc::new(Mutex::new(HashMap::new())),
             use_v3_rpc_quoter: std::env::var("USE_V3_RPC_QUOTER")
                 .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
-                .unwrap_or(false),
+                .unwrap_or(true),
         }
     }
 
@@ -63,23 +63,39 @@ impl ExactQuoter {
             return Ok(cached);
         }
 
-        let i = pool
+        let Some(i) = pool
             .token_addresses
             .iter()
             .position(|token| *token == token_in)
-            .unwrap_or(0);
-        let j = pool
+        else {
+            self.insert_quote(cache_key, 0);
+            return Ok(0);
+        };
+        let Some(j) = pool
             .token_addresses
             .iter()
             .position(|token| *token == token_out)
-            .unwrap_or(0);
+        else {
+            self.insert_quote(cache_key, 0);
+            return Ok(0);
+        };
+        if i == j {
+            self.insert_quote(cache_key, 0);
+            return Ok(0);
+        }
 
         let out = match &pool.state {
             PoolSpecificState::UniswapV2Like(state) => {
-                let zero_for_one = pool.token_addresses.first().copied() == Some(token_in);
+                if pool.token_addresses.len() != 2 {
+                    return Ok(0);
+                }
+                let zero_for_one = i == 0 && j == 1;
                 amm::uniswap_v2::quote_exact_in(state, zero_for_one, amount_in).unwrap_or(0)
             }
             PoolSpecificState::UniswapV3Like(state) => {
+                if pool.token_addresses.len() != 2 {
+                    return Ok(0);
+                }
                 if self.use_v3_rpc_quoter {
                     if let Some(quoter) = pool.quoter {
                         let raw = self
@@ -89,11 +105,13 @@ impl ExactQuoter {
                                 quoter,
                                 None,
                                 IV3QuoterV2::quoteExactInputSingleCall {
-                                    tokenIn: token_in,
-                                    tokenOut: token_out,
-                                    fee: Uint::<24, 1>::saturating_from(state.fee),
-                                    amountIn: U256::saturating_from(amount_in),
-                                    sqrtPriceLimitX96: U160::ZERO,
+                                    params: IV3QuoterV2::QuoteExactInputSingleParams {
+                                        tokenIn: token_in,
+                                        tokenOut: token_out,
+                                        amountIn: U256::saturating_from(amount_in),
+                                        fee: Uint::<24, 1>::saturating_from(state.fee),
+                                        sqrtPriceLimitX96: U160::ZERO,
+                                    },
                                 }
                                 .abi_encode()
                                 .into(),
@@ -101,13 +119,13 @@ impl ExactQuoter {
                             )
                             .await?;
                         let ret = IV3QuoterV2::quoteExactInputSingleCall::abi_decode_returns(&raw)?;
-                        u256_to_u128(ret)
+                        u256_to_u128(ret.amountOut)
                     } else {
-                        let zero_for_one = pool.token_addresses.first().copied() == Some(token_in);
+                        let zero_for_one = i == 0 && j == 1;
                         amm::uniswap_v3::fallback_quote(state, zero_for_one, amount_in)
                     }
                 } else {
-                    let zero_for_one = pool.token_addresses.first().copied() == Some(token_in);
+                    let zero_for_one = i == 0 && j == 1;
                     amm::uniswap_v3::fallback_quote(state, zero_for_one, amount_in)
                 }
             }

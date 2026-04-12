@@ -392,6 +392,100 @@ fn detector_can_skip_unusable_parallel_edge_for_same_pair() {
         .any(|candidate| candidate.cycle_key.contains(&addr(61).to_string())));
 }
 
+#[test]
+fn detector_filters_low_confidence_edges() {
+    let tokens = vec![
+        token_with_anchor("A", addr(70), 18, false, true),
+        token("X", addr(71), 18, false),
+        token("Y", addr(72), 18, false),
+    ];
+    let mut adjacency = vec![Vec::new(); tokens.len()];
+    let mut reverse_adj = vec![Vec::new(); tokens.len()];
+    let mut pair_to_edges = HashMap::new();
+    let mut pool_to_edges = HashMap::new();
+    let mut pool_nonce = 230u8;
+
+    let mut low_confidence = health();
+    low_confidence.confidence_bps = 1_000;
+    let low_ref = add_manual_edge_with(
+        &mut adjacency,
+        &mut reverse_adj,
+        &mut pair_to_edges,
+        &mut pool_to_edges,
+        &mut pool_nonce,
+        0,
+        1,
+        low_confidence,
+        -10_000_000,
+        10_000_000,
+    );
+    let low_pool = adjacency[low_ref.from][low_ref.edge_idx].pool_id;
+    add_manual_edge_with(
+        &mut adjacency,
+        &mut reverse_adj,
+        &mut pair_to_edges,
+        &mut pool_to_edges,
+        &mut pool_nonce,
+        0,
+        1,
+        health(),
+        -1_000_000,
+        1_000_000,
+    );
+    add_manual_edge(
+        &mut adjacency,
+        &mut reverse_adj,
+        &mut pair_to_edges,
+        &mut pool_to_edges,
+        &mut pool_nonce,
+        1,
+        2,
+    );
+    add_manual_edge(
+        &mut adjacency,
+        &mut reverse_adj,
+        &mut pair_to_edges,
+        &mut pool_to_edges,
+        &mut pool_nonce,
+        2,
+        0,
+    );
+
+    let changed_edges = adjacency
+        .iter()
+        .enumerate()
+        .flat_map(|(from, edges)| (0..edges.len()).map(move |edge_idx| EdgeRef { from, edge_idx }))
+        .collect::<Vec<_>>();
+    let token_to_index = tokens
+        .iter()
+        .enumerate()
+        .map(|(idx, token)| (token.address, idx))
+        .collect();
+    let snapshot = GraphSnapshot {
+        snapshot_id: 1,
+        block_ref: None,
+        tokens,
+        token_to_index,
+        stable_token_indices: Vec::new(),
+        cycle_anchor_indices: vec![0],
+        adjacency,
+        reverse_adj,
+        pools: HashMap::new(),
+        pool_to_edges,
+        pair_to_edges,
+    };
+    let distance_cache = DistanceCache::recompute(&snapshot);
+    let detector = Detector::new(settings());
+
+    let candidates = detector.detect(&snapshot, &changed_edges, &distance_cache);
+
+    assert!(!candidates.is_empty());
+    assert!(candidates
+        .iter()
+        .flat_map(|candidate| candidate.path.iter())
+        .all(|hop| hop.pool_id != low_pool));
+}
+
 fn manual_parallel_snapshot(parallel_pools: usize) -> (GraphSnapshot, Vec<EdgeRef>) {
     let tokens = vec![
         token_with_anchor("A", addr(50), 18, false, true),

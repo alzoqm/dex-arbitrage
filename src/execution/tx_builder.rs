@@ -97,7 +97,10 @@ fn encode_extra(extra: &SplitExtra) -> Bytes {
             out[28..32].copy_from_slice(&fee_ppm.to_be_bytes());
             out.into()
         }
-        SplitExtra::V3 { .. } => Bytes::new(),
+        SplitExtra::V3 {
+            sqrt_price_limit_x96,
+            ..
+        } => sqrt_price_limit_x96.to_be_bytes::<32>().to_vec().into(),
         SplitExtra::Curve { i, j, underlying } => {
             let mut out = Vec::new();
             out.extend_from_slice(&i.to_be_bytes());
@@ -106,5 +109,56 @@ fn encode_extra(extra: &SplitExtra) -> Bytes {
             out.into()
         }
         SplitExtra::Balancer { pool_id } => pool_id.as_slice().to_vec().into(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use alloy::primitives::{Bytes, U256};
+
+    use crate::types::SplitExtra;
+
+    use super::encode_extra;
+
+    #[test]
+    fn v3_extra_encodes_sqrt_price_limit() {
+        let raw = encode_extra(&SplitExtra::V3 {
+            zero_for_one: true,
+            sqrt_price_limit_x96: U256::from(123u64),
+        });
+        let bytes: &[u8] = raw.as_ref();
+
+        assert_eq!(bytes.len(), 32);
+        assert_eq!(U256::from_be_slice(bytes), U256::from(123u64));
+    }
+
+    #[test]
+    fn none_extra_stays_empty() {
+        let raw: Bytes = encode_extra(&SplitExtra::None);
+        assert!(raw.is_empty());
+    }
+
+    #[test]
+    fn v3_extra_encodes_zero_as_full_width_big_endian() {
+        let raw = encode_extra(&SplitExtra::V3 {
+            zero_for_one: false,
+            sqrt_price_limit_x96: U256::ZERO,
+        });
+        let bytes: &[u8] = raw.as_ref();
+
+        assert_eq!(bytes.len(), 32);
+        assert!(bytes.iter().all(|byte| *byte == 0));
+    }
+
+    #[test]
+    fn v3_extra_encodes_max_value_without_truncation() {
+        let raw = encode_extra(&SplitExtra::V3 {
+            zero_for_one: true,
+            sqrt_price_limit_x96: U256::MAX,
+        });
+        let bytes: &[u8] = raw.as_ref();
+
+        assert_eq!(bytes.len(), 32);
+        assert!(bytes.iter().all(|byte| *byte == 0xff));
     }
 }

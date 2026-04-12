@@ -206,7 +206,7 @@ impl PoolFetcher {
                 balances,
                 amp: u256_to_u128(amp_ret),
                 fee: u256_to_u128(fee_ret).min(u32::MAX as u128) as u32,
-                supports_underlying: true,
+                supports_underlying: false,
             }),
             last_updated_block: block_number.unwrap_or_default(),
             extras: HashMap::new(),

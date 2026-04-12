@@ -172,23 +172,37 @@ impl SplitOptimizer {
                 crate::types::PoolSpecificState::UniswapV2Like(state) => SplitExtra::V2 {
                     fee_ppm: state.fee_ppm,
                 },
-                crate::types::PoolSpecificState::UniswapV3Like(_) => SplitExtra::V3 {
-                    zero_for_one: pool.token_addresses.first().copied() == Some(token_in),
-                    sqrt_price_limit_x96: alloy::primitives::U256::ZERO,
-                },
-                crate::types::PoolSpecificState::CurvePlain(state) => SplitExtra::Curve {
-                    i: pool
+                crate::types::PoolSpecificState::UniswapV3Like(state) => {
+                    let zero_for_one = pool.token_addresses.first().copied() == Some(token_in);
+                    SplitExtra::V3 {
+                        zero_for_one,
+                        sqrt_price_limit_x96: v3_sqrt_price_limit(
+                            state.sqrt_price_x96,
+                            zero_for_one,
+                        ),
+                    }
+                }
+                crate::types::PoolSpecificState::CurvePlain(state) => {
+                    let Some(i) = pool
                         .token_addresses
                         .iter()
                         .position(|token| *token == token_in)
-                        .unwrap_or(0) as i128,
-                    j: pool
+                    else {
+                        continue;
+                    };
+                    let Some(j) = pool
                         .token_addresses
                         .iter()
                         .position(|token| *token == token_out)
-                        .unwrap_or(1) as i128,
-                    underlying: state.supports_underlying,
-                },
+                    else {
+                        continue;
+                    };
+                    SplitExtra::Curve {
+                        i: i as i128,
+                        j: j as i128,
+                        underlying: state.supports_underlying,
+                    }
+                }
                 crate::types::PoolSpecificState::BalancerWeighted(state) => SplitExtra::Balancer {
                     pool_id: state.pool_id,
                 },
@@ -246,4 +260,31 @@ fn ranked_pair_edges(
     });
     edge_refs.truncate(max_edges);
     edge_refs
+}
+
+fn v3_sqrt_price_limit(
+    current: alloy::primitives::U256,
+    zero_for_one: bool,
+) -> alloy::primitives::U256 {
+    let bps = std::env::var("V3_SQRT_PRICE_LIMIT_BPS")
+        .ok()
+        .and_then(|value| value.parse::<u128>().ok())
+        .filter(|value| *value < 10_000)
+        .unwrap_or(50);
+    if bps == 0 || current.is_zero() {
+        return alloy::primitives::U256::ZERO;
+    }
+
+    let denominator = alloy::primitives::U256::from(10_000u64);
+    let numerator = if zero_for_one {
+        alloy::primitives::U256::from(10_000u128.saturating_sub(bps))
+    } else {
+        alloy::primitives::U256::from(10_000u128.saturating_add(bps))
+    };
+    let limit = current.saturating_mul(numerator) / denominator;
+    if zero_for_one {
+        limit.max(alloy::primitives::U256::from(4_295_128_740u64))
+    } else {
+        limit
+    }
 }

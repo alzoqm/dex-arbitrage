@@ -217,6 +217,7 @@ impl DiscoveryManager {
             .iter()
             .map(|token| token.address)
             .collect::<std::collections::HashSet<_>>();
+        let metadata_cache_len = self.token_metadata_cache.lock().len();
 
         for pool in pools {
             for address in pool.token_addresses.iter().copied() {
@@ -269,6 +270,10 @@ impl DiscoveryManager {
             });
         }
 
+        if self.token_metadata_cache.lock().len() != metadata_cache_len {
+            self.save_token_metadata_cache();
+        }
+
         Ok(())
     }
 
@@ -302,22 +307,47 @@ impl DiscoveryManager {
             .await?;
         let reserves = IAavePool::getReservesListCall::abi_decode_returns(&raw)?;
         let mut out = HashMap::new();
-        for asset in reserves {
-            let raw = self
-                .rpc
-                .best_read()
-                .eth_call(
+        let calls = reserves
+            .iter()
+            .copied()
+            .map(|asset| {
+                (
                     aave_pool,
-                    None,
-                    IAavePool::getConfigurationCall { asset }
-                        .abi_encode()
-                        .into(),
-                    "latest",
+                    IAavePool::getConfigurationCall { asset }.abi_encode(),
                 )
-                .await?;
-            let config = IAavePool::getConfigurationCall::abi_decode_returns(&raw)?;
-            if reserve_accepts_flash_loan(config.data) {
-                out.insert(asset, ());
+            })
+            .collect::<Vec<_>>();
+        match multicall::aggregate3(&self.rpc, calls).await {
+            Ok(results) => {
+                for (asset, raw) in reserves.into_iter().zip(results.into_iter()) {
+                    let Some(raw) = raw else {
+                        continue;
+                    };
+                    let config = IAavePool::getConfigurationCall::abi_decode_returns(&raw)?;
+                    if reserve_accepts_flash_loan(config.data) {
+                        out.insert(asset, ());
+                    }
+                }
+            }
+            Err(_) => {
+                for asset in reserves {
+                    let raw = self
+                        .rpc
+                        .best_read()
+                        .eth_call(
+                            aave_pool,
+                            None,
+                            IAavePool::getConfigurationCall { asset }
+                                .abi_encode()
+                                .into(),
+                            "latest",
+                        )
+                        .await?;
+                    let config = IAavePool::getConfigurationCall::abi_decode_returns(&raw)?;
+                    if reserve_accepts_flash_loan(config.data) {
+                        out.insert(asset, ());
+                    }
+                }
             }
         }
         *self.aave_cache.lock() = Some(AaveReserveCache {
@@ -340,13 +370,16 @@ impl DiscoveryManager {
         self.token_metadata_cache
             .lock()
             .insert(address, metadata.clone());
+        metadata
+    }
+
+    fn save_token_metadata_cache(&self) {
         TokenMetadataCache::from_map(
             self.settings.chain_id,
             self.token_metadata_cache.lock().clone(),
         )
         .save(&self.settings)
         .ok();
-        metadata
     }
 
     async fn fetch_token_symbol(&self, address: Address) -> Option<String> {
@@ -478,8 +511,10 @@ fn apply_pool_patch(
 
     if applied {
         pool.last_updated_block = block_number.unwrap_or(pool.last_updated_block);
-        pool.health =
-            patched_health(block_number.unwrap_or(pool.health.last_successful_refresh_block));
+        pool.health = patched_health(
+            &pool.health,
+            block_number.unwrap_or(pool.health.last_successful_refresh_block),
+        );
     }
     applied
 }
@@ -492,15 +527,15 @@ fn apply_i128_delta(value: u128, delta: i128) -> u128 {
     }
 }
 
-fn patched_health(block_number: u64) -> PoolHealth {
+fn patched_health(previous: &PoolHealth, block_number: u64) -> PoolHealth {
     PoolHealth {
         stale: false,
-        paused: false,
-        quarantined: false,
-        confidence_bps: 10_000,
+        paused: previous.paused,
+        quarantined: previous.quarantined,
+        confidence_bps: previous.confidence_bps,
         last_successful_refresh_block: block_number,
         last_refresh_at: SystemTime::now(),
-        recent_revert_count: 0,
+        recent_revert_count: previous.recent_revert_count,
     }
 }
 
@@ -709,9 +744,10 @@ fn reserve_accepts_flash_loan(config_data: U256) -> bool {
 
 fn apply_aave_flash_reserves(tokens: &mut [TokenInfo], flash_reserves: &HashMap<Address, ()>) {
     for token in tokens {
-        let flash_loan_enabled = flash_reserves.contains_key(&token.address);
-        token.is_cycle_anchor = flash_loan_enabled;
-        token.flash_loan_enabled = flash_loan_enabled;
+        if flash_reserves.contains_key(&token.address) {
+            token.is_cycle_anchor = true;
+            token.flash_loan_enabled = true;
+        }
     }
 }
 
@@ -897,6 +933,10 @@ fn derive_price_from_balances(
 
 #[cfg(test)]
 mod tests {
+    use std::time::SystemTime;
+
+    use crate::types::{AmmKind, PoolAdmissionStatus, V2PoolState};
+
     use super::*;
 
     #[test]
@@ -935,7 +975,7 @@ mod tests {
     }
 
     #[test]
-    fn aave_reserves_are_the_only_cycle_anchors() {
+    fn aave_reserves_are_added_as_cycle_anchors_without_resetting_configured_anchors() {
         let reserve = Address::from_slice(&[1u8; 20]);
         let non_reserve = Address::from_slice(&[2u8; 20]);
         let mut tokens = vec![
@@ -972,7 +1012,91 @@ mod tests {
 
         assert!(tokens[0].is_cycle_anchor);
         assert!(tokens[0].flash_loan_enabled);
-        assert!(!tokens[1].is_cycle_anchor);
-        assert!(!tokens[1].flash_loan_enabled);
+        assert!(tokens[1].is_cycle_anchor);
+        assert!(tokens[1].flash_loan_enabled);
+    }
+
+    #[test]
+    fn patched_health_preserves_previous_health_flags_and_confidence() {
+        let previous = PoolHealth {
+            stale: true,
+            paused: true,
+            quarantined: true,
+            confidence_bps: 7_500,
+            last_successful_refresh_block: 12,
+            last_refresh_at: SystemTime::now(),
+            recent_revert_count: 4,
+        };
+
+        let patched = patched_health(&previous, 99);
+
+        assert!(!patched.stale);
+        assert!(patched.paused);
+        assert!(patched.quarantined);
+        assert_eq!(patched.confidence_bps, previous.confidence_bps);
+        assert_eq!(patched.last_successful_refresh_block, 99);
+        assert_eq!(patched.recent_revert_count, previous.recent_revert_count);
+    }
+
+    #[test]
+    fn apply_pool_patch_keeps_health_flags_when_refreshing_pool_state() {
+        let pool_id = Address::from_slice(&[9u8; 20]);
+        let token0 = Address::from_slice(&[1u8; 20]);
+        let token1 = Address::from_slice(&[2u8; 20]);
+        let mut pool = PoolState {
+            pool_id,
+            dex_name: "uniswap".to_string(),
+            kind: AmmKind::UniswapV2Like,
+            token_addresses: vec![token0, token1],
+            token_symbols: vec!["A".to_string(), "B".to_string()],
+            factory: None,
+            registry: None,
+            vault: None,
+            quoter: None,
+            admission_status: PoolAdmissionStatus::Allowed,
+            health: PoolHealth {
+                stale: true,
+                paused: true,
+                quarantined: true,
+                confidence_bps: 6_250,
+                last_successful_refresh_block: 8,
+                last_refresh_at: SystemTime::now(),
+                recent_revert_count: 2,
+            },
+            state: PoolSpecificState::UniswapV2Like(V2PoolState {
+                reserve0: 10,
+                reserve1: 20,
+                fee_ppm: 3_000,
+            }),
+            last_updated_block: 8,
+            extras: HashMap::new(),
+        };
+
+        let applied = apply_pool_patch(
+            &mut pool,
+            PoolStatePatch::UniswapV2Sync {
+                pool_id,
+                reserve0: 111,
+                reserve1: 222,
+                block_number: Some(99),
+            },
+            None,
+        );
+
+        assert!(applied);
+        match pool.state {
+            PoolSpecificState::UniswapV2Like(ref state) => {
+                assert_eq!(state.reserve0, 111);
+                assert_eq!(state.reserve1, 222);
+            }
+            _ => panic!("expected v2 state"),
+        }
+        assert_eq!(pool.last_updated_block, 99);
+        assert!(!pool.health.stale);
+        assert!(pool.health.paused);
+        assert!(pool.health.quarantined);
+        assert_eq!(pool.health.confidence_bps, 6_250);
+        assert_eq!(pool.health.last_successful_refresh_block, 99);
+        assert_eq!(pool.health.recent_revert_count, 2);
     }
 }
