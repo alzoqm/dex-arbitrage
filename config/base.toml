@@ -15,7 +15,7 @@ max_flash_loan_default = 10000000000
 daily_loss_limit_default = -50000000
 pool_health_min_bps = 9000
 stable_depeg_cutoff_e6 = 995000
-strict_target_allowlist = false
+strict_target_allowlist = true
 
 [policy]
 venues = []
@@ -113,7 +113,7 @@ registry_env = ""
 vault_env = ""
 fee_ppm = 2000
 start_block = 0
-enabled = true
+enabled = false
 
 [[dexes]]
 name = "uniswap_v3"
@@ -137,7 +137,7 @@ registry_env = ""
 vault_env = ""
 fee_ppm = 0
 start_block = 0
-enabled = true
+enabled = false
 
 [[dexes]]
 name = "curve"
