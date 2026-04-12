@@ -9,7 +9,11 @@ use crate::{
     config::Settings,
     detector::Detector,
     discovery::{factory_scanner::DiscoveredPool, DiscoveryManager},
-    execution::{nonce_manager::NonceManager, submitter::Submitter, validator::Validator},
+    execution::{
+        nonce_manager::NonceManager,
+        submitter::{ReceiptOutcome, Submitter},
+        validator::Validator,
+    },
     graph::{DistanceCache, GraphSnapshot, GraphStore},
     risk::limits::RiskManager,
     router::Router,
@@ -35,7 +39,7 @@ pub async fn run_chain(
     let detector = Detector::new(settings.clone());
     let router = Router::new(settings.clone(), rpc.clone());
     let validator = Validator::new(settings.clone(), rpc.clone());
-    let submitter = Submitter::new(settings.clone());
+    let submitter = Submitter::new(settings.clone(), rpc.clone());
     let risk = RiskManager::new(&settings);
     let nonce_manager = NonceManager::new();
 
@@ -294,9 +298,31 @@ async fn process_candidate(
         Ok(result) => {
             nonce_manager.mark_submitted(executable.nonce);
             risk.on_submission_result(&result);
-            // Receipt tracking is intentionally left external; release the local slot immediately.
-            risk.mark_finalized(0);
-            Ok(Some(result))
+            match submitter.wait_for_receipt(result.tx_hash).await {
+                Ok(ReceiptOutcome::Included) => {
+                    nonce_manager.mark_included(executable.nonce);
+                    risk.mark_finalized(0);
+                    Ok(Some(result))
+                }
+                Ok(ReceiptOutcome::Reverted) => {
+                    nonce_manager.mark_included(executable.nonce);
+                    risk.mark_finalized(-executable.exact.gas_cost_usd_e8);
+                    warn!(tx_hash = %result.tx_hash, nonce = executable.nonce, "submitted transaction reverted");
+                    Ok(None)
+                }
+                Ok(ReceiptOutcome::TimedOut) => {
+                    nonce_manager.mark_dropped(executable.nonce);
+                    risk.mark_failed_submission();
+                    warn!(tx_hash = %result.tx_hash, nonce = executable.nonce, "submitted transaction receipt wait timed out");
+                    Ok(None)
+                }
+                Err(err) => {
+                    nonce_manager.mark_dropped(executable.nonce);
+                    risk.mark_failed_submission();
+                    warn!(error = %err, tx_hash = %result.tx_hash, nonce = executable.nonce, "failed while waiting for transaction receipt");
+                    Ok(None)
+                }
+            }
         }
         Err(err) => {
             nonce_manager.mark_dropped(executable.nonce);
@@ -313,9 +339,6 @@ fn validate_runtime_prerequisites(settings: &Settings) -> Result<()> {
     }
     if settings.contracts.executor_address.is_none() {
         anyhow::bail!("chain executor address env is required");
-    }
-    if settings.contracts.aave_pool.is_none() {
-        anyhow::bail!("chain Aave pool env is required");
     }
     Ok(())
 }

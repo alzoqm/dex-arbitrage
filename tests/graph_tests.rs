@@ -85,3 +85,38 @@ fn graph_snapshot_builds_pair_and_pool_indices() {
     assert_eq!(snapshot.pair_edges(addr(2), addr(1)).len(), 1);
     assert!(snapshot.pool_to_edges.contains_key(&addr(10)));
 }
+
+#[test]
+fn graph_cycle_anchors_use_cycle_anchor_flag_not_flash_flag() {
+    let cycle_anchor = TokenInfo {
+        address: addr(3),
+        symbol: "DAI".to_string(),
+        decimals: 18,
+        is_stable: true,
+        is_cycle_anchor: true,
+        flash_loan_enabled: false,
+        allow_self_funded: true,
+        behavior: TokenBehavior::default(),
+        manual_price_usd_e8: Some(100_000_000),
+        max_position_usd_e8: None,
+        max_flash_loan_usd_e8: None,
+    };
+    let flash_enabled = TokenInfo {
+        address: addr(4),
+        symbol: "USDT".to_string(),
+        decimals: 6,
+        is_stable: true,
+        is_cycle_anchor: false,
+        flash_loan_enabled: true,
+        allow_self_funded: true,
+        behavior: TokenBehavior::default(),
+        manual_price_usd_e8: Some(100_000_000),
+        max_position_usd_e8: None,
+        max_flash_loan_usd_e8: None,
+    };
+
+    let snapshot = GraphSnapshot::build(1, None, vec![cycle_anchor, flash_enabled], HashMap::new());
+
+    assert_eq!(snapshot.cycle_anchor_indices, vec![0]);
+    assert!(!snapshot.cycle_anchor_indices.contains(&1));
+}

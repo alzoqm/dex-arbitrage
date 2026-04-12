@@ -198,14 +198,12 @@ impl Router {
 
         let rough_gas_limit = estimate_gas_limit(candidate, &hops);
         let gross_profit_raw = next_amount as i128 - input_amount as i128;
-        let flash_fee_raw = input_amount.saturating_mul(flash_premium_ppm) / 1_000_000;
-        let net_profit_before_gas_raw = gross_profit_raw - flash_fee_raw as i128;
-        if net_profit_before_gas_raw <= 0 {
+        if gross_profit_raw <= 0 {
             return Ok(None);
         }
 
-        // Router only computes raw gross profit; USD conversion and gas costs
-        // are handled later in the Validator
+        // Capital selection owns flash-fee accounting because self-funded and
+        // mixed routes only pay premium on the borrowed shortfall.
         Ok(Some(ExactPlan {
             snapshot_id: candidate.snapshot_id,
             input_token: candidate.start_token,
@@ -214,8 +212,8 @@ impl Router {
             output_amount: next_amount,
             gross_profit_raw,
             flash_premium_ppm,
-            flash_fee_raw,
-            net_profit_before_gas_raw,
+            flash_fee_raw: 0,
+            net_profit_before_gas_raw: gross_profit_raw,
             contract_min_profit_raw: 0, // Set later in validator
             input_value_usd_e8: 0,      // Calculated later in validator
             flash_loan_value_usd_e8: 0,
@@ -224,7 +222,7 @@ impl Router {
             actual_flash_fee_usd_e8: 0,
             gas_cost_usd_e8: 0,
             net_profit_usd_e8: 0,
-            expected_profit: net_profit_before_gas_raw,
+            expected_profit: gross_profit_raw,
             gas_limit: rough_gas_limit,
             gas_cost_wei: alloy::primitives::U256::ZERO,
             capital_source: CapitalSource::SelfFunded,

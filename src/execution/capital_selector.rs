@@ -47,16 +47,12 @@ impl CapitalSelector {
         if gross_profit_raw <= 0 {
             return Ok(None);
         }
-        if !token.flash_loan_enabled {
-            return Ok(None);
-        }
-        if self.settings.contracts.aave_pool.is_none() {
-            return Ok(None);
-        }
 
-        let executor_balance = self.executor_balance(plan.input_token).await.unwrap_or(0);
-        let conservative_flash_fee_raw =
-            plan.input_amount.saturating_mul(plan.flash_premium_ppm) / 1_000_000;
+        let executor_balance = if token.allow_self_funded {
+            self.executor_balance(plan.input_token).await.unwrap_or(0)
+        } else {
+            0
+        };
         let own_amount = executor_balance.min(plan.input_amount);
         let loan_amount = plan.input_amount.saturating_sub(own_amount);
         let actual_flash_fee_raw = loan_amount.saturating_mul(plan.flash_premium_ppm) / 1_000_000;
@@ -67,7 +63,6 @@ impl CapitalSelector {
             self.settings.contracts.aave_pool.is_some(),
             self.settings.risk.max_flash_loan_usd_e8,
             loan_amount,
-            conservative_flash_fee_raw,
             actual_flash_fee_raw,
         ))
     }
@@ -79,12 +74,8 @@ impl CapitalSelector {
         aave_pool_configured: bool,
         global_flash_cap_usd_e8: u128,
         loan_amount: u128,
-        conservative_flash_fee_raw: u128,
         actual_flash_fee_raw: u128,
     ) -> Option<CapitalChoice> {
-        if !token.flash_loan_enabled {
-            return None;
-        }
         if loan_amount > plan.input_amount {
             return None;
         }
@@ -92,16 +83,19 @@ impl CapitalSelector {
         let net_profit = calculate_net_profit_before_gas_raw(
             plan.input_amount,
             plan.output_amount,
-            conservative_flash_fee_raw,
+            actual_flash_fee_raw,
         );
         if net_profit <= 0 {
             return None;
         }
 
         let source = if loan_amount == 0 {
+            if !token.allow_self_funded {
+                return None;
+            }
             CapitalSource::SelfFunded
         } else {
-            if !aave_pool_configured {
+            if !token.flash_loan_enabled || !aave_pool_configured {
                 return None;
             }
 
@@ -123,7 +117,7 @@ impl CapitalSelector {
         Some(CapitalChoice {
             source,
             loan_amount_raw: loan_amount,
-            flash_fee_raw: conservative_flash_fee_raw,
+            flash_fee_raw: actual_flash_fee_raw,
             actual_flash_fee_raw,
             net_profit_before_gas_raw: net_profit,
         })

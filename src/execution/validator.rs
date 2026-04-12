@@ -217,7 +217,7 @@ impl Validator {
             return Ok(None);
         };
 
-        let net_profit_usd_e8 = gross_profit_usd_e8 - flash_fee_usd_e8 - gas_cost_usd_e8;
+        let net_profit_usd_e8 = gross_profit_usd_e8 - actual_flash_fee_usd_e8 - gas_cost_usd_e8;
 
         // Fill USD fields in plan
         plan.gross_profit_usd_e8 = gross_profit_usd_e8;

@@ -148,20 +148,20 @@ struct FileConfig {
     policy: FilePolicyConfig,
     max_hops: usize,
     screening_margin_bps: u32,
-    min_net_profit_default: i128,
-    min_net_profit_usd_e8: Option<u128>,
-    min_trade_usd_e8: Option<u128>,
+    min_net_profit_default: i64,
+    min_net_profit_usd_e8: Option<u64>,
+    min_trade_usd_e8: Option<u64>,
     poll_interval_ms: u64,
     event_backfill_blocks: u64,
     staleness_timeout_ms: u64,
     gas_risk_buffer_pct: f64,
-    gas_price_ceiling_wei: u128,
-    max_position_default: u128,
-    max_position_usd_e8: Option<u128>,
-    max_flash_loan_default: u128,
-    max_flash_loan_usd_e8: Option<u128>,
-    daily_loss_limit_default: i128,
-    daily_loss_limit_usd_e8: Option<u128>,
+    gas_price_ceiling_wei: u64,
+    max_position_default: u64,
+    max_position_usd_e8: Option<u64>,
+    max_flash_loan_default: u64,
+    max_flash_loan_usd_e8: Option<u64>,
+    daily_loss_limit_default: i64,
+    daily_loss_limit_usd_e8: Option<u64>,
     min_profit_realization_bps: Option<u32>,
     pool_health_min_bps: u16,
     stable_depeg_cutoff_e6: u32,
@@ -204,9 +204,9 @@ struct FileTokenConfig {
     allow_self_funded: Option<bool>,
     price_env: String,
     #[serde(default)]
-    max_position_usd_e8: Option<u128>,
+    max_position_usd_e8: Option<u64>,
     #[serde(default)]
-    max_flash_loan_usd_e8: Option<u128>,
+    max_flash_loan_usd_e8: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -243,7 +243,7 @@ impl Settings {
         let json_logs = env_bool("JSON_LOGS", false);
         let strict_target_allowlist =
             env_bool("STRICT_TARGET_ALLOWLIST", file_cfg.strict_target_allowlist);
-        let safe_owner = env_opt("SAFE_OWNER").and_then(|v| parse_address(&v).ok());
+        let safe_owner = parse_env_address_opt("SAFE_OWNER")?;
 
         let rpc = match chain {
             Chain::Base => RpcSettings {
@@ -261,7 +261,7 @@ impl Settings {
             Chain::Polygon => RpcSettings {
                 public_rpc_url: env_req("POLYGON_PUBLIC_RPC_URL")?,
                 fallback_rpc_url: env_opt("POLYGON_FALLBACK_RPC_URL"),
-                preconf_rpc_url: env_opt("POLYGON_PRIVATE_MEMPOOL_URL"),
+                preconf_rpc_url: env_opt("POLYGON_PRECONF_RPC_URL"),
                 ws_url: env_opt("POLYGON_WSS_URL"),
                 protected_rpc_url: env_opt("POLYGON_PRIVATE_MEMPOOL_URL"),
                 private_submit_method: env_or(
@@ -273,8 +273,8 @@ impl Settings {
         };
 
         let contracts = ContractSettings {
-            executor_address: env_opt(chain.executor_env()).and_then(|v| parse_address(&v).ok()),
-            aave_pool: env_opt(chain.aave_pool_env()).and_then(|v| parse_address(&v).ok()),
+            executor_address: parse_env_address_opt(chain.executor_env())?,
+            aave_pool: parse_env_address_opt(chain.aave_pool_env())?,
             strict_target_allowlist,
         };
 
@@ -286,13 +286,13 @@ impl Settings {
             } else {
                 "POLYGON_MIN_NET_PROFIT"
             })
-            .unwrap_or(file_cfg.min_net_profit_default),
+            .unwrap_or(i128::from(file_cfg.min_net_profit_default)),
             min_net_profit_usd_e8: env_opt_u128(if chain == Chain::Base {
                 "BASE_MIN_NET_PROFIT_USD_E8"
             } else {
                 "POLYGON_MIN_NET_PROFIT_USD_E8"
             })
-            .or(file_cfg.min_net_profit_usd_e8)
+            .or(file_cfg.min_net_profit_usd_e8.map(u128::from))
             .unwrap_or({
                 // Backward compatible default: convert old raw USDC value
                 // 100000 raw USDC (6 decimals) at $1 = $0.10 = 10_000_000 e8
@@ -303,7 +303,7 @@ impl Settings {
             } else {
                 "POLYGON_MIN_TRADE_USD_E8"
             })
-            .or(file_cfg.min_trade_usd_e8)
+            .or(file_cfg.min_trade_usd_e8.map(u128::from))
             .unwrap_or(1_000_000_000), // $10 default
             poll_interval_ms: env_opt_u64("POLL_INTERVAL_MS").unwrap_or(file_cfg.poll_interval_ms),
             event_backfill_blocks: env_opt_u64("EVENT_BACKFILL_BLOCKS")
@@ -317,37 +317,37 @@ impl Settings {
             } else {
                 "POLYGON_GAS_PRICE_CEILING_WEI"
             })
-            .unwrap_or(file_cfg.gas_price_ceiling_wei),
+            .unwrap_or(u128::from(file_cfg.gas_price_ceiling_wei)),
             max_position: env_opt_u128(if chain == Chain::Base {
                 "BASE_MAX_POSITION"
             } else {
                 "POLYGON_MAX_POSITION"
             })
-            .unwrap_or(file_cfg.max_position_default),
+            .unwrap_or(u128::from(file_cfg.max_position_default)),
             max_position_usd_e8: env_opt_u128(if chain == Chain::Base {
                 "BASE_MAX_POSITION_USD_E8"
             } else {
                 "POLYGON_MAX_POSITION_USD_E8"
             })
-            .or(file_cfg.max_position_usd_e8)
+            .or(file_cfg.max_position_usd_e8.map(u128::from))
             .unwrap_or(200_000_000_000), // $2000 default
             max_flash_loan: env_opt_u128(if chain == Chain::Base {
                 "BASE_MAX_FLASH_LOAN"
             } else {
                 "POLYGON_MAX_FLASH_LOAN"
             })
-            .unwrap_or(file_cfg.max_flash_loan_default),
+            .unwrap_or(u128::from(file_cfg.max_flash_loan_default)),
             max_flash_loan_usd_e8: env_opt_u128(if chain == Chain::Base {
                 "BASE_MAX_FLASH_LOAN_USD_E8"
             } else {
                 "POLYGON_MAX_FLASH_LOAN_USD_E8"
             })
-            .or(file_cfg.max_flash_loan_usd_e8)
+            .or(file_cfg.max_flash_loan_usd_e8.map(u128::from))
             .unwrap_or(1_000_000_000_000), // $10000 default
             daily_loss_limit: env_opt_i128("DAILY_LOSS_LIMIT")
-                .unwrap_or(file_cfg.daily_loss_limit_default),
+                .unwrap_or(i128::from(file_cfg.daily_loss_limit_default)),
             daily_loss_limit_usd_e8: env_opt_u128("DAILY_LOSS_LIMIT_USD_E8")
-                .or(file_cfg.daily_loss_limit_usd_e8)
+                .or(file_cfg.daily_loss_limit_usd_e8.map(u128::from))
                 .unwrap_or(50_000_000_000), // $500 default
             min_profit_realization_bps: env_opt_u32("MIN_PROFIT_REALIZATION_BPS")
                 .or(file_cfg.min_profit_realization_bps)
@@ -434,23 +434,23 @@ impl Settings {
                 symbol_filter.is_empty()
                     || symbol_filter.contains(&token.symbol.to_ascii_lowercase())
             })
-            .filter_map(|token| {
-                let address = match env_opt(&token.address_env) {
-                    Some(addr) if !addr.trim().is_empty() => parse_address(&addr).ok(),
-                    _ => None,
-                }?;
+            .map(|token| -> Result<Option<TokenConfig>> {
+                let Some(addr) = env_opt(&token.address_env) else {
+                    return Ok(None);
+                };
+                let address = parse_address(&addr)
+                    .with_context(|| format!("invalid token address env {}", token.address_env))?;
                 let manual_price_usd_e8 = if token.price_env.trim().is_empty() {
                     None
                 } else {
                     env_opt_u64(&token.price_env)
                 };
-                // Start/end anchors are assigned from live Aave reserves during discovery.
-                let _configured_cycle_anchor = token.is_cycle_anchor;
-                let _configured_flash_loan_enabled = token.flash_loan_enabled;
-                let is_cycle_anchor = false;
-                let flash_loan_enabled = false;
                 let allow_self_funded = token.allow_self_funded.unwrap_or(token.is_stable);
-                Some(TokenConfig {
+                let flash_loan_enabled = token.flash_loan_enabled.unwrap_or(false);
+                let is_cycle_anchor = token
+                    .is_cycle_anchor
+                    .unwrap_or(token.is_stable || allow_self_funded || flash_loan_enabled);
+                Ok(Some(TokenConfig {
                     symbol: token.symbol,
                     address,
                     decimals: token.decimals,
@@ -459,10 +459,13 @@ impl Settings {
                     flash_loan_enabled,
                     allow_self_funded,
                     manual_price_usd_e8,
-                    max_position_usd_e8: token.max_position_usd_e8,
-                    max_flash_loan_usd_e8: token.max_flash_loan_usd_e8,
-                })
+                    max_position_usd_e8: token.max_position_usd_e8.map(u128::from),
+                    max_flash_loan_usd_e8: token.max_flash_loan_usd_e8.map(u128::from),
+                }))
             })
+            .collect::<Result<Vec<_>>>()?
+            .into_iter()
+            .flatten()
             .collect::<Vec<_>>();
 
         let dexes = file_cfg
@@ -503,7 +506,7 @@ impl Settings {
             safe_owner,
             simulation_only,
             json_logs,
-            prometheus_bind: env_or("PROMETHEUS_BIND", "0.0.0.0:9898"),
+            prometheus_bind: env_or("PROMETHEUS_BIND", "127.0.0.1:9898"),
             rpc,
             contracts,
             risk,
@@ -533,7 +536,7 @@ impl Settings {
     pub fn cycle_anchor_tokens(&self) -> Vec<Address> {
         self.tokens
             .iter()
-            .filter(|token| token.flash_loan_enabled)
+            .filter(|token| token.is_cycle_anchor)
             .map(|token| token.address)
             .collect()
     }
@@ -567,6 +570,12 @@ fn resolve_address_from_env_name(env_name: &str) -> Result<Option<Address>> {
 
 fn parse_address(value: &str) -> Result<Address> {
     Address::from_str(value).with_context(|| format!("invalid address: {value}"))
+}
+
+fn parse_env_address_opt(key: &str) -> Result<Option<Address>> {
+    env_opt(key)
+        .map(|value| parse_address(&value).with_context(|| format!("invalid address env {key}")))
+        .transpose()
 }
 
 fn validate_dex_configs(dexes: &[DexConfig]) -> Result<()> {
