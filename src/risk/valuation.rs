@@ -204,4 +204,33 @@ mod tests {
         let net = calculate_net_profit_before_gas_raw(1_000_000, 1_100_000, flash_fee);
         assert_eq!(net, 99_100);
     }
+
+    #[test]
+    fn zero_price_returns_none_for_both_directions() {
+        let token = make_token(6, Some(0));
+
+        assert!(amount_to_usd_e8(1_000_000, &token).is_none());
+        assert!(usd_e8_to_amount(100_000_000, &token).is_none());
+    }
+
+    #[test]
+    fn conversion_overflow_returns_none() {
+        let expensive_token = make_token(0, Some(u64::MAX));
+        let tiny_price_token = make_token(38, Some(1));
+
+        assert!(amount_to_usd_e8(u128::MAX, &expensive_token).is_none());
+        assert!(usd_e8_to_amount(u128::MAX, &tiny_price_token).is_none());
+    }
+
+    #[test]
+    fn native_gas_to_usd_rejects_zero_price() {
+        assert!(native_gas_to_usd_e8(U256::from(21_000u64), 0, 18).is_none());
+    }
+
+    #[test]
+    fn contract_min_profit_uses_floor_rounding() {
+        let profit = calculate_contract_min_profit_raw(101, 9_000);
+
+        assert_eq!(profit, 90);
+    }
 }
