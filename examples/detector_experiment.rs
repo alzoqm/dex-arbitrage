@@ -805,6 +805,7 @@ fn settings(max_hops: usize, screening_margin_bps: u32) -> Arc<Settings> {
             pool_health_min_bps: 9_000,
             stable_depeg_cutoff_e6: 995_000,
         },
+        search: dex_arbitrage::config::SearchSettings::default(),
         policy: UniversePolicy::default(),
         tokens: Vec::<TokenConfig>::new(),
         dexes: Vec::new(),

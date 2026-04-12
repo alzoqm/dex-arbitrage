@@ -1,6 +1,8 @@
 use alloy::primitives::Address;
 use dex_arbitrage::{
-    config::{ContractSettings, RiskSettings, RpcSettings, Settings, UniversePolicy},
+    config::{
+        ContractSettings, RiskSettings, RpcSettings, SearchSettings, Settings, UniversePolicy,
+    },
     risk::depeg_guard::DepegGuard,
     types::{AmmKind, Chain, DiscoveryKind},
 };
@@ -57,6 +59,7 @@ fn depeg_guard_blocks_unhealthy_stable_token() {
             pool_health_min_bps: 9_000,
             stable_depeg_cutoff_e6: 995_000,
         },
+        search: SearchSettings::default(),
         policy: UniversePolicy::default(),
         tokens: vec![
             dex_arbitrage::config::TokenConfig {

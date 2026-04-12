@@ -20,6 +20,7 @@ pub struct Settings {
     pub rpc: RpcSettings,
     pub contracts: ContractSettings,
     pub risk: RiskSettings,
+    pub search: SearchSettings,
     pub policy: UniversePolicy,
     pub tokens: Vec<TokenConfig>,
     pub dexes: Vec<DexConfig>,
@@ -65,6 +66,29 @@ pub struct RiskSettings {
     pub max_concurrent_tx: usize,
     pub pool_health_min_bps: u16,
     pub stable_depeg_cutoff_e6: u32,
+}
+
+#[derive(Debug, Clone)]
+pub struct SearchSettings {
+    pub top_k_paths_per_side: usize,
+    pub max_virtual_branches_per_node: usize,
+    pub path_beam_width: usize,
+    pub max_candidates_per_refresh: usize,
+    pub max_pair_edges_per_pair: usize,
+    pub max_split_parallel_pools: usize,
+}
+
+impl Default for SearchSettings {
+    fn default() -> Self {
+        Self {
+            top_k_paths_per_side: 8,
+            max_virtual_branches_per_node: 16,
+            path_beam_width: 96,
+            max_candidates_per_refresh: 512,
+            max_pair_edges_per_pair: 1,
+            max_split_parallel_pools: 3,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -142,6 +166,8 @@ struct FileConfig {
     pool_health_min_bps: u16,
     stable_depeg_cutoff_e6: u32,
     strict_target_allowlist: bool,
+    #[serde(default)]
+    search: FileSearchConfig,
     tokens: Vec<FileTokenConfig>,
     dexes: Vec<FileDexConfig>,
 }
@@ -152,6 +178,16 @@ struct FilePolicyConfig {
     venues: Option<Vec<String>>,
     #[serde(default)]
     symbols: Option<Vec<String>>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct FileSearchConfig {
+    top_k_paths_per_side: Option<usize>,
+    max_virtual_branches_per_node: Option<usize>,
+    path_beam_width: Option<usize>,
+    max_candidates_per_refresh: Option<usize>,
+    max_pair_edges_per_pair: Option<usize>,
+    max_split_parallel_pools: Option<usize>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -330,6 +366,39 @@ impl Settings {
             );
         }
 
+        let search = SearchSettings {
+            top_k_paths_per_side: configured_usize(
+                "SEARCH_TOP_K_PATHS_PER_SIDE",
+                file_cfg.search.top_k_paths_per_side,
+                8,
+            ),
+            max_virtual_branches_per_node: configured_usize(
+                "SEARCH_MAX_VIRTUAL_BRANCHES_PER_NODE",
+                file_cfg.search.max_virtual_branches_per_node,
+                16,
+            ),
+            path_beam_width: configured_usize(
+                "SEARCH_PATH_BEAM_WIDTH",
+                file_cfg.search.path_beam_width,
+                96,
+            ),
+            max_candidates_per_refresh: configured_usize(
+                "SEARCH_MAX_CANDIDATES_PER_REFRESH",
+                file_cfg.search.max_candidates_per_refresh,
+                512,
+            ),
+            max_pair_edges_per_pair: configured_usize(
+                "SEARCH_MAX_PAIR_EDGES_PER_PAIR",
+                file_cfg.search.max_pair_edges_per_pair,
+                1,
+            ),
+            max_split_parallel_pools: configured_usize(
+                "MAX_SPLIT_PARALLEL_POOLS",
+                file_cfg.search.max_split_parallel_pools,
+                3,
+            ),
+        };
+
         let policy = UniversePolicy {
             venues: file_cfg
                 .policy
@@ -438,6 +507,7 @@ impl Settings {
             rpc,
             contracts,
             risk,
+            search,
             policy,
             tokens,
             dexes,
@@ -559,6 +629,13 @@ fn env_opt_u16(key: &str) -> Option<u16> {
 
 fn env_opt_usize(key: &str) -> Option<usize> {
     env_opt(key).and_then(|v| v.parse().ok())
+}
+
+fn configured_usize(env_key: &str, file_value: Option<usize>, default: usize) -> usize {
+    env_opt_usize(env_key)
+        .filter(|value| *value > 0)
+        .or_else(|| file_value.filter(|value| *value > 0))
+        .unwrap_or(default)
 }
 
 fn env_opt_f64(key: &str) -> Option<f64> {

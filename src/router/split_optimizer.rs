@@ -12,11 +12,15 @@ use super::{exact_quoter::ExactQuoter, split_decision::should_split};
 #[derive(Debug, Clone)]
 pub struct SplitOptimizer {
     exact_quoter: ExactQuoter,
+    max_parallel_pools: usize,
 }
 
 impl SplitOptimizer {
-    pub fn new(_settings: Arc<crate::config::Settings>, exact_quoter: ExactQuoter) -> Self {
-        Self { exact_quoter }
+    pub fn new(settings: Arc<crate::config::Settings>, exact_quoter: ExactQuoter) -> Self {
+        Self {
+            exact_quoter,
+            max_parallel_pools: settings.search.max_split_parallel_pools,
+        }
     }
 
     pub async fn optimize_pair(
@@ -26,7 +30,11 @@ impl SplitOptimizer {
         token_out: alloy::primitives::Address,
         total_in: u128,
     ) -> Result<(Vec<SplitPlan>, u128)> {
-        let edge_refs = ranked_pair_edges(snapshot, snapshot.pair_edges(token_in, token_out));
+        let edge_refs = ranked_pair_edges(
+            snapshot,
+            snapshot.pair_edges(token_in, token_out),
+            self.max_parallel_pools,
+        );
         if edge_refs.is_empty() {
             return Ok((Vec::new(), 0));
         }
@@ -215,6 +223,7 @@ impl SplitOptimizer {
 fn ranked_pair_edges(
     snapshot: &GraphSnapshot,
     mut edge_refs: Vec<crate::types::EdgeRef>,
+    max_edges: usize,
 ) -> Vec<crate::types::EdgeRef> {
     edge_refs.sort_by(|a, b| {
         let a_edge = snapshot.edge(*a);
@@ -235,11 +244,6 @@ fn ranked_pair_edges(
             (None, None) => Ordering::Equal,
         }
     });
-    let max_edges = std::env::var("MAX_SPLIT_PARALLEL_POOLS")
-        .ok()
-        .and_then(|value| value.parse::<usize>().ok())
-        .filter(|value| *value > 0)
-        .unwrap_or(3);
     edge_refs.truncate(max_edges);
     edge_refs
 }

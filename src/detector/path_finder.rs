@@ -9,18 +9,23 @@ use crate::{
     config::Settings,
     detector::pruning,
     graph::{DistanceCache, GraphSnapshot},
-    types::{CandidateHop, CandidatePath, EdgeRef},
+    types::{CandidateHop, CandidatePath, Edge, EdgeRef},
 };
-
-const TOP_K_PATHS_PER_SIDE: usize = 8;
-const MAX_VIRTUAL_BRANCHES_PER_NODE: usize = 16;
-const PATH_BEAM_WIDTH: usize = 96;
-const MAX_CANDIDATES_PER_REFRESH: usize = 512;
 
 #[derive(Debug)]
 pub struct PathFinder {
     max_hops: usize,
     screening_cutoff_q32: i64,
+    tuning: SearchTuning,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SearchTuning {
+    top_k_paths_per_side: usize,
+    max_virtual_branches_per_node: usize,
+    path_beam_width: usize,
+    max_candidates_per_refresh: usize,
+    max_pair_edges_per_pair: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -33,9 +38,17 @@ struct SearchPath {
 
 impl PathFinder {
     pub fn new(settings: Arc<Settings>) -> Self {
+        let search = &settings.search;
         Self {
             max_hops: settings.risk.max_hops,
             screening_cutoff_q32: screening_cutoff_q32(settings.risk.screening_margin_bps),
+            tuning: SearchTuning {
+                top_k_paths_per_side: search.top_k_paths_per_side,
+                max_virtual_branches_per_node: search.max_virtual_branches_per_node,
+                path_beam_width: search.path_beam_width,
+                max_candidates_per_refresh: search.max_candidates_per_refresh,
+                max_pair_edges_per_pair: search.max_pair_edges_per_pair,
+            },
         }
     }
 
@@ -63,9 +76,11 @@ impl PathFinder {
             {
                 continue;
             }
-            let Some(changed_best_ref) = best_virtual_edge(snapshot, from, to) else {
+            let changed_candidate_edges =
+                candidate_pair_edges(snapshot, from, to, self.tuning.max_pair_edges_per_pair);
+            if changed_candidate_edges.is_empty() {
                 continue;
-            };
+            }
 
             for &anchor_idx in &snapshot.cycle_anchor_indices {
                 if !anchor_can_participate(snapshot, anchor_idx, from, to) {
@@ -82,47 +97,52 @@ impl PathFinder {
                     continue;
                 }
 
-                for prefix in &prefixes {
-                    for suffix in &suffixes {
-                        let total_hops = prefix.edge_refs.len() + 1 + suffix.edge_refs.len();
-                        if total_hops > self.max_hops || total_hops < 2 {
-                            continue;
-                        }
-                        if !forms_simple_cycle(prefix, to, suffix) {
-                            continue;
-                        }
+                for &changed_path_ref in &changed_candidate_edges {
+                    for prefix in &prefixes {
+                        for suffix in &suffixes {
+                            let total_hops = prefix.edge_refs.len() + 1 + suffix.edge_refs.len();
+                            if total_hops > self.max_hops || total_hops < 2 {
+                                continue;
+                            }
+                            if !forms_simple_cycle(prefix, to, suffix) {
+                                continue;
+                            }
 
-                        let Some(changed_edge) = snapshot.edge(changed_best_ref) else {
-                            continue;
-                        };
-                        let score_q32 = prefix
-                            .score_q32
-                            .saturating_add(changed_edge.weight_log_q32)
-                            .saturating_add(suffix.score_q32);
-                        if score_q32 >= self.screening_cutoff_q32 {
-                            continue;
-                        }
+                            let Some(changed_edge) = snapshot.edge(changed_path_ref) else {
+                                continue;
+                            };
+                            let score_q32 = prefix
+                                .score_q32
+                                .saturating_add(changed_edge.weight_log_q32)
+                                .saturating_add(suffix.score_q32);
+                            if score_q32 >= self.screening_cutoff_q32 {
+                                continue;
+                            }
 
-                        let mut edge_refs = prefix.edge_refs.clone();
-                        edge_refs.push(changed_best_ref);
-                        edge_refs.extend_from_slice(&suffix.edge_refs);
+                            let mut edge_refs = prefix.edge_refs.clone();
+                            edge_refs.push(changed_path_ref);
+                            edge_refs.extend_from_slice(&suffix.edge_refs);
 
-                        let key = token_cycle_key(snapshot, prefix, to, suffix);
-                        if !dedup.insert(key.clone()) {
-                            continue;
-                        }
+                            let key = token_cycle_key(snapshot, prefix, to, suffix);
+                            if !dedup.insert(key.clone()) {
+                                continue;
+                            }
 
-                        if let Some(candidate) = self.materialize_candidate(
-                            snapshot,
-                            anchor_idx,
-                            key,
-                            score_q32,
-                            &edge_refs,
-                            changed_edge_ref,
-                        ) {
-                            candidates.push(candidate);
-                            if candidates.len() >= MAX_CANDIDATES_PER_REFRESH {
-                                return finalize_candidates(candidates);
+                            if let Some(candidate) = self.materialize_candidate(
+                                snapshot,
+                                anchor_idx,
+                                key,
+                                score_q32,
+                                &edge_refs,
+                                changed_edge_ref,
+                            ) {
+                                candidates.push(candidate);
+                                if candidates.len() >= self.tuning.max_candidates_per_refresh {
+                                    return finalize_candidates(
+                                        candidates,
+                                        self.tuning.max_candidates_per_refresh,
+                                    );
+                                }
                             }
                         }
                     }
@@ -130,7 +150,7 @@ impl PathFinder {
             }
         }
 
-        finalize_candidates(candidates)
+        finalize_candidates(candidates, self.tuning.max_candidates_per_refresh)
     }
 
     fn changed_virtual_pairs(
@@ -200,17 +220,15 @@ impl PathFinder {
             let mut next_frontier = Vec::new();
             for current in &frontier {
                 let current_node = *current.tokens.last().expect("path always has a node");
-                for edge_ref in virtual_outgoing(snapshot, current_node)
-                    .into_iter()
-                    .take(MAX_VIRTUAL_BRANCHES_PER_NODE)
+                for edge_ref in
+                    virtual_outgoing(snapshot, current_node, self.tuning.max_pair_edges_per_pair)
+                        .into_iter()
+                        .take(self.tuning.max_virtual_branches_per_node)
                 {
                     let Some(edge) = snapshot.edge(edge_ref) else {
                         continue;
                     };
-                    if edge.pool_health.paused
-                        || edge.pool_health.quarantined
-                        || edge.pool_health.stale
-                    {
+                    if !edge_is_usable(edge) {
                         continue;
                     }
                     if current.tokens.contains(&edge.to) {
@@ -235,9 +253,9 @@ impl PathFinder {
             }
 
             sort_paths(&mut out);
-            out.truncate(TOP_K_PATHS_PER_SIDE);
+            out.truncate(self.tuning.top_k_paths_per_side);
             sort_paths(&mut next_frontier);
-            next_frontier.truncate(PATH_BEAM_WIDTH);
+            next_frontier.truncate(self.tuning.path_beam_width);
             frontier = next_frontier;
             if frontier.is_empty() {
                 break;
@@ -245,7 +263,7 @@ impl PathFinder {
         }
 
         sort_paths(&mut out);
-        out.truncate(TOP_K_PATHS_PER_SIDE);
+        out.truncate(self.tuning.top_k_paths_per_side);
         out
     }
 
@@ -291,9 +309,12 @@ impl PathFinder {
     }
 }
 
-fn finalize_candidates(mut candidates: Vec<CandidatePath>) -> Vec<CandidatePath> {
+fn finalize_candidates(
+    mut candidates: Vec<CandidatePath>,
+    max_candidates_per_refresh: usize,
+) -> Vec<CandidatePath> {
     candidates.sort_by(|a, b| a.screening_score_q32.cmp(&b.screening_score_q32));
-    candidates.truncate(MAX_CANDIDATES_PER_REFRESH);
+    candidates.truncate(max_candidates_per_refresh);
     candidates
 }
 
@@ -326,27 +347,54 @@ fn anchor_can_participate(
             .unwrap_or(false)
 }
 
-fn virtual_outgoing(snapshot: &GraphSnapshot, vertex: usize) -> Vec<EdgeRef> {
-    let mut by_to = HashMap::<usize, EdgeRef>::new();
+fn virtual_outgoing(
+    snapshot: &GraphSnapshot,
+    vertex: usize,
+    max_pair_edges_per_pair: usize,
+) -> Vec<EdgeRef> {
+    let mut by_to = HashMap::<usize, Vec<EdgeRef>>::new();
     for edge_ref in pruning::ranked_outgoing(snapshot, vertex) {
         let Some(edge) = snapshot.edge(edge_ref) else {
             continue;
         };
-        by_to.entry(edge.to).or_insert(edge_ref);
+        if !edge_is_usable(edge) {
+            continue;
+        }
+        by_to.entry(edge.to).or_default().push(edge_ref);
     }
 
-    let mut out = by_to.into_values().collect::<Vec<_>>();
+    let mut out = Vec::new();
+    for mut edge_refs in by_to.into_values() {
+        edge_refs.sort_by(|a, b| compare_edge_refs(snapshot, *a, *b));
+        edge_refs.truncate(max_pair_edges_per_pair);
+        out.extend(edge_refs);
+    }
     out.sort_by(|a, b| compare_edge_refs(snapshot, *a, *b));
     out
 }
 
-fn best_virtual_edge(snapshot: &GraphSnapshot, from: usize, to: usize) -> Option<EdgeRef> {
-    snapshot
-        .pair_to_edges
-        .get(&(from, to))?
+fn candidate_pair_edges(
+    snapshot: &GraphSnapshot,
+    from: usize,
+    to: usize,
+    max_pair_edges_per_pair: usize,
+) -> Vec<EdgeRef> {
+    let Some(edges) = snapshot.pair_to_edges.get(&(from, to)) else {
+        return Vec::new();
+    };
+    let mut out = edges
         .iter()
         .copied()
-        .min_by(|a, b| compare_edge_refs(snapshot, *a, *b))
+        .filter(|edge_ref| {
+            snapshot
+                .edge(*edge_ref)
+                .map(edge_is_usable)
+                .unwrap_or(false)
+        })
+        .collect::<Vec<_>>();
+    out.sort_by(|a, b| compare_edge_refs(snapshot, *a, *b));
+    out.truncate(max_pair_edges_per_pair);
+    out
 }
 
 fn better_edge_ref(snapshot: &GraphSnapshot, left: EdgeRef, right: EdgeRef) -> bool {
@@ -378,6 +426,10 @@ fn compare_edge_refs(
                 .cmp(&a.pool_health.confidence_bps)
         })
         .then_with(|| a.pool_id.cmp(&b.pool_id))
+}
+
+fn edge_is_usable(edge: &Edge) -> bool {
+    !edge.pool_health.paused && !edge.pool_health.quarantined && !edge.pool_health.stale
 }
 
 fn forms_simple_cycle(prefix: &SearchPath, changed_to: usize, suffix: &SearchPath) -> bool {

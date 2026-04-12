@@ -3,8 +3,8 @@ use std::{collections::HashMap, sync::Arc, time::SystemTime};
 use alloy::primitives::{Address, U256};
 use dex_arbitrage::{
     config::{
-        ContractSettings, DexConfig, RiskSettings, RpcSettings, Settings, TokenConfig,
-        UniversePolicy,
+        ContractSettings, DexConfig, RiskSettings, RpcSettings, SearchSettings, Settings,
+        TokenConfig, UniversePolicy,
     },
     detector::Detector,
     graph::{DistanceCache, GraphSnapshot},
@@ -126,6 +126,7 @@ fn settings() -> Arc<Settings> {
             pool_health_min_bps: 9_000,
             stable_depeg_cutoff_e6: 995_000,
         },
+        search: SearchSettings::default(),
         policy: UniversePolicy::default(),
         tokens: vec![
             TokenConfig {
@@ -178,6 +179,12 @@ fn settings() -> Arc<Settings> {
             enabled: true,
         }],
     })
+}
+
+fn settings_with_search(search: SearchSettings) -> Arc<Settings> {
+    let mut settings = (*settings()).clone();
+    settings.search = search;
+    Arc::new(settings)
 }
 
 #[test]
@@ -291,6 +298,100 @@ fn detector_deduplicates_parallel_pools_by_token_cycle() {
     assert_eq!(candidates[0].path.len(), 4);
 }
 
+#[test]
+fn detector_can_skip_unusable_parallel_edge_for_same_pair() {
+    let tokens = vec![
+        token_with_anchor("A", addr(60), 18, false, true),
+        token("X", addr(61), 18, false),
+        token("Y", addr(62), 18, false),
+    ];
+    let mut adjacency = vec![Vec::new(); tokens.len()];
+    let mut reverse_adj = vec![Vec::new(); tokens.len()];
+    let mut pair_to_edges = HashMap::new();
+    let mut pool_to_edges = HashMap::new();
+    let mut pool_nonce = 220u8;
+
+    let mut stale = health();
+    stale.stale = true;
+    add_manual_edge_with(
+        &mut adjacency,
+        &mut reverse_adj,
+        &mut pair_to_edges,
+        &mut pool_to_edges,
+        &mut pool_nonce,
+        0,
+        1,
+        stale,
+        -10_000_000,
+        10_000_000,
+    );
+    add_manual_edge_with(
+        &mut adjacency,
+        &mut reverse_adj,
+        &mut pair_to_edges,
+        &mut pool_to_edges,
+        &mut pool_nonce,
+        0,
+        1,
+        health(),
+        -1_000_000,
+        1_000_000,
+    );
+    add_manual_edge(
+        &mut adjacency,
+        &mut reverse_adj,
+        &mut pair_to_edges,
+        &mut pool_to_edges,
+        &mut pool_nonce,
+        1,
+        2,
+    );
+    add_manual_edge(
+        &mut adjacency,
+        &mut reverse_adj,
+        &mut pair_to_edges,
+        &mut pool_to_edges,
+        &mut pool_nonce,
+        2,
+        0,
+    );
+
+    let changed_edges = adjacency
+        .iter()
+        .enumerate()
+        .flat_map(|(from, edges)| (0..edges.len()).map(move |edge_idx| EdgeRef { from, edge_idx }))
+        .collect::<Vec<_>>();
+    let token_to_index = tokens
+        .iter()
+        .enumerate()
+        .map(|(idx, token)| (token.address, idx))
+        .collect();
+    let snapshot = GraphSnapshot {
+        snapshot_id: 1,
+        block_ref: None,
+        tokens,
+        token_to_index,
+        stable_token_indices: Vec::new(),
+        cycle_anchor_indices: vec![0],
+        adjacency,
+        reverse_adj,
+        pools: HashMap::new(),
+        pool_to_edges,
+        pair_to_edges,
+    };
+    let distance_cache = DistanceCache::recompute(&snapshot);
+    let detector = Detector::new(settings_with_search(SearchSettings {
+        max_pair_edges_per_pair: 2,
+        ..SearchSettings::default()
+    }));
+
+    let candidates = detector.detect(&snapshot, &changed_edges, &distance_cache);
+
+    assert!(candidates
+        .iter()
+        .any(|candidate| candidate.cycle_key.contains(&addr(61).to_string())));
+}
+
 fn manual_parallel_snapshot(parallel_pools: usize) -> (GraphSnapshot, Vec<EdgeRef>) {
     let tokens = vec![
         token_with_anchor("A", addr(50), 18, false, true),
@@ -382,6 +483,33 @@ fn add_manual_edge(
     from: usize,
     to: usize,
 ) -> EdgeRef {
+    add_manual_edge_with(
+        adjacency,
+        reverse_adj,
+        pair_to_edges,
+        pool_to_edges,
+        pool_nonce,
+        from,
+        to,
+        health(),
+        -1_000_000,
+        1_000_000,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn add_manual_edge_with(
+    adjacency: &mut [Vec<Edge>],
+    reverse_adj: &mut [Vec<EdgeRef>],
+    pair_to_edges: &mut HashMap<(usize, usize), smallvec::SmallVec<[EdgeRef; 8]>>,
+    pool_to_edges: &mut HashMap<Address, smallvec::SmallVec<[EdgeRef; 8]>>,
+    pool_nonce: &mut u8,
+    from: usize,
+    to: usize,
+    pool_health: PoolHealth,
+    weight_log_q32: i64,
+    safe_capacity_in: u128,
+) -> EdgeRef {
     let pool_id = addr(*pool_nonce);
     *pool_nonce = pool_nonce.saturating_add(1);
     adjacency[from].push(Edge {
@@ -390,13 +518,13 @@ fn add_manual_edge(
         pool_id,
         amm_kind: AmmKind::UniswapV2Like,
         fee_ppm: 3_000,
-        weight_log_q32: -1_000_000,
+        weight_log_q32,
         spot_rate_q128: U256::from(1u8),
         liquidity: LiquidityInfo {
             estimated_usd_e8: 100_000_000,
-            safe_capacity_in: 1_000_000,
+            safe_capacity_in,
         },
-        pool_health: health(),
+        pool_health,
         dex_name: "manual".to_string(),
     });
     let edge_ref = EdgeRef {

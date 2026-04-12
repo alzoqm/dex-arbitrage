@@ -21,6 +21,14 @@ strict_target_allowlist = false
 venues = []
 symbols = []
 
+[search]
+top_k_paths_per_side = 12
+max_virtual_branches_per_node = 32
+path_beam_width = 192
+max_candidates_per_refresh = 1024
+max_pair_edges_per_pair = 4
+max_split_parallel_pools = 5
+
 [[tokens]]
 symbol = "USDC"
 address_env = "POLYGON_USDC"
