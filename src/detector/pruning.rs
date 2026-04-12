@@ -1,10 +1,6 @@
 use crate::{graph::GraphSnapshot, types::EdgeRef};
 
-pub fn ranked_outgoing(
-    snapshot: &GraphSnapshot,
-    vertex: usize,
-    max_branching: usize,
-) -> Vec<EdgeRef> {
+pub fn ranked_outgoing(snapshot: &GraphSnapshot, vertex: usize) -> Vec<EdgeRef> {
     let mut refs = snapshot
         .adjacency
         .get(vertex)
@@ -36,7 +32,6 @@ pub fn ranked_outgoing(
     });
 
     refs.into_iter()
-        .take(max_branching)
         .map(|(edge_idx, _)| EdgeRef {
             from: vertex,
             edge_idx,

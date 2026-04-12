@@ -50,9 +50,6 @@ impl PoolFetcher {
         let token1 = self
             .call_address(spec.address, IUniswapV2Pair::token1Call {}.abi_encode())
             .await?;
-        if !self.token_map.contains_key(&token0) || !self.token_map.contains_key(&token1) {
-            return Ok(None);
-        }
         let raw = self
             .rpc
             .best_read()
@@ -76,10 +73,7 @@ impl PoolFetcher {
             dex_name: spec.dex_name.clone(),
             kind: spec.amm_kind,
             token_addresses: vec![token0, token1],
-            token_symbols: vec![
-                self.token_map[&token0].symbol.clone(),
-                self.token_map[&token1].symbol.clone(),
-            ],
+            token_symbols: vec![self.token_symbol(token0), self.token_symbol(token1)],
             factory: spec.factory,
             registry: spec.registry,
             vault: spec.vault,
@@ -108,9 +102,6 @@ impl PoolFetcher {
         let token1 = self
             .call_address(spec.address, IUniswapV3Pool::token1Call {}.abi_encode())
             .await?;
-        if !self.token_map.contains_key(&token0) || !self.token_map.contains_key(&token1) {
-            return Ok(None);
-        }
         let raw_fee = self
             .rpc
             .best_read()
@@ -161,10 +152,7 @@ impl PoolFetcher {
             dex_name: spec.dex_name.clone(),
             kind: spec.amm_kind,
             token_addresses: vec![token0, token1],
-            token_symbols: vec![
-                self.token_map[&token0].symbol.clone(),
-                self.token_map[&token1].symbol.clone(),
-            ],
+            token_symbols: vec![self.token_symbol(token0), self.token_symbol(token1)],
             factory: spec.factory,
             registry: spec.registry,
             vault: spec.vault,
@@ -234,9 +222,6 @@ impl PoolFetcher {
                 Ok(ret) => ret,
                 Err(_) => break,
             };
-            if !self.token_map.contains_key(&coin_ret) {
-                return Ok(None);
-            }
             let bal_call = ICurvePool::balancesCall {
                 i: U256::saturating_from(i),
             }
@@ -247,7 +232,7 @@ impl PoolFetcher {
                 .eth_call(spec.address, None, bal_call.into(), "latest")
                 .await?;
             let bal_ret = ICurvePool::balancesCall::abi_decode_returns(&bal_raw)?;
-            token_symbols.push(self.token_map[&coin_ret].symbol.clone());
+            token_symbols.push(self.token_symbol(coin_ret));
             token_addresses.push(coin_ret);
             balances.push(u256_to_u128(bal_ret));
         }
@@ -322,13 +307,6 @@ impl PoolFetcher {
             )
             .await?;
         let tokens_ret = IBalancerVault::getPoolTokensCall::abi_decode_returns(&raw_tokens)?;
-        if tokens_ret
-            .tokens
-            .iter()
-            .any(|token| !self.token_map.contains_key(token))
-        {
-            return Ok(None);
-        }
         let raw_weights = self
             .rpc
             .best_read()
@@ -380,7 +358,7 @@ impl PoolFetcher {
             token_symbols: tokens_ret
                 .tokens
                 .iter()
-                .map(|token| self.token_map[token].symbol.clone())
+                .map(|token| self.token_symbol(*token))
                 .collect(),
             factory: spec.factory,
             registry: spec.registry,
@@ -424,6 +402,13 @@ impl PoolFetcher {
             anyhow::bail!("address return too short");
         }
         Ok(Address::from_slice(&bytes[12..32]))
+    }
+
+    fn token_symbol(&self, address: Address) -> String {
+        self.token_map
+            .get(&address)
+            .map(|token| token.symbol.clone())
+            .unwrap_or_else(|| address.to_string())
     }
 }
 

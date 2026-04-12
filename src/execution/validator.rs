@@ -83,7 +83,9 @@ impl Validator {
 
         // Update plan with capital choice
         plan.capital_source = choice.source;
+        plan.flash_loan_amount = choice.loan_amount_raw;
         plan.flash_fee_raw = choice.flash_fee_raw;
+        plan.actual_flash_fee_raw = choice.actual_flash_fee_raw;
         plan.net_profit_before_gas_raw = choice.net_profit_before_gas_raw;
 
         // Step 2: Build preliminary calldata with contract min profit
@@ -166,6 +168,29 @@ impl Validator {
             return Ok(None);
         };
 
+        let Some(actual_flash_fee_usd_e8) = amount_to_usd_e8(plan.actual_flash_fee_raw, token)
+        else {
+            debug!(
+                input_token = %plan.input_token,
+                input_symbol = %token.symbol,
+                "input token price missing, cannot value actual flash fee"
+            );
+            return Ok(None);
+        };
+        let Ok(actual_flash_fee_usd_e8) = i128::try_from(actual_flash_fee_usd_e8) else {
+            debug!("actual flash fee USD value exceeds i128 range");
+            return Ok(None);
+        };
+
+        let Some(flash_loan_value_usd_e8) = amount_to_usd_e8(plan.flash_loan_amount, token) else {
+            debug!(
+                input_token = %plan.input_token,
+                input_symbol = %token.symbol,
+                "input token price missing, cannot value flash loan amount"
+            );
+            return Ok(None);
+        };
+
         let Some((native_symbol, native_price_usd_e8, native_decimals)) =
             self.native_gas_pricing(snapshot)
         else {
@@ -197,6 +222,8 @@ impl Validator {
         // Fill USD fields in plan
         plan.gross_profit_usd_e8 = gross_profit_usd_e8;
         plan.flash_fee_usd_e8 = flash_fee_usd_e8;
+        plan.actual_flash_fee_usd_e8 = actual_flash_fee_usd_e8;
+        plan.flash_loan_value_usd_e8 = flash_loan_value_usd_e8;
         plan.gas_cost_usd_e8 = gas_cost_usd_e8;
         plan.net_profit_usd_e8 = net_profit_usd_e8;
 

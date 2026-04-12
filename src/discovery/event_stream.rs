@@ -15,13 +15,12 @@ use crate::{
 
 #[derive(Debug)]
 pub struct EventStream {
-    settings: Arc<Settings>,
     rpc: Arc<RpcClients>,
 }
 
 impl EventStream {
-    pub fn new(settings: Arc<Settings>, rpc: Arc<RpcClients>) -> Self {
-        Self { settings, rpc }
+    pub fn new(_settings: Arc<Settings>, rpc: Arc<RpcClients>) -> Self {
+        Self { rpc }
     }
 
     pub async fn poll_once(
@@ -40,12 +39,50 @@ impl EventStream {
         }
 
         let logs = self
-            .rpc
-            .best_read()
-            .get_logs(from_block + 1, latest, &addresses, &event_topics())
+            .get_logs_chunked(from_block + 1, latest, &addresses, &event_topics())
             .await?;
         let batch = self.into_refresh_batch(snapshot, logs);
         Ok((latest, batch))
+    }
+
+    async fn get_logs_chunked(
+        &self,
+        from_block: u64,
+        to_block: u64,
+        addresses: &[Address],
+        topics: &[B256],
+    ) -> Result<Vec<RpcLog>> {
+        if from_block > to_block {
+            return Ok(Vec::new());
+        }
+        let chunk_blocks = std::env::var("EVENT_LOG_CHUNK_BLOCKS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(10_000);
+        let address_chunk_size = std::env::var("EVENT_LOG_ADDRESS_CHUNK_SIZE")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(200);
+        let mut logs = Vec::new();
+        let mut start = from_block;
+        while start <= to_block {
+            let end = start.saturating_add(chunk_blocks - 1).min(to_block);
+            for address_chunk in addresses.chunks(address_chunk_size) {
+                let mut chunk = self
+                    .rpc
+                    .best_read()
+                    .get_logs(start, end, address_chunk, topics)
+                    .await?;
+                logs.append(&mut chunk);
+            }
+            if end == u64::MAX {
+                break;
+            }
+            start = end.saturating_add(1);
+        }
+        Ok(logs)
     }
 
     fn into_refresh_batch(&self, snapshot: &GraphSnapshot, logs: Vec<RpcLog>) -> RefreshBatch {

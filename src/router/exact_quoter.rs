@@ -9,7 +9,6 @@ use anyhow::Result;
 use crate::{
     abi::{ICurvePool, IV3QuoterV2},
     amm,
-    config::Settings,
     graph::GraphSnapshot,
     rpc::RpcClients,
     types::{PoolSpecificState, PoolState},
@@ -17,13 +16,12 @@ use crate::{
 
 #[derive(Debug, Clone)]
 pub struct ExactQuoter {
-    settings: Arc<Settings>,
     rpc: Arc<RpcClients>,
 }
 
 impl ExactQuoter {
-    pub fn new(settings: Arc<Settings>, rpc: Arc<RpcClients>) -> Self {
-        Self { settings, rpc }
+    pub fn new(_settings: Arc<crate::config::Settings>, rpc: Arc<RpcClients>) -> Self {
+        Self { rpc }
     }
 
     pub async fn quote_pool(

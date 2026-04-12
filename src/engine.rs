@@ -11,7 +11,7 @@ use crate::{
     discovery::{factory_scanner::DiscoveredPool, DiscoveryManager},
     execution::{nonce_manager::NonceManager, submitter::Submitter, validator::Validator},
     graph::{DistanceCache, GraphSnapshot, GraphStore},
-    risk::{depeg_guard::DepegGuard, limits::RiskManager},
+    risk::limits::RiskManager,
     router::Router,
     rpc::RpcClients,
     types::{
@@ -37,7 +37,6 @@ pub async fn run_chain(
     let validator = Validator::new(settings.clone(), rpc.clone());
     let submitter = Submitter::new(settings.clone());
     let risk = RiskManager::new(&settings);
-    let depeg_guard = DepegGuard::new(&settings);
     let nonce_manager = NonceManager::new();
 
     let operator = validator
@@ -73,7 +72,6 @@ pub async fn run_chain(
         &validator,
         &submitter,
         &risk,
-        &depeg_guard,
         &nonce_manager,
         simulate_only,
     )
@@ -172,7 +170,6 @@ pub async fn run_chain(
             &validator,
             &submitter,
             &risk,
-            &depeg_guard,
             &nonce_manager,
             simulate_only,
         )
@@ -192,19 +189,12 @@ async fn process_refresh(
     validator: &Validator,
     submitter: &Submitter,
     risk: &RiskManager,
-    depeg_guard: &DepegGuard,
     nonce_manager: &NonceManager,
     simulate_only: bool,
 ) -> Result<()> {
     if changed_edges.is_empty() {
         return Ok(());
     }
-
-    // Removed global depeg gate - now handled at candidate level
-    // if !depeg_guard.stable_routes_allowed() {
-    //     warn!("stable depeg guard disabled route processing");
-    //     return Ok(());
-    // }
 
     let distance_cache = DistanceCache::recompute(snapshot.as_ref());
     let mut candidates = detector.detect(snapshot.as_ref(), &changed_edges, &distance_cache);
@@ -222,16 +212,7 @@ async fn process_refresh(
         "processing candidate set"
     );
 
-    for candidate in candidates.into_iter().take(32) {
-        // Candidate-level depeg check: reject if path touches unhealthy stable token
-        if !candidate_stables_healthy(&candidate, depeg_guard) {
-            debug!(
-                start_symbol = %candidate.start_symbol,
-                "candidate rejected - touches unhealthy stable token"
-            );
-            continue;
-        }
-
+    for candidate in candidates {
         if let Some(result) = process_candidate(
             settings.clone(),
             snapshot.as_ref(),
@@ -250,14 +231,6 @@ async fn process_refresh(
     }
 
     Ok(())
-}
-
-/// Check if all stable tokens in the candidate path are healthy
-fn candidate_stables_healthy(candidate: &CandidatePath, depeg_guard: &DepegGuard) -> bool {
-    candidate
-        .path
-        .iter()
-        .all(|hop| depeg_guard.token_is_healthy(hop.from) && depeg_guard.token_is_healthy(hop.to))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -298,6 +271,10 @@ async fn process_candidate(
             gross_profit_usd_e8 = executable.exact.gross_profit_usd_e8,
             flash_fee_raw = executable.exact.flash_fee_raw,
             flash_fee_usd_e8 = executable.exact.flash_fee_usd_e8,
+            flash_loan_amount = executable.exact.flash_loan_amount,
+            flash_loan_value_usd_e8 = executable.exact.flash_loan_value_usd_e8,
+            actual_flash_fee_raw = executable.exact.actual_flash_fee_raw,
+            actual_flash_fee_usd_e8 = executable.exact.actual_flash_fee_usd_e8,
             gas_cost_usd_e8 = executable.exact.gas_cost_usd_e8,
             net_profit_usd_e8 = executable.exact.net_profit_usd_e8,
             contract_min_profit_raw = executable.exact.contract_min_profit_raw,
@@ -333,6 +310,9 @@ fn validate_runtime_prerequisites(settings: &Settings) -> Result<()> {
     }
     if settings.contracts.executor_address.is_none() {
         anyhow::bail!("chain executor address env is required");
+    }
+    if settings.contracts.aave_pool.is_none() {
+        anyhow::bail!("chain Aave pool env is required");
     }
     Ok(())
 }

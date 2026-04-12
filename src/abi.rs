@@ -122,7 +122,13 @@ sol! {
     }
 
     interface IAavePool {
+        struct ReserveConfigurationMap {
+            uint256 data;
+        }
+
         function FLASHLOAN_PREMIUM_TOTAL() external view returns (uint128);
+        function getReservesList() external view returns (address[] memory);
+        function getConfiguration(address asset) external view returns (ReserveConfigurationMap memory);
     }
 
     interface IArbitrageExecutor {

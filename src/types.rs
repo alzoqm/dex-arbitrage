@@ -6,6 +6,7 @@ use std::{
 };
 
 use alloy::primitives::{Address, Bytes, B256, U256};
+use serde::{Deserialize, Serialize};
 use smallvec::SmallVec;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -62,7 +63,7 @@ impl Display for Chain {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum AmmKind {
     UniswapV2Like,
     UniswapV3Like,
@@ -82,7 +83,7 @@ impl AmmKind {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum DiscoveryKind {
     FactoryAllPairs,
     PoolCreatedLogs,
@@ -122,12 +123,15 @@ pub enum PoolAdmissionStatus {
 pub enum CapitalSource {
     SelfFunded,
     FlashLoan,
+    MixedFlashLoan,
 }
 
 #[derive(Debug, Clone, Copy)]
 pub struct CapitalChoice {
     pub source: CapitalSource,
+    pub loan_amount_raw: u128,
     pub flash_fee_raw: u128,
+    pub actual_flash_fee_raw: u128,
     pub net_profit_before_gas_raw: i128,
 }
 
@@ -347,6 +351,9 @@ pub struct CandidatePath {
 #[derive(Debug, Clone)]
 pub enum SplitExtra {
     None,
+    V2 {
+        fee_ppm: u32,
+    },
     V3 {
         zero_for_one: bool,
         sqrt_price_limit_x96: U256,
@@ -393,14 +400,17 @@ pub struct ExactPlan {
 
     // Raw input-token units (for contract)
     pub gross_profit_raw: i128,
+    pub flash_premium_ppm: u128,
     pub flash_fee_raw: u128,
     pub net_profit_before_gas_raw: i128,
     pub contract_min_profit_raw: u128,
 
     // USD e8 decision units (for off-chain risk checks)
     pub input_value_usd_e8: u128,
+    pub flash_loan_value_usd_e8: u128,
     pub gross_profit_usd_e8: i128,
     pub flash_fee_usd_e8: i128,
+    pub actual_flash_fee_usd_e8: i128,
     pub gas_cost_usd_e8: i128,
     pub net_profit_usd_e8: i128,
 
@@ -410,6 +420,8 @@ pub struct ExactPlan {
     pub gas_limit: u64,
     pub gas_cost_wei: U256,
     pub capital_source: CapitalSource,
+    pub flash_loan_amount: u128,
+    pub actual_flash_fee_raw: u128,
     pub hops: Vec<HopPlan>,
 }
 

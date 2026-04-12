@@ -1,4 +1,4 @@
-# DEX N-Hop Cyclic Arbitrage Bot — 상세 설계서 v2.1
+# DEX N-Hop Cyclic Arbitrage Bot — 상세 설계서 v2.2
 
 ## 1. 프로젝트 개요
 
@@ -7,20 +7,23 @@
 | 목적 | Base / Polygon 체인 내 DEX N-hop 순환 차익매매 자동화 |
 | 언어 | Rust (tokio async runtime) |
 | 노드 접근 | Base: Flashblocks-aware RPC + Standard RPC fallback / Polygon: Standard RPC(read) + Private Mempool(write) + Standard RPC fallback |
-| 매매 전략 | `cycle anchor` 토큰 A → … → A 순환 경로 후보 탐지 → exact quote / route simulation → 실행 |
-| 자본 전략 | 자기 자본 + Aave V3 Flash Loan 병행 |
+| 매매 전략 | Aave flash-loan 가능 토큰 A → … → A 순환 경로 후보 탐지 → exact quote / route simulation → 실행 |
+| 자본 전략 | executor 보유 잔고 우선 + 부족분 Aave V3 Flash Loan |
 | 라우팅 | Spot-graph 기반 후보 경로 탐지 + hop별 Split Routing + 총 수량 최적화 |
 | MEV 방어 | 체인별 Submitter Abstraction (Base: Flashblocks-aware read path + protected/private 가능 채널 + public fallback / Polygon: official Private Mempool default) |
-| DEX 범위 | 지원 풀 타입을 명시적으로 제한한 Uniswap V2/V3, QuickSwap/Sushi/BaseSwap, Aerodrome(volatile + CL만), Curve plain/metapool(plain ERC20만), Balancer Weighted(static fee만) |
+| DEX 범위 | `policy.venues = []`이면 config/env에 등록된 enabled venue 전체. 지원 풀 타입은 Uniswap V2/V3, QuickSwap/Sushi/BaseSwap, Aerodrome(volatile + CL만), Curve plain/metapool(plain ERC20만), Balancer Weighted(static fee만) |
 | 크로스체인 | 미적용 (체인별 독립 실행) |
 
-> **v2.1 핵심 변경**
-> - 기존 `USDC/USDT → ... → USDC/USDT` 중심 전략을 `is_cycle_anchor = true` 토큰 기준으로 일반화한다.
+> **v2.2 핵심 변경**
+> - 시작/종료 토큰은 config allowlist가 아니라 **live Aave V3 reserve discovery** 결과로 정한다.
+> - `policy.venues = []`, `policy.symbols = []`는 각각 모든 configured venue, 모든 discovered symbol을 의미한다.
 > - 플래시론은 차입 토큰과 상환 토큰이 동일해야 하므로 경로 invariant는 여전히 **start token == end token** 이다.
-> - `is_stable`은 depeg guard와 stablecoin 전용 정책에만 사용하고, cycle 시작/종료 권한은 `is_cycle_anchor`로 분리한다.
+> - config의 `is_cycle_anchor` / `flash_loan_enabled` 플래그는 더 이상 시작/종료 권한을 부여하지 않는다. 최종 anchor는 Aave reserve의 flash-loan enabled 상태로 덮어쓴다.
+> - 자기자본 실행은 별도 경로가 아니라 “최적 진입 수량 중 executor가 보유한 start asset을 먼저 사용하고 부족분만 flash loan” 하는 방식이다.
+> - 최적 진입 수량 계산은 보수적으로 **전체 input이 flash loan이라고 가정한 수수료**를 먼저 반영한다.
 > - 오프체인 리스크/수익성 판단은 USD e8 기준으로 수행하고, 컨트랙트 `minProfit`은 입력 토큰 raw 단위로 유지한다.
 
-> **v2.1 지원 범위 외**
+> **v2.2 지원 범위 외**
 > - Aerodrome V1 stable pool
 > - Balancer Composable Stable / Linear / Boosted / Managed / dynamic-fee pool
 > - Curve pool 중 rebasing / ERC4626 / rate-oraclized token 포함 풀
@@ -95,52 +98,70 @@
 | Polygon | StableSwap (plain ERC20 only) | Curve plain pools / metapools |
 | Polygon | Weighted Pool (static fee only) | Balancer Weighted |
 
-**풀/자산 Admission Policy**
+**풀/자산 Universe Policy**
 
-그래프는 “모든 ERC-20, 모든 풀”을 무차별적으로 수용하지 않는다. Discovery 단계에서 아래 규칙을 통과한 대상만 등록한다.
+목표 universe는 “해당 체인의 configured venue 전체 + 해당 venue에서 발견되는 ERC-20 전체”다.
+단, “모든 venue”는 온체인에 존재하는 임의 DEX까지 자동 탐색한다는 뜻이 아니라, `config/{chain}.toml`에 등록되어 있고 필요한 factory / registry / vault env가 설정된 enabled venue 전체를 뜻한다.
+
+```toml
+[policy]
+venues = []   # empty => all configured enabled venues
+symbols = []  # empty => all discovered token symbols
+```
+
+`venues`나 `symbols`가 비어 있지 않으면 명시된 이름만 포함한다. 비어 있으면 제한하지 않는다.
+
+Discovery 단계의 hard admission은 경로 universe를 임의로 줄이지 않도록 최소화한다.
 
 | 검사 항목 | 기준 |
 |---|---|
 | Factory / Registry 검증 | 공식 factory / registry / vault / pool factory에서 생성된 풀만 허용 |
 | Pool Type allowlist | 위 표의 지원 풀 타입만 허용 |
-| Token behavior | fee-on-transfer, rebasing, ERC4626, rate-oraclized, callback 특이 토큰은 기본 제외 |
-| Liquidity Floor | USD 환산 최소 유동성 기준 미달 시 제외 |
-| Pool Health | pause / freeze / dynamic-fee / owner-managed 특징이 있으면 기본 제외 또는 quarantine |
-| Codehash / ABI | 기대한 ABI 및 bytecode 패턴과 일치해야 함 |
-| Recent Revert Rate | warm-up 기간 동안 quote/sim 실패율이 높으면 quarantine |
+| Token universe | pool token은 ERC-20 metadata 조회 후 등록. `policy.symbols`가 비어 있지 않을 때만 symbol 필터 적용 |
+| Aave reserve universe | `getReservesList()` + `getConfiguration(asset)`로 active + unpaused + flashloan enabled reserve만 시작/종료 anchor로 등록 |
+| Pool Health | paused / quarantined / explicitly excluded 상태는 제외 |
+| Optional safety policy | fee-on-transfer, rebasing, ERC4626, rate-oraclized, callback token, codehash, revert-rate, liquidity floor는 별도 risk/admission 모듈에서 추가할 수 있으나 full-universe 모드의 기본 hard filter가 아니다 |
 
 **토큰 역할 분리**
 
-토큰 설정은 stable 여부와 cycle 시작/종료 가능 여부를 분리한다.
+토큰 설정은 stable 여부, 가격 seed, 자기자본 사용 정책을 제공한다.
+cycle 시작/종료 권한은 config가 아니라 Aave reserve discovery가 최종 결정한다.
 
 | 필드 | 의미 |
 |---|---|
 | `is_stable` | stablecoin health/depeg guard 적용 대상 |
-| `is_cycle_anchor` | Detector가 순환 경로의 시작/종료 토큰으로 사용할 수 있는 토큰 |
-| `flash_loan_enabled` | Capital selector가 Aave flash loan 차입 후보로 사용할 수 있는 토큰 |
-| `allow_self_funded` | executor 보유 잔고를 자기자본 실행 후보로 사용할 수 있는 토큰 |
+| `is_cycle_anchor` | runtime `TokenInfo`에서 Aave flash-loan enabled reserve일 때 true. config 값은 anchor 권한으로 사용하지 않음 |
+| `flash_loan_enabled` | runtime `TokenInfo`에서 Aave flash-loan enabled reserve일 때 true. config 값은 discovery 후 덮어씀 |
+| `allow_self_funded` | legacy/advisory flag. 현재 capital selector는 Aave-flashloan-enabled start token에 대해 executor 잔고를 우선 사용 |
 | `price_env` / `manual_price_usd_e8` | USD e8 리스크, 수익성, 가스 비용 환산에 사용하는 가격 |
 | `max_position_usd_e8` | 토큰별 선택적 포지션 한도 |
 | `max_flash_loan_usd_e8` | 토큰별 선택적 플래시론 한도 |
 
-Backward-compatible 기본값:
+Runtime anchor assignment:
 
 ```text
-is_cycle_anchor    defaults to is_stable
-flash_loan_enabled defaults to is_cycle_anchor
-allow_self_funded  defaults to is_stable
+config token is loaded with:
+  is_cycle_anchor = false
+  flash_loan_enabled = false
+
+discovery then applies:
+  if token.address in live Aave flash-loan reserve set:
+      is_cycle_anchor = true
+      flash_loan_enabled = true
+  else:
+      is_cycle_anchor = false
+      flash_loan_enabled = false
 ```
 
-따라서 기존 USDC/USDT 동작은 유지하면서, WETH/DAI/WMATIC 같은 토큰은 설정에서 명시적으로 anchor 권한과 flash-loan 권한을 켜야 한다.
+따라서 WETH/DAI/WMATIC/USDC/USDT 등 어떤 토큰이든 Aave에서 flash loan 차입 가능한 reserve이면 start/end 후보가 될 수 있다.
+반대로 config에 명시되어 있어도 Aave reserve가 아니거나 flash loan disabled이면 start/end 후보가 아니다.
 
 Config validation:
 
 ```text
-at least one cycle anchor must be configured
-flash_loan_enabled token must also be is_cycle_anchor
-cycle anchor used for USD risk must have manual_price_usd_e8 or an approved oracle source
 wrapped native token price must be configured for gas USD valuation
 MIN_PROFIT_REALIZATION_BPS must be in [0, 10000]
+non-empty policy.venues / policy.symbols acts as an explicit filter
 ```
 
 **프로토콜별 풀 수집 방법**
@@ -154,19 +175,28 @@ MIN_PROFIT_REALIZATION_BPS must be in [0, 10000]
 
 **수집 절차**
 
-1. **Factory / Registry / Vault 순회**: 지원 범위에 속하는 전체 풀 주소 목록 수집.
-2. **풀 메타데이터 캐싱**: 풀마다 AMM 유형, 토큰 목록, fee tier, 불변 파라미터, 지원 여부를 1회 조회 후 로컬 캐시에 저장.
+1. **Factory / Registry / Vault 순회**: `policy.venues`에 의해 제외되지 않은 enabled venue의 전체 풀 주소 목록 수집.
+2. **Discovery Cache 사용**: `state/{chain}_discovery_cache.json`에 venue별 cursor와 pool 목록을 저장해 cold start 이후에는 증분 스캔한다.
+   - V2 / Curve registry 계열: count cursor 기반 증분 조회
+   - V3 / Balancer log 계열: block cursor 기반 증분 `eth_getLogs`
+   - log scan은 `DISCOVERY_LOG_CHUNK_BLOCKS` 단위로 나누어 provider range 제한을 피한다.
+3. **풀 메타데이터 조회**: 풀마다 AMM 유형, 토큰 목록, fee tier, 불변 파라미터, 지원 여부를 조회한다.
    - V2-like: `token0`, `token1`, `fee`, stable/volatile flag(해당 시), factory
    - V3 / Slipstream: `token0`, `token1`, `fee`, `tickSpacing`, factory
    - Curve: `coins(i)`, `A`, `fee`, 코인 개수, pool type, exotic token 여부
    - Balancer Weighted: `getPoolTokens(poolId)`, `getNormalizedWeights()`, `getSwapFeePercentage()`, owner / paused / dynamic fee 여부
-3. **Admission Filtering**: 지원 풀 타입, 토큰 특성, codehash/factory 검증, 유동성 기준을 통과한 풀만 채택.
-4. **초기 가격/유동성 스냅샷**: 풀마다 현재 상태를 정확한 정수 산술로 조회 → spot graph 간선과 quote cache 초기화.
-5. **Aave Flash Loan 파라미터 수집**: `FLASHLOAN_PREMIUM_TOTAL()` 및 anchor별 reserve availability를 조회하여 flash loan 비용 모델 초기화.
-6. **가스비 기준값 수집**:
+4. **토큰 메타데이터 확장**: pool token과 Aave reserve token에 대해 ERC-20 `symbol()` / `decimals()`를 조회한다.
+   - `symbol()`이 dynamic string decode에 실패하면 bytes32 symbol decode를 시도한다.
+   - metadata 조회 실패 시 symbol은 address string, decimals는 18 fallback을 사용한다.
+   - stable symbol(USDC/USDT/DAI/USDS 등)은 기본 $1 seed를 가진다.
+5. **Admission Filtering**: 지원 풀 타입, factory/registry/vault 검증, paused/quarantined 여부를 기준으로 hard filter한다. 토큰 allowlist나 raw liquidity floor로 기본 universe를 줄이지 않는다.
+6. **초기 가격/유동성 스냅샷**: 풀마다 현재 상태를 정확한 정수 산술로 조회 → spot graph 간선과 quote cache 초기화.
+7. **DEX-derived 가격 보강**: stable seed 또는 manual price가 있는 토큰에서 출발해 V2/Curve/Balancer balance ratio와 V3 sqrt price로 누락 가격을 median propagation 방식으로 보강한다.
+8. **Aave Flash Loan 파라미터 수집**: `FLASHLOAN_PREMIUM_TOTAL()` 및 Aave reserve list/config를 조회하여 flash loan 비용 모델과 anchor set을 초기화.
+9. **가스비 기준값 수집**:
    - Base: L2 fee + L1 security fee 분리 모델 초기화
    - Polygon: EIP-1559 `baseFee` + `priorityFee` 모델 초기화
-7. **초기 Graph Snapshot 생성**: `snapshot_id = 0` 으로 시작하는 immutable snapshot 생성.
+10. **초기 Graph Snapshot 생성**: `snapshot_id = 0` 으로 시작하는 immutable snapshot 생성.
 
 **Alchemy / Provider 호출 최적화**
 
@@ -254,7 +284,8 @@ Standard WSS logs
 1. **Transactional Update**: 한 풀의 상태 갱신은 all-or-nothing으로 반영한다.
 2. **Partial Failure 금지**: Curve/Balancer의 `eth_call` 재조회가 실패하면 기존 상태를 유지하고 해당 풀을 `stale/quarantine` 으로 마킹한다.
 3. **Changed Edges Only**: 변경된 풀의 간선만 새 스냅샷에서 갱신한다.
-4. **Pool Health Tracking**: stale / paused / unsupported / revert-heavy 풀은 detector 후보군에서 제외한다.
+4. **Pool Health Tracking**: paused / quarantined / explicitly excluded 풀은 detector 후보군에서 제외한다. confidence는 정렬/우선순위 신호로 사용하되, full-universe 모드에서는 별도 cap으로 후보를 잘라내지 않는다.
+5. **Log Chunking**: HTTP polling fallback은 `EVENT_LOG_CHUNK_BLOCKS`와 `EVENT_LOG_ADDRESS_CHUNK_SIZE`로 block range와 address 목록을 모두 쪼개 provider 제한을 피한다.
 
 **업데이트 출력**
 
@@ -377,7 +408,7 @@ enum AmmType {
 }
 ```
 
-`TokenInfo`는 실행 가능한 anchor 판단과 stable-specific 판단을 분리해서 가진다.
+`TokenInfo`는 stable-specific 판단과 Aave-derived anchor 판단을 분리해서 가진다. `is_cycle_anchor`와 `flash_loan_enabled`는 config 값이 아니라 discovery가 적용한 live Aave reserve 결과다.
 
 ```rust
 struct TokenInfo {
@@ -402,7 +433,7 @@ struct TokenInfo {
 | `pool_to_edges` | 이벤트 수신 → O(1)로 해당 풀의 모든 간선 접근 |
 | `reverse_adj` | 역방향 탐색 / `reachable_to_anchor` 계산 |
 | `stable_token_indices` | stablecoin depeg guard / stable-specific metrics |
-| `cycle_anchor_indices` | 순환 경로 시작·종료점 빠른 접근 |
+| `cycle_anchor_indices` | Aave flash-loan-enabled reserve 기반 순환 경로 시작·종료점 빠른 접근 |
 | `pair_to_pools` | exact quote / split routing 시 병렬 풀 조회 |
 
 **정밀도 정책**
@@ -476,9 +507,9 @@ Detector에 (snapshot_id, changed_edges) 전달
     │   detector는 입력으로 받은 snapshot_id만 사용
     │
     ├─ [2단계] 시작점 필터링
-    │   cycle anchor에서 u까지 도달 가능한가?
-    │   v에서 cycle anchor로 복귀 가능한가?
-    │   pool_health가 양호한가?
+    │   Aave flash-loan-enabled anchor에서 u까지 도달 가능한가?
+    │   v에서 동일 anchor로 복귀 가능한가?
+    │   pool이 paused/quarantined/excluded 상태가 아닌가?
     │
     ├─ [3단계] 후보 경로 탐색
     │   MAX_HOPS 범위 내에서 음의 순환 후보를 탐색
@@ -501,6 +532,7 @@ Detector에 (snapshot_id, changed_edges) 전달
 **Cycle anchor DFS root**
 
 Detector는 `stable_token_indices`가 아니라 `cycle_anchor_indices`를 DFS root로 사용한다.
+`cycle_anchor_indices`는 config allowlist가 아니라 live Aave flash-loan reserve set에서 만들어진다.
 
 ```rust
 for &anchor_idx in &snapshot.cycle_anchor_indices {
@@ -522,17 +554,15 @@ contract final currentToken == params.inputToken
 
 #### 3.3.3 사전 계산 테이블 (Distance Cache)
 
-빠른 증분 판단을 위해 두 개의 거리 테이블을 유지한다.
+빠른 증분 판단을 위해 두 개의 도달 가능성 테이블을 유지한다.
 
 ```
-reachable_from_anchor[v] : cycle anchor → v 도달 가능 여부
-reachable_to_anchor[v]   : v → cycle anchor 도달 가능 여부
-prev_from_anchor[v]      : 경로 복원용
-prev_to_anchor[v]        : 경로 복원용
+reachable_from_anchor[v] : Aave anchor → v 도달 가능 여부
+reachable_to_anchor[v]   : v → Aave anchor 도달 가능 여부
 ```
 
 - **초기화**: 부트스트랩 시 `cycle_anchor_indices`를 source set으로 전체 1회 계산
-- **증분 갱신**: `changed_edges` 중심으로 SPFA/queue propagation
+- **갱신**: snapshot 단위로 recompute하거나 `changed_edges` 중심 증분 갱신을 적용할 수 있다.
 - **주의**: 이 캐시는 candidate prescreen 전용이다. exact profit을 의미하지 않는다.
 
 ---
@@ -547,17 +577,16 @@ prev_to_anchor[v]        : 경로 복원용
 | `MIN_TRADE_USD_E8` | 수량 탐색 시작점 | $10 등 |
 | `MAX_POSITION_USD_E8` | 단일 트랜잭션 입력 가치 한도 | $2,000 등 |
 | `MAX_FLASH_LOAN_USD_E8` | 단일 플래시론 차입 가치 한도 | $10,000 등 |
-| `LIQUIDITY_FLOOR` | 최소 유동성 | $10,000 상당 |
-| `POOL_HEALTH_MIN` | confidence 하한 | 9,000 bps 등 |
-| `STABLE_DEPEG_CUTOFF` | stable path 차단 기준 | 예: $0.995 |
+| `POOL_HEALTH_MIN` | optional confidence 하한. 기본 full-universe 탐색에서는 hard cap이 아니라 ranking/monitoring 신호 | 9,000 bps 등 |
+| `STABLE_DEPEG_CUTOFF` | optional stable risk signal. 기본 full-universe 탐색에서는 candidate hard block이 아님 | 예: $0.995 |
 
 가지치기 규칙:
-1. `pool_health`가 불량(stale / quarantined / paused)이면 제외.
+1. `PoolAdmissionStatus::Excluded`, paused, quarantined 풀은 제외.
 2. Hop 수가 `MAX_HOPS`를 넘으면 종단.
-3. 이미 방문한 토큰 재방문 금지 (단순 순환만 허용).
-4. exact quote로 넘어가기 전 low-TVL / exotic-token path는 제외.
-5. 후보 경로가 unhealthy stable token을 포함하면 해당 후보만 제외한다.
-6. `cycle_anchor_indices`별 후보 수를 제한하여 한 anchor의 noisy subgraph가 다른 anchor 후보를 starvation시키지 않도록 한다.
+3. 후보는 동일 anchor로 돌아온 경우에만 emit한다.
+4. hot path에서는 변경된 edge를 포함한 후보만 재평가한다. cold start는 모든 edge를 changed edge로 간주한다.
+5. 후보 dedup은 `(from, to, pool_id)` sequence 기준으로 수행한다.
+6. outgoing edge 수, anchor별 후보 수, stable 여부, symbol 여부로 hidden cap을 두지 않는다. 필요한 경우 별도 risk policy로 명시적으로 추가한다.
 
 ---
 
@@ -657,9 +686,12 @@ capacity를 넘는 split은 후보에서 제외한다.
 
 1. `MIN_TRADE_USD_E8`와 anchor 가격을 raw token amount로 변환해 geometric ladder 시작점을 만든다.
 2. `MAX_POSITION_USD_E8`와 token-level `max_position_usd_e8`를 raw token amount로 변환해 ladder 상한을 만든다.
-3. geometric ladder로 입력 수량 후보 구간을 빠르게 훑는다.
-4. 상위 구간에서 local refinement(ternary / bracketed search)를 수행한다.
-5. 최고 순이익 수량을 선택한다.
+3. Router는 Aave `FLASHLOAN_PREMIUM_TOTAL()`을 먼저 조회한다. 조회 실패 시 premium 0 fallback을 쓰지 않고 해당 후보를 reject한다.
+4. 모든 입력 수량 평가에서 보수적으로 `input_amount × flash_premium_ppm`을 flash fee로 차감한다.
+5. geometric ladder로 입력 수량 후보 구간을 빠르게 훑는다.
+6. ladder에서 수익이 높은 상위 seed 여러 개를 고른다.
+7. 각 seed 주변에서 refinement point, bracketed ternary search, dense sampling을 수행한다.
+8. 최고 `net_profit_before_gas_raw` 수량을 선택한다.
 
 예시:
 
@@ -671,7 +703,7 @@ WETH decimals=18, price=$3,000:
   $2,000 max_position -> 0.666... WETH raw
 ```
 
-legacy raw `max_position`은 가격이 없는 토큰의 fallback 또는 migration 보조값으로만 사용한다. 실행 리스크 판단의 primary unit은 USD e8이다.
+legacy raw `max_position`은 가격이 없는 토큰의 fallback 또는 migration 보조값으로만 사용한다. 실행 리스크 판단의 primary unit은 USD e8이다. 가격이 없는 start token은 USD 기반 search range를 만들 수 없으므로 실행 후보가 되지 않는다.
 
 ---
 
@@ -707,7 +739,9 @@ candidate_path + snapshot_id 수신
     │   - hop별 split + 총 입력 수량 최적화
     │
     ├─ [2] 자본 전략 결정
-    │   - self-funded vs flashLoanSimple
+    │   - executor 보유 start asset 확인
+    │   - 부족분만 flashLoanSimple
+    │   - 부족분이 0이면 executeSelfFunded
     │
     ├─ [3] route-level 최종 검증
     │   - input/gross/flash/gas를 USD e8로 환산
@@ -737,11 +771,14 @@ candidate_path + snapshot_id 수신
 
 ```text
 1. Router returns raw cyclic quote plan.
-2. CapitalSelector chooses SelfFunded or FlashLoan and fills flash_fee_raw.
+2. CapitalSelector checks executor balance and chooses SelfFunded, FlashLoan, or MixedFlashLoan.
+   - `flash_fee_raw` is conservative full-input flash fee.
+   - `actual_flash_fee_raw` is loan shortfall fee.
+   - `flash_loan_amount` is `max(0, input_amount - executor_balance)`.
 3. contract_min_profit_raw is computed from net_profit_before_gas_raw.
 4. TxBuilder builds preliminary calldata.
 5. estimate_gas + GasTracker buffered gas quote.
-6. input/gross/flash/gas are converted to USD e8.
+6. input/gross/conservative flash/actual flash/gas are converted to USD e8.
 7. Reject if net_profit_usd_e8 < min_net_profit_usd_e8.
 8. Rebuild calldata if contract_min_profit_raw changed.
 9. Simulate against target state.
@@ -763,7 +800,8 @@ Gas USD conversion requires the configured wrapped native token price:
 
 **v2 선택**
 
-- 시작/종료 토큰은 동일한 `cycle anchor` ERC-20이며, 해당 토큰이 flash-loan enabled인 경우 **`flashLoanSimple()`** 를 사용한다.
+- 시작/종료 토큰은 동일한 ERC-20이며, 해당 토큰이 Aave V3에서 flash-loan enabled reserve일 때만 anchor가 된다.
+- 부족한 자본이 있으면 **`flashLoanSimple()`** 를 사용한다.
 - `flashLoanSimple()` 은 gas 효율이 높고, fee waiver가 없다.
 - 플래시론 수수료는 하드코딩하지 않고 **on-chain `FLASHLOAN_PREMIUM_TOTAL()` 조회값** 을 사용한다.
 - `flashLoanSimple()`은 하나의 asset만 차입하므로 경로는 반드시 `inputToken`으로 끝나야 한다.
@@ -773,13 +811,14 @@ Gas USD conversion requires the configured wrapped native token price:
 ```
 1. startup / periodic refresh 시 FLASHLOAN_PREMIUM_TOTAL 조회
 2. opportunity마다:
-   - self-funded profitability 계산
-   - flashLoanSimple profitability 계산
-   - token-level flash cap / global flash cap을 USD e8 기준으로 확인
-3. 가능한 자본 모드 중 더 나은 모드 선택
-4. executeOperation() 내부에서 경로 실행
-5. amount + premium 상환
-6. minProfit 미달 시 전체 revert
+   - optimal input amount 계산 시 전체 input이 flash loan이라고 가정해 conservative flash fee를 차감
+   - executor의 start token balance 조회
+   - `loan_amount = max(0, optimal_input - executor_balance)`
+   - token-level flash cap / global flash cap은 `loan_amount`의 USD e8 가치 기준으로 확인
+3. `loan_amount == 0`이면 `executeSelfFunded`, `loan_amount > 0`이면 `executeFlashLoan`
+4. `executeOperation()` 내부에서 `execution.inputAmount >= amount`를 확인하고, loan + 기존 executor 잔고를 합쳐 경로 실행
+5. `amount + premium` 상환
+6. `startBalance + premium + minProfit` 미달 시 전체 revert
 ```
 
 **수익성 계산**
@@ -787,29 +826,35 @@ Gas USD conversion requires the configured wrapped native token price:
 ```
 gross_profit_raw = final_output - input_amount
 
-net_profit_before_gas_raw_self  = gross_profit_raw
-net_profit_before_gas_raw_flash = gross_profit_raw - flash_fee
+conservative_flash_fee = input_amount × current_flashloan_premium
+actual_flash_fee       = loan_amount × current_flashloan_premium
 
-flash_fee = borrowed_amount × current_flashloan_premium
+net_profit_before_gas_raw = gross_profit_raw - conservative_flash_fee
 
 net_profit_usd_e8 =
   value_usd_e8(net_profit_before_gas_raw, input_token)
   - gas_buffered_cost_usd_e8
 ```
 
-**Self-funded vs Flash Loan 자동 선택**
+`actual_flash_fee`는 로그, 실제 flash cost, flash loan cap 평가에 사용한다.
+기대 수익과 route-level threshold는 항상 `conservative_flash_fee` 기준이다.
+
+**Self-funded / Mixed Flash Loan 자동 선택**
 
 ```
-IF token.allow_self_funded
-   AND self_balance >= optimal_amount
-   AND net_profit_self_usd_e8 >= net_profit_flash_usd_e8:
+IF token.flash_loan_enabled
+   AND aave_pool configured
+   AND flash premium query succeeds
+   AND executor_balance >= optimal_amount
+   AND conservative net profit passes:
        → Self-funded
 ELIF token.flash_loan_enabled
    AND aave_pool configured
    AND flash premium query succeeds
-   AND input_value_usd_e8 <= token/global flash cap
-   AND net_profit_flash_usd_e8 >= MIN_NET_PROFIT_USD_E8:
-       → Flash Loan
+   AND loan_amount_usd_e8 <= token/global flash cap
+   AND conservative net profit passes:
+       → Flash Loan if loan_amount == optimal_amount
+       → MixedFlashLoan if 0 < loan_amount < optimal_amount
 ELSE:
        → 실행하지 않음
 ```
@@ -818,8 +863,9 @@ ELSE:
 
 - self-funded가 불가능하면 임의로 SelfFunded로 fallback하지 않는다.
 - flash premium 조회 실패를 0으로 취급하지 않는다.
-- flash-loan enabled 토큰이더라도 Aave reserve availability와 최종 simulation을 통과해야 한다.
-- 두 자본 모드는 같은 input token raw profit을 기준으로 비교할 수 있지만, 실행 threshold와 logging은 USD e8로 정규화한다.
+- flash-loan enabled는 config 플래그가 아니라 Aave reserve availability 조회 결과다.
+- self-funded도 Aave anchor token에 대해서만 수행한다. 이는 시작/끝 universe를 Aave borrowable asset으로 고정하기 위한 의도적 제약이다.
+- 실행 threshold와 logging은 USD e8로 정규화한다.
 
 ---
 
@@ -836,12 +882,12 @@ ELSE:
 │   - Ownable / Safe-owned auth                │
 │                                              │
 │  [진입점 1] executeSelfFunded(params)         │
-│    → transferFrom / prefunded balance 사용     │
+│    → prefunded executor balance 사용           │
 │    → _executeSwapPath                         │
 │                                              │
 │  [진입점 2] executeFlashLoan(params)          │
-│    → Aave flashLoanSimple                     │
-│    → executeOperation 콜백에서 경로 실행       │
+│    → 부족분만 Aave flashLoanSimple             │
+│    → executeOperation 콜백에서 own+loan 실행   │
 │                                              │
 │  [콜백] uniswapV3SwapCallback(...)            │
 │    → canonical pool / factory 검증            │
@@ -871,6 +917,7 @@ ELSE:
 - 무제한 approve를 광범위하게 남기지 않는다.
 - 필요한 대상(router / vault / pool)에 대해 `exact approve` 또는 `forceApprove` 패턴을 사용한다.
 - 신뢰 가능한 정적 대상만 allowlist에 포함한다.
+- V2-like split은 venue별 `fee_ppm`을 `extraData`로 전달하고, 컨트랙트 quote도 이 값을 사용한다. extraData가 없으면 backward-compatible default `3000 ppm`을 사용한다.
 
 ---
 
@@ -925,7 +972,10 @@ subject to:
 
 **외부 루프**
 
-- geometric ladder + local refinement로 최적 input을 탐색한다.
+- `MIN_TRADE_USD_E8` ~ `MAX_POSITION_USD_E8` 범위에서 geometric ladder를 만든다.
+- Aave premium을 1회 조회하고, 모든 candidate input 평가에 conservative full-flash fee를 적용한다.
+- ladder 평가 후 수익 상위 seed 여러 개를 대상으로 local refinement를 수행한다.
+- 각 seed 주변에서 bracketed ternary search와 dense sampling을 병행한다.
 
 **내부 루프**
 
@@ -972,8 +1022,8 @@ subject to:
 | `GAS_RISK_BUFFER_PCT` | 가스비 안전 마진 |
 | `CIRCUIT_BREAKER` | 연속 손실 시 일시 정지 |
 | `STALENESS_TIMEOUT` | 마지막 신뢰성 있는 업데이트 이후 허용 시간 |
-| `POOL_HEALTH_MIN` | detector 진입 최소 confidence |
-| `STABLE_DEPEG_CUTOFF` | unhealthy stable token을 포함한 candidate 차단 기준 |
+| `POOL_HEALTH_MIN` | optional confidence threshold / monitoring signal. 기본 full-universe 탐색의 hard cap이 아님 |
+| `STABLE_DEPEG_CUTOFF` | optional stable risk signal. 기본 full-universe 탐색의 candidate hard block이 아님 |
 | `REORG_BUFFER_DEPTH` | rollback 가능한 최근 snapshot 수 |
 | `CHANNEL_TTL_MS` | submitter 재시도 전 기회 유효 시간 |
 
@@ -990,16 +1040,23 @@ struct ExactPlan {
 
     // input token raw units
     gross_profit_raw: i128,
+    flash_premium_ppm: u128,
     flash_fee_raw: u128,
+    actual_flash_fee_raw: u128,
     net_profit_before_gas_raw: i128,
     contract_min_profit_raw: u128,
 
     // USD e8 decision units
     input_value_usd_e8: u128,
+    flash_loan_value_usd_e8: u128,
     gross_profit_usd_e8: i128,
     flash_fee_usd_e8: i128,
+    actual_flash_fee_usd_e8: i128,
     gas_cost_usd_e8: i128,
     net_profit_usd_e8: i128,
+
+    capital_source: SelfFunded | FlashLoan | MixedFlashLoan,
+    flash_loan_amount: u128,
 }
 ```
 
@@ -1007,7 +1064,7 @@ Risk manager checks:
 
 ```text
 input_value_usd_e8 <= max_position_usd_e8
-if flash: input_value_usd_e8 <= max_flash_loan_usd_e8
+if flash or mixed flash: flash_loan_value_usd_e8 <= max_flash_loan_usd_e8
 net_profit_usd_e8 >= min_net_profit_usd_e8
 open_tx_count < max_concurrent_tx
 daily_pnl_usd_e8 loss <= daily_loss_limit_usd_e8
@@ -1362,10 +1419,11 @@ ArbitrageExecutor
     ├── ExecutionParams { inputToken, inputAmount, hops, minProfit, deadline, snapshotId }
     ├── FlashLoanParams { loanAsset, loanAmount, execution }
     ├── Hop { splits: Split[] }
-    └── Split { adapterType, pool, tokenIn, tokenOut, amountIn, minAmountOut }
+    └── Split { adapterType, pool, tokenIn, tokenOut, amountIn, minAmountOut, extraData }
 ```
 
 `minProfit`은 항상 `inputToken` raw 단위다. USD e8 profit threshold는 오프체인 validator/risk manager에서만 사용한다.
+`loanAmount`는 `inputAmount`와 같을 필요가 없다. partial flash 실행에서는 `0 < loanAmount < inputAmount`가 가능하고, 나머지는 executor의 기존 input token balance가 부담한다.
 
 ### 9.2 DEX 어댑터별 호출 인터페이스
 
@@ -1375,6 +1433,8 @@ ArbitrageExecutor
 | UniswapV3Adapter | Pool Contract 직접 | `swap(...)` 호출 후 `uniswapV3SwapCallback(...)` 에서 정산, canonical factory 검증 필수 |
 | CurveAdapter | Pool Contract | 지원되는 plain/metapool ABI에 한해 `exchange(...)` / `exchange_underlying(...)` |
 | BalancerAdapter | Vault Contract | `swap(...)` / 필요 시 `batchSwap(...)`, validation은 `querySwap` / `queryBatchSwap`와 동일 결과 기준 |
+
+V2-like adapter는 `extraData`에 ABI-encoded `fee_ppm`을 받는다. 이 값으로 컨트랙트의 `_getAmountOut`을 계산하므로 BaseSwap/Aerodrome 등 0.30%가 아닌 V2 venue도 off-chain quote와 on-chain minOut 검증이 일치한다.
 
 ### 9.3 가스비 예상 (hop당)
 
@@ -1408,10 +1468,10 @@ Polygon total fee = EIP-1559 base fee + priority fee
 | Graph data stale | pool quarantine + detector 제외 + 주기적 refresh |
 | Curve/Balancer re-read 실패 | partial update 금지, 기존 상태 유지, stale 마킹 |
 | Route simulation 실패 | 즉시 폐기 + rejection reason 기록 |
-| Flash Loan 실패 | self-funded 모드 재평가 또는 기회 폐기 |
+| Flash Loan 실패 | 해당 opportunity 폐기. self-funded는 사전 capital selection에서 `loan_amount == 0`일 때만 선택 |
 | Private Mempool / protected submit 실패 | fresh snapshot 재시뮬레이션 후 fallback 채널 고려 |
 | Nonce 충돌 | local reservation + pending nonce reconciliation + replacement 정책 |
-| 프로세스 비정상 종료 | pool metadata / admission cache로 warm start, state만 재수집 |
+| 프로세스 비정상 종료 | discovery cache로 pool universe를 warm start하고, volatile pool state만 재수집 |
 
 ---
 

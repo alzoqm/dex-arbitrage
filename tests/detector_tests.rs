@@ -2,7 +2,10 @@ use std::{collections::HashMap, sync::Arc, time::SystemTime};
 
 use alloy::primitives::Address;
 use dex_arbitrage::{
-    config::{ContractSettings, DexConfig, RiskSettings, RpcSettings, Settings, TokenConfig},
+    config::{
+        ContractSettings, DexConfig, RiskSettings, RpcSettings, Settings, TokenConfig,
+        UniversePolicy,
+    },
     detector::Detector,
     graph::{DistanceCache, GraphSnapshot},
     types::{
@@ -123,6 +126,7 @@ fn settings() -> Arc<Settings> {
             pool_health_min_bps: 9_000,
             stable_depeg_cutoff_e6: 995_000,
         },
+        policy: UniversePolicy::default(),
         tokens: vec![
             TokenConfig {
                 symbol: "USDC".to_string(),

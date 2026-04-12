@@ -17,6 +17,10 @@ pool_health_min_bps = 9000
 stable_depeg_cutoff_e6 = 995000
 strict_target_allowlist = false
 
+[policy]
+venues = []
+symbols = []
+
 [[tokens]]
 symbol = "USDC"
 address_env = "BASE_USDC"
@@ -36,8 +40,6 @@ symbol = "WETH"
 address_env = "BASE_WETH"
 decimals = 18
 is_stable = false
-is_cycle_anchor = false
-flash_loan_enabled = false
 allow_self_funded = false
 price_env = "BASE_WETH_PRICE_E8"
 
@@ -46,8 +48,6 @@ symbol = "DAI"
 address_env = "BASE_DAI"
 decimals = 18
 is_stable = false
-is_cycle_anchor = false
-flash_loan_enabled = false
 allow_self_funded = false
 price_env = "BASE_DAI_PRICE_E8"
 
@@ -56,8 +56,6 @@ symbol = "cbETH"
 address_env = "BASE_CBETH"
 decimals = 18
 is_stable = false
-is_cycle_anchor = false
-flash_loan_enabled = false
 allow_self_funded = false
 price_env = ""
 

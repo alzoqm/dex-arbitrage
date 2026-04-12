@@ -3,7 +3,6 @@ use std::{cmp::Ordering, sync::Arc};
 use anyhow::Result;
 
 use crate::{
-    config::Settings,
     graph::GraphSnapshot,
     types::{AdapterType, SplitExtra, SplitPlan},
 };
@@ -12,16 +11,12 @@ use super::{exact_quoter::ExactQuoter, split_decision::should_split};
 
 #[derive(Debug, Clone)]
 pub struct SplitOptimizer {
-    settings: Arc<Settings>,
     exact_quoter: ExactQuoter,
 }
 
 impl SplitOptimizer {
-    pub fn new(settings: Arc<Settings>, exact_quoter: ExactQuoter) -> Self {
-        Self {
-            settings,
-            exact_quoter,
-        }
+    pub fn new(_settings: Arc<crate::config::Settings>, exact_quoter: ExactQuoter) -> Self {
+        Self { exact_quoter }
     }
 
     pub async fn optimize_pair(
@@ -166,7 +161,9 @@ impl SplitOptimizer {
             }
             let min_amount_out = ((expected as f64) * 0.995) as u128;
             let extra = match &pool.state {
-                crate::types::PoolSpecificState::UniswapV2Like(_) => SplitExtra::None,
+                crate::types::PoolSpecificState::UniswapV2Like(state) => SplitExtra::V2 {
+                    fee_ppm: state.fee_ppm,
+                },
                 crate::types::PoolSpecificState::UniswapV3Like(_) => SplitExtra::V3 {
                     zero_for_one: pool.token_addresses.first().copied() == Some(token_in),
                     sqrt_price_limit_x96: alloy::primitives::U256::ZERO,

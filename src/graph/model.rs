@@ -46,7 +46,7 @@ impl GraphSnapshot {
         let cycle_anchor_indices = tokens
             .iter()
             .enumerate()
-            .filter_map(|(idx, token)| token.is_cycle_anchor.then_some(idx))
+            .filter_map(|(idx, token)| token.flash_loan_enabled.then_some(idx))
             .collect::<Vec<_>>();
 
         let mut adjacency = vec![Vec::new(); tokens.len()];

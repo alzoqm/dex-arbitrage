@@ -15,24 +15,9 @@ impl QuantitySearcher {
     }
 
     pub fn ladder(&self, snapshot: &GraphSnapshot, candidate: &CandidatePath) -> Vec<u128> {
-        let token_idx = match snapshot.token_index(candidate.start_token) {
-            Some(idx) => idx,
-            None => return vec![1],
-        };
-        let token = &snapshot.tokens[token_idx];
-        let decimals = token.decimals;
-
-        // Calculate max position in raw token units from USD cap
-        let max_position_raw = self.calculate_max_position_raw(token);
-
-        // Calculate min trade amount in raw units
-        let min_trade_raw = usd_e8_to_amount(self.settings.risk.min_trade_usd_e8, token)
-            .unwrap_or(10u128.pow(decimals as u32) / 100); // Default: 0.01 token
-
-        let unit = min_trade_raw.max(1);
-        if unit > max_position_raw {
+        let Some((unit, max_position_raw)) = self.search_range(snapshot, candidate) else {
             return Vec::new();
-        }
+        };
 
         let mut ladder = Vec::new();
         let mut current = unit;
@@ -49,15 +34,39 @@ impl QuantitySearcher {
         ladder
     }
 
+    pub fn search_range(
+        &self,
+        snapshot: &GraphSnapshot,
+        candidate: &CandidatePath,
+    ) -> Option<(u128, u128)> {
+        let token_idx = snapshot.token_index(candidate.start_token)?;
+        let token = &snapshot.tokens[token_idx];
+        let decimals = token.decimals;
+        let max_position_raw = self.calculate_max_position_raw(token);
+        let min_trade_raw = usd_e8_to_amount(self.settings.risk.min_trade_usd_e8, token)
+            .unwrap_or(10u128.pow(decimals as u32) / 100);
+
+        let min_trade_raw = min_trade_raw.max(1);
+        (min_trade_raw <= max_position_raw).then_some((min_trade_raw, max_position_raw))
+    }
+
     pub fn refinement_points(&self, center: u128, max_position_raw: u128) -> Vec<u128> {
-        [
+        let mut points = [
+            center / 2,
             center.saturating_mul(3) / 4,
+            center.saturating_mul(7) / 8,
             center,
+            center.saturating_mul(9) / 8,
             center.saturating_mul(5) / 4,
+            center.saturating_mul(3) / 2,
+            center.saturating_mul(2),
         ]
         .into_iter()
         .filter(|amount| *amount > 0 && *amount <= max_position_raw)
-        .collect()
+        .collect::<Vec<_>>();
+        points.sort_unstable();
+        points.dedup();
+        points
     }
 
     pub fn max_position_raw(&self, snapshot: &GraphSnapshot, candidate: &CandidatePath) -> u128 {

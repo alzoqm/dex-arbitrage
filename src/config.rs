@@ -20,6 +20,7 @@ pub struct Settings {
     pub rpc: RpcSettings,
     pub contracts: ContractSettings,
     pub risk: RiskSettings,
+    pub policy: UniversePolicy,
     pub tokens: Vec<TokenConfig>,
     pub dexes: Vec<DexConfig>,
 }
@@ -80,6 +81,22 @@ pub struct TokenConfig {
     pub max_flash_loan_usd_e8: Option<u128>,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct UniversePolicy {
+    pub venues: Vec<String>,
+    pub symbols: Vec<String>,
+}
+
+impl UniversePolicy {
+    pub fn symbol_allowed(&self, symbol: &str) -> bool {
+        self.symbols.is_empty()
+            || self
+                .symbols
+                .iter()
+                .any(|allowed| allowed.eq_ignore_ascii_case(symbol))
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct DexConfig {
     pub name: String,
@@ -99,6 +116,12 @@ struct FileConfig {
     chain: String,
     chain_id: u64,
     native_symbol: String,
+    #[serde(default)]
+    venues: Option<Vec<String>>,
+    #[serde(default)]
+    symbols: Option<Vec<String>>,
+    #[serde(default)]
+    policy: FilePolicyConfig,
     max_hops: usize,
     screening_margin_bps: u32,
     min_net_profit_default: i128,
@@ -121,6 +144,14 @@ struct FileConfig {
     strict_target_allowlist: bool,
     tokens: Vec<FileTokenConfig>,
     dexes: Vec<FileDexConfig>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct FilePolicyConfig {
+    #[serde(default)]
+    venues: Option<Vec<String>>,
+    #[serde(default)]
+    symbols: Option<Vec<String>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -299,9 +330,41 @@ impl Settings {
             );
         }
 
+        let policy = UniversePolicy {
+            venues: file_cfg
+                .policy
+                .venues
+                .clone()
+                .or_else(|| file_cfg.venues.clone())
+                .unwrap_or_default(),
+            symbols: file_cfg
+                .policy
+                .symbols
+                .clone()
+                .or_else(|| file_cfg.symbols.clone())
+                .unwrap_or_default(),
+        };
+
+        let symbol_filter = policy
+            .symbols
+            .clone()
+            .into_iter()
+            .map(|symbol| symbol.to_ascii_lowercase())
+            .collect::<std::collections::HashSet<_>>();
+        let venue_filter = policy
+            .venues
+            .clone()
+            .into_iter()
+            .map(|venue| venue.to_ascii_lowercase())
+            .collect::<std::collections::HashSet<_>>();
+
         let tokens = file_cfg
             .tokens
             .into_iter()
+            .filter(|token| {
+                symbol_filter.is_empty()
+                    || symbol_filter.contains(&token.symbol.to_ascii_lowercase())
+            })
             .filter_map(|token| {
                 let address = match env_opt(&token.address_env) {
                     Some(addr) if !addr.trim().is_empty() => parse_address(&addr).ok(),
@@ -312,9 +375,11 @@ impl Settings {
                 } else {
                     env_opt_u64(&token.price_env)
                 };
-                // Apply backward-compatible defaults
-                let is_cycle_anchor = token.is_cycle_anchor.unwrap_or(token.is_stable);
-                let flash_loan_enabled = token.flash_loan_enabled.unwrap_or(is_cycle_anchor);
+                // Start/end anchors are assigned from live Aave reserves during discovery.
+                let _configured_cycle_anchor = token.is_cycle_anchor;
+                let _configured_flash_loan_enabled = token.flash_loan_enabled;
+                let is_cycle_anchor = false;
+                let flash_loan_enabled = false;
                 let allow_self_funded = token.allow_self_funded.unwrap_or(token.is_stable);
                 Some(TokenConfig {
                     symbol: token.symbol,
@@ -331,31 +396,12 @@ impl Settings {
             })
             .collect::<Vec<_>>();
 
-        if tokens.is_empty() {
-            anyhow::bail!("no token addresses configured for {}", chain);
-        }
-
-        // Validate at least one cycle anchor is configured
-        let anchor_count = tokens.iter().filter(|t| t.is_cycle_anchor).count();
-        if anchor_count == 0 {
-            anyhow::bail!(
-                "at least one cycle anchor token must be configured (is_cycle_anchor=true)"
-            );
-        }
-
-        // Validate flash-loan-enabled tokens are also cycle anchors
-        for token in &tokens {
-            if token.flash_loan_enabled && !token.is_cycle_anchor {
-                anyhow::bail!(
-                    "token {} has flash_loan_enabled=true but is_cycle_anchor=false - flash loan tokens must be cycle anchors",
-                    token.symbol
-                );
-            }
-        }
-
         let dexes = file_cfg
             .dexes
             .into_iter()
+            .filter(|dex| {
+                venue_filter.is_empty() || venue_filter.contains(&dex.name.to_ascii_lowercase())
+            })
             .map(|dex| -> Result<DexConfig> {
                 let amm_kind = AmmKind::from_toml(&dex.amm)?;
                 let discovery_kind = DiscoveryKind::from_toml(&dex.discovery)?;
@@ -391,6 +437,7 @@ impl Settings {
             rpc,
             contracts,
             risk,
+            policy,
             tokens,
             dexes,
         })
@@ -415,7 +462,15 @@ impl Settings {
     pub fn cycle_anchor_tokens(&self) -> Vec<Address> {
         self.tokens
             .iter()
-            .filter(|token| token.is_cycle_anchor)
+            .filter(|token| token.flash_loan_enabled)
+            .map(|token| token.address)
+            .collect()
+    }
+
+    pub fn flash_loan_tokens(&self) -> Vec<Address> {
+        self.tokens
+            .iter()
+            .filter(|token| token.flash_loan_enabled)
             .map(|token| token.address)
             .collect()
     }

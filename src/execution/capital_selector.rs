@@ -6,7 +6,6 @@ use anyhow::Result;
 use crate::{
     abi::IERC20,
     config::Settings,
-    execution::flash_loan::FlashLoanEngine,
     risk::valuation::{amount_to_usd_e8, calculate_net_profit_before_gas_raw},
     rpc::RpcClients,
     types::{CapitalChoice, CapitalSource, ExactPlan, TokenInfo},
@@ -16,17 +15,11 @@ use crate::{
 pub struct CapitalSelector {
     settings: Arc<Settings>,
     rpc: Arc<RpcClients>,
-    flash: FlashLoanEngine,
 }
 
 impl CapitalSelector {
     pub fn new(settings: Arc<Settings>, rpc: Arc<RpcClients>) -> Self {
-        let flash = FlashLoanEngine::new(settings.clone(), rpc.clone());
-        Self {
-            settings,
-            rpc,
-            flash,
-        }
+        Self { settings, rpc }
     }
 
     pub async fn choose(
@@ -38,80 +31,86 @@ impl CapitalSelector {
         if gross_profit_raw <= 0 {
             return Ok(None);
         }
+        if !token.flash_loan_enabled {
+            return Ok(None);
+        }
+        if self.settings.contracts.aave_pool.is_none() {
+            return Ok(None);
+        }
 
-        // Check self-funded option
-        let self_funded = if token.allow_self_funded {
-            let balance = self.executor_balance(plan.input_token).await.unwrap_or(0);
-            if balance >= plan.input_amount {
-                Some(CapitalChoice {
-                    source: CapitalSource::SelfFunded,
-                    flash_fee_raw: 0,
-                    net_profit_before_gas_raw: gross_profit_raw,
-                })
-            } else {
-                None
-            }
-        } else {
-            None
-        };
+        let executor_balance = self.executor_balance(plan.input_token).await.unwrap_or(0);
+        let conservative_flash_fee_raw =
+            plan.input_amount.saturating_mul(plan.flash_premium_ppm) / 1_000_000;
+        let own_amount = executor_balance.min(plan.input_amount);
+        let loan_amount = plan.input_amount.saturating_sub(own_amount);
+        let actual_flash_fee_raw = loan_amount.saturating_mul(plan.flash_premium_ppm) / 1_000_000;
 
-        // Check flash loan option
-        let flash = if token.flash_loan_enabled && self.settings.contracts.aave_pool.is_some() {
-            // Check per-token flash cap
-            let flash_cap_usd_e8 = token
-                .max_flash_loan_usd_e8
-                .unwrap_or(self.settings.risk.max_flash_loan_usd_e8);
-
-            match amount_to_usd_e8(plan.input_amount, token) {
-                Some(input_usd_e8) if input_usd_e8 <= flash_cap_usd_e8 => {
-                    match self.flash.fee_for_amount(plan.input_amount).await {
-                        Ok(flash_fee) => {
-                            let net_profit = calculate_net_profit_before_gas_raw(
-                                plan.input_amount,
-                                plan.output_amount,
-                                flash_fee,
-                            );
-                            if net_profit > 0 {
-                                Some(CapitalChoice {
-                                    source: CapitalSource::FlashLoan,
-                                    flash_fee_raw: flash_fee,
-                                    net_profit_before_gas_raw: net_profit,
-                                })
-                            } else {
-                                None
-                            }
-                        }
-                        Err(_) => None, // Premium lookup failure - reject flash loan
-                    }
-                }
-                _ => None,
-            }
-        } else {
-            None
-        };
-
-        // Choose best option
-        Ok(self.best_choice(self_funded, flash))
+        Ok(Self::choice_from_balance_and_fees(
+            plan,
+            token,
+            self.settings.contracts.aave_pool.is_some(),
+            self.settings.risk.max_flash_loan_usd_e8,
+            loan_amount,
+            conservative_flash_fee_raw,
+            actual_flash_fee_raw,
+        ))
     }
 
-    fn best_choice(
-        &self,
-        self_funded: Option<CapitalChoice>,
-        flash: Option<CapitalChoice>,
+    #[allow(clippy::too_many_arguments)]
+    pub fn choice_from_balance_and_fees(
+        plan: &ExactPlan,
+        token: &TokenInfo,
+        aave_pool_configured: bool,
+        global_flash_cap_usd_e8: u128,
+        loan_amount: u128,
+        conservative_flash_fee_raw: u128,
+        actual_flash_fee_raw: u128,
     ) -> Option<CapitalChoice> {
-        match (self_funded, flash) {
-            (Some(self_opt), Some(flash_opt)) => {
-                // Prefer flash loan if it has better net profit
-                if flash_opt.net_profit_before_gas_raw > self_opt.net_profit_before_gas_raw {
-                    Some(flash_opt)
-                } else {
-                    Some(self_opt)
-                }
-            }
-            (Some(self_opt), None) => Some(self_opt),
-            (None, Some(flash_opt)) => Some(flash_opt),
-            (None, None) => None,
+        if !token.flash_loan_enabled {
+            return None;
         }
+        if loan_amount > plan.input_amount {
+            return None;
+        }
+
+        let net_profit = calculate_net_profit_before_gas_raw(
+            plan.input_amount,
+            plan.output_amount,
+            conservative_flash_fee_raw,
+        );
+        if net_profit <= 0 {
+            return None;
+        }
+
+        let source = if loan_amount == 0 {
+            CapitalSource::SelfFunded
+        } else {
+            if !aave_pool_configured {
+                return None;
+            }
+
+            let flash_cap_usd_e8 = token
+                .max_flash_loan_usd_e8
+                .unwrap_or(global_flash_cap_usd_e8);
+            let loan_value_usd_e8 = amount_to_usd_e8(loan_amount, token)?;
+            if loan_value_usd_e8 > flash_cap_usd_e8 {
+                return None;
+            }
+
+            if loan_amount == plan.input_amount {
+                CapitalSource::FlashLoan
+            } else {
+                CapitalSource::MixedFlashLoan
+            }
+        };
+
+        Some(CapitalChoice {
+            source,
+            loan_amount_raw: loan_amount,
+            flash_fee_raw: conservative_flash_fee_raw,
+            actual_flash_fee_raw,
+            net_profit_before_gas_raw: net_profit,
+        })
     }
 
     pub fn operator_address(&self) -> Result<alloy::primitives::Address> {

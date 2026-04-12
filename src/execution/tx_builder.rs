@@ -56,14 +56,16 @@ impl TxBuilder {
             CapitalSource::SelfFunded => {
                 IArbitrageExecutor::executeSelfFundedCall { params: execution }.abi_encode()
             }
-            CapitalSource::FlashLoan => IArbitrageExecutor::executeFlashLoanCall {
-                params: IArbitrageExecutor::FlashLoanParams {
-                    loanAsset: plan.input_token,
-                    loanAmount: U256::saturating_from(plan.input_amount),
-                    execution,
-                },
+            CapitalSource::FlashLoan | CapitalSource::MixedFlashLoan => {
+                IArbitrageExecutor::executeFlashLoanCall {
+                    params: IArbitrageExecutor::FlashLoanParams {
+                        loanAsset: plan.input_token,
+                        loanAmount: U256::saturating_from(plan.flash_loan_amount),
+                        execution,
+                    },
+                }
+                .abi_encode()
             }
-            .abi_encode(),
         };
         Ok(calldata.into())
     }
@@ -90,6 +92,11 @@ fn map_adapter(adapter: crate::types::AdapterType) -> IArbitrageExecutor::Adapte
 fn encode_extra(extra: &SplitExtra) -> Bytes {
     match extra {
         SplitExtra::None => Bytes::new(),
+        SplitExtra::V2 { fee_ppm } => {
+            let mut out = vec![0u8; 32];
+            out[28..32].copy_from_slice(&fee_ppm.to_be_bytes());
+            out.into()
+        }
         SplitExtra::V3 { .. } => Bytes::new(),
         SplitExtra::Curve { i, j, underlying } => {
             let mut out = Vec::new();

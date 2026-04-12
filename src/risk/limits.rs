@@ -52,9 +52,9 @@ impl RiskManager {
         // Check USD-denominated flash loan limit
         if matches!(
             plan.exact.capital_source,
-            crate::types::CapitalSource::FlashLoan
+            crate::types::CapitalSource::FlashLoan | crate::types::CapitalSource::MixedFlashLoan
         ) {
-            let flash_value_usd_e8 = input_value_usd_e8;
+            let flash_value_usd_e8 = plan.exact.flash_loan_value_usd_e8;
             if flash_value_usd_e8 > self.max_flash_loan_usd_e8 {
                 anyhow::bail!(
                     "flash loan value {} USD e8 exceeds max flash loan {} USD e8",

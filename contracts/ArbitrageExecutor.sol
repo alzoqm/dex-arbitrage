@@ -169,10 +169,11 @@ contract ArbitrageExecutor is IFlashLoanSimpleReceiver, IUniswapV3SwapCallback {
         require(aavePool != address(0), "FLASH_DISABLED");
         require(params.execution.hops.length > 0, "EMPTY_HOPS");
         require(params.execution.inputToken == params.loanAsset, "INPUT_ASSET_MISMATCH");
-        require(params.execution.inputAmount == params.loanAmount, "INPUT_AMOUNT_MISMATCH");
+        require(params.loanAmount > 0, "ZERO_LOAN_AMOUNT");
+        require(params.execution.inputAmount >= params.loanAmount, "LOAN_EXCEEDS_INPUT");
         require(block.timestamp <= params.execution.deadline, "DEADLINE_EXPIRED");
 
-        emit ExecutionStarted(msg.sender, params.execution.snapshotId, params.loanAsset, params.loanAmount, true);
+        emit ExecutionStarted(msg.sender, params.execution.snapshotId, params.loanAsset, params.execution.inputAmount, true);
         IAavePool(aavePool).flashLoanSimple(
             address(this),
             params.loanAsset,
@@ -194,20 +195,20 @@ contract ArbitrageExecutor is IFlashLoanSimpleReceiver, IUniswapV3SwapCallback {
 
         ExecutionParams memory execution = abi.decode(data, (ExecutionParams));
         require(execution.inputToken == asset, "FLASH_ASSET_MISMATCH");
-        require(execution.inputAmount == amount, "FLASH_AMOUNT_MISMATCH");
+        require(execution.inputAmount >= amount, "FLASH_EXCEEDS_INPUT");
         require(block.timestamp <= execution.deadline, "DEADLINE_EXPIRED");
 
         uint256 startBalance = IERC20(asset).balanceOf(address(this));
-        require(startBalance >= amount, "FLASH_NOT_RECEIVED");
+        require(startBalance >= execution.inputAmount, "INSUFFICIENT_INPUT_BALANCE");
 
         uint256 endingBalance = _execute(execution);
         uint256 amountOwed = amount + premium;
-        require(endingBalance >= amountOwed + execution.minProfit, "MIN_PROFIT");
+        require(endingBalance >= startBalance + premium + execution.minProfit, "MIN_PROFIT");
 
         _forceApprove(asset, aavePool, 0);
         _forceApprove(asset, aavePool, amountOwed);
 
-        emit ExecutionFinished(execution.snapshotId, execution.inputToken, endingBalance, endingBalance - amount);
+        emit ExecutionFinished(execution.snapshotId, execution.inputToken, endingBalance, endingBalance - startBalance - premium);
         return true;
     }
 
@@ -299,7 +300,7 @@ contract ArbitrageExecutor is IFlashLoanSimpleReceiver, IUniswapV3SwapCallback {
         (uint112 reserve0, uint112 reserve1,) = pair.getReserves();
         uint256 reserveIn = zeroForOne ? uint256(reserve0) : uint256(reserve1);
         uint256 reserveOut = zeroForOne ? uint256(reserve1) : uint256(reserve0);
-        uint256 quotedOut = _getAmountOut(split.amountIn, reserveIn, reserveOut);
+        uint256 quotedOut = _getAmountOut(split.amountIn, reserveIn, reserveOut, _decodeV2FeePpm(split.extraData));
 
         uint256 balanceBefore = IERC20(split.tokenOut).balanceOf(address(this));
         _safeTransfer(split.tokenIn, split.target, split.amountIn);
@@ -388,6 +389,15 @@ contract ArbitrageExecutor is IFlashLoanSimpleReceiver, IUniswapV3SwapCallback {
         return zeroForOne ? MIN_SQRT_RATIO_PLUS_ONE : MAX_SQRT_RATIO_MINUS_ONE;
     }
 
+    function _decodeV2FeePpm(bytes memory extraData) internal pure returns (uint256) {
+        if (extraData.length >= 32) {
+            uint256 feePpm = abi.decode(extraData, (uint256));
+            require(feePpm < 1_000_000, "BAD_V2_FEE");
+            return feePpm;
+        }
+        return 3000;
+    }
+
     function _decodeCurveExtra(bytes memory extraData) internal pure returns (int128 i, int128 j, bool underlying) {
         require(extraData.length >= 33, "BAD_CURVE_EXTRA");
         i = _readInt128(extraData, 0);
@@ -410,12 +420,13 @@ contract ArbitrageExecutor is IFlashLoanSimpleReceiver, IUniswapV3SwapCallback {
         }
     }
 
-    function _getAmountOut(uint256 amountIn, uint256 reserveIn, uint256 reserveOut) internal pure returns (uint256) {
+    function _getAmountOut(uint256 amountIn, uint256 reserveIn, uint256 reserveOut, uint256 feePpm) internal pure returns (uint256) {
         require(amountIn > 0, "ZERO_INPUT");
         require(reserveIn > 0 && reserveOut > 0, "BAD_RESERVES");
-        uint256 amountInWithFee = amountIn * 997;
+        uint256 feeDenominator = 1_000_000;
+        uint256 amountInWithFee = amountIn * (feeDenominator - feePpm);
         uint256 numerator = amountInWithFee * reserveOut;
-        uint256 denominator = reserveIn * 1000 + amountInWithFee;
+        uint256 denominator = reserveIn * feeDenominator + amountInWithFee;
         return numerator / denominator;
     }
 
