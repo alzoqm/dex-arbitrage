@@ -131,6 +131,24 @@ sol! {
         function getConfiguration(address asset) external view returns (ReserveConfigurationMap memory);
     }
 
+    interface IMulticall3 {
+        struct Call3 {
+            address target;
+            bool allowFailure;
+            bytes callData;
+        }
+
+        struct Result {
+            bool success;
+            bytes returnData;
+        }
+
+        function aggregate3(Call3[] calldata calls)
+            external
+            payable
+            returns (Result[] memory returnData);
+    }
+
     interface IArbitrageExecutor {
         enum AdapterType {
             UniswapV2Like,

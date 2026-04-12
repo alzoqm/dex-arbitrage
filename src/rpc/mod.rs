@@ -1,4 +1,7 @@
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::{
+    sync::atomic::{AtomicU64, Ordering},
+    time::Instant,
+};
 
 use alloy::primitives::{Address, Bytes, B256, U256};
 use anyhow::{Context, Result};
@@ -107,6 +110,10 @@ impl RpcClient {
     }
 
     pub async fn request(&self, method: &str, params: Value) -> Result<Value> {
+        let started = Instant::now();
+        metrics::counter!("rpc_requests_total", "method" => method.to_string()).increment(1);
+        metrics::counter!("rpc_compute_units_total", "method" => method.to_string())
+            .increment(rpc_compute_units(method));
         let id = self.request_id.fetch_add(1, Ordering::Relaxed);
         let payload = json!({
             "jsonrpc": "2.0",
@@ -130,12 +137,14 @@ impl RpcClient {
             .context("failed to read rpc response body")?;
 
         if !status.is_success() {
+            metrics::counter!("rpc_errors_total", "method" => method.to_string()).increment(1);
             anyhow::bail!("rpc http error {} for method {}: {}", status, method, body);
         }
 
         let parsed: RpcResponse = serde_json::from_str(&body)
             .with_context(|| format!("invalid rpc response body: {body}"))?;
         if let Some(err) = parsed.error {
+            metrics::counter!("rpc_errors_total", "method" => method.to_string()).increment(1);
             anyhow::bail!(
                 "rpc error {} {} for method {}",
                 err.code,
@@ -144,6 +153,8 @@ impl RpcClient {
             );
         }
 
+        metrics::histogram!("rpc_request_duration_seconds", "method" => method.to_string())
+            .record(started.elapsed().as_secs_f64());
         parsed.result.context("missing rpc result")
     }
 
@@ -185,8 +196,10 @@ impl RpcClient {
         let mut filter = json!({
             "fromBlock": format!("0x{:x}", from_block),
             "toBlock": format!("0x{:x}", to_block),
-            "address": address_values,
         });
+        if !addresses.is_empty() {
+            filter["address"] = json!(address_values);
+        }
         if !topics.is_empty() {
             filter["topics"] = json!([topic_values]);
         }
@@ -197,6 +210,28 @@ impl RpcClient {
             .as_array()
             .context("eth_getLogs did not return array")?;
         logs.iter().map(parse_log).collect()
+    }
+
+    pub async fn get_block_receipts_logs(&self, block_number: u64) -> Result<Vec<RpcLog>> {
+        let value = self
+            .request(
+                "eth_getBlockReceipts",
+                json!([format!("0x{:x}", block_number)]),
+            )
+            .await?;
+        let receipts = value
+            .as_array()
+            .context("eth_getBlockReceipts did not return array")?;
+        let mut out = Vec::new();
+        for receipt in receipts {
+            let Some(logs) = receipt.get("logs").and_then(Value::as_array) else {
+                continue;
+            };
+            for log in logs {
+                out.push(parse_log(log)?);
+            }
+        }
+        Ok(out)
     }
 
     pub async fn eth_call(
@@ -261,7 +296,7 @@ impl RpcClient {
     }
 }
 
-fn parse_log(value: &Value) -> Result<RpcLog> {
+pub fn parse_log(value: &Value) -> Result<RpcLog> {
     let address = parse_address(value.get("address").context("log missing address")?)?;
     let topics = value
         .get("topics")
@@ -335,4 +370,35 @@ pub fn parse_hex_u256(value: &Value) -> Result<U256> {
     let text = value.as_str().context("u256 hex value must be string")?;
     U256::from_str_radix(text.trim_start_matches("0x"), 16)
         .with_context(|| format!("invalid hex u256: {text}"))
+}
+
+fn rpc_compute_units(method: &str) -> u64 {
+    match method {
+        "net_version" | "eth_chainId" | "eth_syncing" | "eth_protocolVersion" | "net_listening" => {
+            0
+        }
+        "eth_blockNumber"
+        | "eth_subscribe"
+        | "eth_unsubscribe"
+        | "eth_feeHistory"
+        | "eth_maxPriorityFeePerGas"
+        | "eth_blobBaseFee"
+        | "eth_createAccessList" => 10,
+        "eth_getTransactionReceipt"
+        | "eth_getBlockByNumber"
+        | "eth_getBlockByHash"
+        | "eth_getBlockReceipts"
+        | "eth_getTransactionCount"
+        | "eth_getCode"
+        | "eth_gasPrice"
+        | "eth_estimateGas"
+        | "eth_getStorageAt"
+        | "eth_getTransactionByHash"
+        | "eth_getRawTransactionByHash" => 20,
+        "eth_call" => 26,
+        "eth_simulateV1" | "eth_callBundle" | "eth_sendRawTransaction" => 40,
+        "eth_getLogs" | "eth_getFilterLogs" => 60,
+        "eth_callMany" => 20,
+        _ => 20,
+    }
 }

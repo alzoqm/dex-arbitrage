@@ -26,7 +26,7 @@ impl SplitOptimizer {
         token_out: alloy::primitives::Address,
         total_in: u128,
     ) -> Result<(Vec<SplitPlan>, u128)> {
-        let edge_refs = snapshot.pair_edges(token_in, token_out);
+        let edge_refs = ranked_pair_edges(snapshot, snapshot.pair_edges(token_in, token_out));
         if edge_refs.is_empty() {
             return Ok((Vec::new(), 0));
         }
@@ -210,4 +210,36 @@ impl SplitOptimizer {
 
         Ok((plans, total_out))
     }
+}
+
+fn ranked_pair_edges(
+    snapshot: &GraphSnapshot,
+    mut edge_refs: Vec<crate::types::EdgeRef>,
+) -> Vec<crate::types::EdgeRef> {
+    edge_refs.sort_by(|a, b| {
+        let a_edge = snapshot.edge(*a);
+        let b_edge = snapshot.edge(*b);
+        match (a_edge, b_edge) {
+            (Some(a_edge), Some(b_edge)) => a_edge
+                .weight_log_q32
+                .cmp(&b_edge.weight_log_q32)
+                .then_with(|| {
+                    b_edge
+                        .liquidity
+                        .safe_capacity_in
+                        .cmp(&a_edge.liquidity.safe_capacity_in)
+                })
+                .then_with(|| a_edge.pool_id.cmp(&b_edge.pool_id)),
+            (Some(_), None) => Ordering::Less,
+            (None, Some(_)) => Ordering::Greater,
+            (None, None) => Ordering::Equal,
+        }
+    });
+    let max_edges = std::env::var("MAX_SPLIT_PARALLEL_POOLS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(3);
+    edge_refs.truncate(max_edges);
+    edge_refs
 }

@@ -1,22 +1,33 @@
 pub mod admission;
 pub mod event_stream;
 pub mod factory_scanner;
+pub mod multicall;
 pub mod pool_fetcher;
 
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::HashMap,
+    fs,
+    sync::Arc,
+    time::{Duration, Instant, SystemTime},
+};
 
 use alloy::{
     primitives::{Address, U256},
     sol_types::SolCall,
 };
 use anyhow::Result;
+use parking_lot::Mutex;
+use serde::{Deserialize, Serialize};
 
 use crate::{
     abi::{IAavePool, IERC20},
     config::Settings,
     graph::GraphSnapshot,
     rpc::RpcClients,
-    types::{BlockRef, PoolSpecificState, PoolState, TokenBehavior, TokenInfo},
+    types::{
+        BlockRef, PoolHealth, PoolSpecificState, PoolState, PoolStatePatch, TokenBehavior,
+        TokenInfo,
+    },
 };
 
 use self::{
@@ -40,25 +51,57 @@ pub struct DiscoveryManager {
     scanner: FactoryScanner,
     fetcher: PoolFetcher,
     admission: AdmissionEngine,
+    aave_cache: Mutex<Option<AaveReserveCache>>,
+    token_metadata_cache: Mutex<HashMap<Address, (String, u8)>>,
+}
+
+#[derive(Debug, Clone)]
+struct AaveReserveCache {
+    fetched_at: Instant,
+    reserves: HashMap<Address, ()>,
 }
 
 impl DiscoveryManager {
     pub fn new(settings: Arc<Settings>, rpc: Arc<RpcClients>) -> Self {
+        let token_metadata_cache = TokenMetadataCache::load(&settings)
+            .ok()
+            .map(|cache| cache.into_map())
+            .unwrap_or_default();
         Self {
             scanner: FactoryScanner::new(settings.clone(), rpc.clone()),
             fetcher: PoolFetcher::new(settings.clone(), rpc.clone()),
             admission: AdmissionEngine::new(settings.clone()),
             settings,
             rpc,
+            aave_cache: Mutex::new(None),
+            token_metadata_cache: Mutex::new(token_metadata_cache),
         }
     }
 
     pub async fn bootstrap(&self) -> Result<DiscoveryOutput> {
         let discovered = self.scanner.scan_all().await?;
         let mut pools = HashMap::new();
+        let mut cached_pools = PoolStateCache::load(&self.settings)
+            .ok()
+            .filter(|_| !pool_state_cache_disabled())
+            .map(|cache| {
+                cache
+                    .pools
+                    .into_iter()
+                    .map(|pool| (pool.pool_id, pool))
+                    .collect::<HashMap<_, _>>()
+            })
+            .unwrap_or_default();
 
         for spec in discovered {
-            if let Some(pool) = self.fetcher.fetch_pool(&spec).await? {
+            let cached = cached_pools
+                .remove(&spec.address)
+                .filter(|pool| pool_matches_spec(pool, &spec));
+            let pool = match cached {
+                Some(pool) => Some(pool),
+                None => self.fetcher.fetch_pool(&spec, None).await?,
+            };
+            if let Some(pool) = pool {
                 if self.admission.admit(&pool) {
                     pools.insert(pool.pool_id, pool);
                 }
@@ -76,6 +119,9 @@ impl DiscoveryManager {
         };
 
         let snapshot = GraphSnapshot::build(0, block_ref, tokens.clone(), pools.clone());
+        PoolStateCache::from_pools(&self.settings, pools.values().cloned().collect())
+            .save(&self.settings)
+            .ok();
         Ok(DiscoveryOutput {
             tokens,
             pools,
@@ -89,14 +135,24 @@ impl DiscoveryManager {
         tokens: Vec<TokenInfo>,
         current_pools: HashMap<Address, PoolState>,
         changed_specs: Vec<DiscoveredPool>,
+        patches: Vec<PoolStatePatch>,
         block_ref: Option<BlockRef>,
     ) -> Result<(GraphSnapshot, Vec<Address>)> {
         let mut pools = current_pools;
         let mut changed_pool_ids = Vec::new();
         let mut tokens = tokens;
+        let block_number = block_ref.as_ref().map(|block| block.number);
+
+        for patch in patches {
+            if let Some(pool) = pools.get_mut(&patch.pool_id()) {
+                if apply_pool_patch(pool, patch, block_number) {
+                    changed_pool_ids.push(pool.pool_id);
+                }
+            }
+        }
 
         for spec in changed_specs {
-            if let Some(pool) = self.fetcher.fetch_pool(&spec).await? {
+            if let Some(pool) = self.fetcher.fetch_pool(&spec, block_number).await? {
                 if self.admission.admit(&pool) {
                     changed_pool_ids.push(pool.pool_id);
                     pools.insert(pool.pool_id, pool);
@@ -217,6 +273,19 @@ impl DiscoveryManager {
     }
 
     async fn aave_flash_reserves(&self) -> Result<HashMap<Address, ()>> {
+        let ttl = Duration::from_secs(
+            std::env::var("AAVE_RESERVE_CACHE_SECS")
+                .ok()
+                .and_then(|value| value.parse::<u64>().ok())
+                .filter(|value| *value > 0)
+                .unwrap_or(3_600),
+        );
+        if let Some(cached) = self.aave_cache.lock().clone() {
+            if cached.fetched_at.elapsed() <= ttl {
+                return Ok(cached.reserves);
+            }
+        }
+
         let Some(aave_pool) = self.settings.contracts.aave_pool else {
             return Ok(HashMap::new());
         };
@@ -251,16 +320,33 @@ impl DiscoveryManager {
                 out.insert(asset, ());
             }
         }
+        *self.aave_cache.lock() = Some(AaveReserveCache {
+            fetched_at: Instant::now(),
+            reserves: out.clone(),
+        });
         Ok(out)
     }
 
     async fn fetch_token_metadata(&self, address: Address) -> (String, u8) {
+        if let Some(cached) = self.token_metadata_cache.lock().get(&address).cloned() {
+            return cached;
+        }
         let symbol = self
             .fetch_token_symbol(address)
             .await
             .unwrap_or_else(|| address.to_string());
         let decimals = self.fetch_token_decimals(address).await.unwrap_or(18);
-        (symbol, decimals)
+        let metadata = (symbol, decimals);
+        self.token_metadata_cache
+            .lock()
+            .insert(address, metadata.clone());
+        TokenMetadataCache::from_map(
+            self.settings.chain_id,
+            self.token_metadata_cache.lock().clone(),
+        )
+        .save(&self.settings)
+        .ok();
+        metadata
     }
 
     async fn fetch_token_symbol(&self, address: Address) -> Option<String> {
@@ -300,6 +386,232 @@ impl DiscoveryManager {
             .ok()?;
         IERC20::decimalsCall::abi_decode_returns(&raw).ok()
     }
+}
+
+fn apply_pool_patch(
+    pool: &mut PoolState,
+    patch: PoolStatePatch,
+    fallback_block_number: Option<u64>,
+) -> bool {
+    let block_number = match &patch {
+        PoolStatePatch::UniswapV2Sync { block_number, .. }
+        | PoolStatePatch::UniswapV3Swap { block_number, .. }
+        | PoolStatePatch::BalancerSwap { block_number, .. }
+        | PoolStatePatch::BalancerBalanceChanged { block_number, .. } => {
+            block_number.or(fallback_block_number)
+        }
+    };
+
+    let applied = match (patch, &mut pool.state) {
+        (
+            PoolStatePatch::UniswapV2Sync {
+                reserve0, reserve1, ..
+            },
+            PoolSpecificState::UniswapV2Like(state),
+        ) => {
+            state.reserve0 = reserve0;
+            state.reserve1 = reserve1;
+            true
+        }
+        (
+            PoolStatePatch::UniswapV3Swap {
+                sqrt_price_x96,
+                liquidity,
+                tick,
+                ..
+            },
+            PoolSpecificState::UniswapV3Like(state),
+        ) => {
+            state.sqrt_price_x96 = sqrt_price_x96;
+            state.liquidity = liquidity;
+            state.tick = tick;
+            true
+        }
+        (
+            PoolStatePatch::BalancerSwap {
+                token_in,
+                token_out,
+                amount_in,
+                amount_out,
+                ..
+            },
+            PoolSpecificState::BalancerWeighted(state),
+        ) => {
+            let mut changed = false;
+            if let Some(idx) = pool
+                .token_addresses
+                .iter()
+                .position(|token| *token == token_in)
+            {
+                state.balances[idx] = state.balances[idx].saturating_add(amount_in);
+                changed = true;
+            }
+            if let Some(idx) = pool
+                .token_addresses
+                .iter()
+                .position(|token| *token == token_out)
+            {
+                state.balances[idx] = state.balances[idx].saturating_sub(amount_out);
+                changed = true;
+            }
+            changed
+        }
+        (
+            PoolStatePatch::BalancerBalanceChanged { tokens, deltas, .. },
+            PoolSpecificState::BalancerWeighted(state),
+        ) => {
+            let mut changed = false;
+            for (token, delta) in tokens.into_iter().zip(deltas) {
+                if let Some(idx) = pool
+                    .token_addresses
+                    .iter()
+                    .position(|known| *known == token)
+                {
+                    state.balances[idx] = apply_i128_delta(state.balances[idx], delta);
+                    changed = true;
+                }
+            }
+            changed
+        }
+        _ => false,
+    };
+
+    if applied {
+        pool.last_updated_block = block_number.unwrap_or(pool.last_updated_block);
+        pool.health =
+            patched_health(block_number.unwrap_or(pool.health.last_successful_refresh_block));
+    }
+    applied
+}
+
+fn apply_i128_delta(value: u128, delta: i128) -> u128 {
+    if delta >= 0 {
+        value.saturating_add(delta as u128)
+    } else {
+        value.saturating_sub(delta.unsigned_abs())
+    }
+}
+
+fn patched_health(block_number: u64) -> PoolHealth {
+    PoolHealth {
+        stale: false,
+        paused: false,
+        quarantined: false,
+        confidence_bps: 10_000,
+        last_successful_refresh_block: block_number,
+        last_refresh_at: SystemTime::now(),
+        recent_revert_count: 0,
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PoolStateCache {
+    version: u32,
+    chain_id: u64,
+    pools: Vec<PoolState>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct TokenMetadataCache {
+    version: u32,
+    chain_id: u64,
+    entries: Vec<TokenMetadataCacheEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct TokenMetadataCacheEntry {
+    address: Address,
+    symbol: String,
+    decimals: u8,
+}
+
+impl TokenMetadataCache {
+    fn from_map(chain_id: u64, map: HashMap<Address, (String, u8)>) -> Self {
+        Self {
+            version: 1,
+            chain_id,
+            entries: map
+                .into_iter()
+                .map(|(address, (symbol, decimals))| TokenMetadataCacheEntry {
+                    address,
+                    symbol,
+                    decimals,
+                })
+                .collect(),
+        }
+    }
+
+    fn into_map(self) -> HashMap<Address, (String, u8)> {
+        self.entries
+            .into_iter()
+            .map(|entry| (entry.address, (entry.symbol, entry.decimals)))
+            .collect()
+    }
+
+    fn load(settings: &Settings) -> Result<Self> {
+        let raw = fs::read_to_string(settings.data_path("token_metadata_cache"))?;
+        let cache: Self = serde_json::from_str(&raw)?;
+        if cache.version != 1 || cache.chain_id != settings.chain_id {
+            anyhow::bail!("token metadata cache version or chain id mismatch");
+        }
+        Ok(cache)
+    }
+
+    fn save(&self, settings: &Settings) -> Result<()> {
+        fs::create_dir_all("state").ok();
+        fs::write(
+            settings.data_path("token_metadata_cache"),
+            serde_json::to_string(self)?,
+        )?;
+        Ok(())
+    }
+}
+
+impl PoolStateCache {
+    fn from_pools(settings: &Settings, pools: Vec<PoolState>) -> Self {
+        Self {
+            version: 1,
+            chain_id: settings.chain_id,
+            pools,
+        }
+    }
+
+    fn load(settings: &Settings) -> Result<Self> {
+        let raw = fs::read_to_string(settings.data_path("pool_state_cache"))?;
+        let cache: Self = serde_json::from_str(&raw)?;
+        if cache.version != 1 || cache.chain_id != settings.chain_id {
+            anyhow::bail!("pool state cache version or chain id mismatch");
+        }
+        Ok(cache)
+    }
+
+    fn save(&self, settings: &Settings) -> Result<()> {
+        if pool_state_cache_disabled() {
+            return Ok(());
+        }
+        fs::create_dir_all("state").ok();
+        fs::write(
+            settings.data_path("pool_state_cache"),
+            serde_json::to_string(self)?,
+        )?;
+        Ok(())
+    }
+}
+
+fn pool_matches_spec(pool: &PoolState, spec: &DiscoveredPool) -> bool {
+    pool.pool_id == spec.address
+        && pool.dex_name == spec.dex_name
+        && pool.kind == spec.amm_kind
+        && pool.factory == spec.factory
+        && pool.registry == spec.registry
+        && pool.vault == spec.vault
+        && pool.quoter == spec.quoter
+}
+
+fn pool_state_cache_disabled() -> bool {
+    std::env::var("DISABLE_POOL_STATE_CACHE")
+        .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+        .unwrap_or(false)
 }
 
 fn derive_missing_prices_from_pools(tokens: &mut [TokenInfo], pools: &HashMap<Address, PoolState>) {
@@ -446,8 +758,7 @@ fn collect_balance_price_estimates(
 ) {
     const MIN_PRICE_BALANCE_RAW: u128 = 10_000;
 
-    for known_idx in 0..addresses.len() {
-        let known = addresses[known_idx];
+    for (known_idx, &known) in addresses.iter().enumerate() {
         let Some(&known_price) = prices.get(&known) else {
             continue;
         };
@@ -464,11 +775,10 @@ fn collect_balance_price_estimates(
             .and_then(|weights| weights.get(known_idx).copied())
             .unwrap_or(1);
 
-        for unknown_idx in 0..addresses.len() {
+        for (unknown_idx, &unknown) in addresses.iter().enumerate() {
             if known_idx == unknown_idx {
                 continue;
             }
-            let unknown = addresses[unknown_idx];
             if prices.contains_key(&unknown) {
                 continue;
             }

@@ -257,7 +257,7 @@ impl Settings {
                 "POLYGON_MIN_NET_PROFIT_USD_E8"
             })
             .or(file_cfg.min_net_profit_usd_e8)
-            .unwrap_or_else(|| {
+            .unwrap_or({
                 // Backward compatible default: convert old raw USDC value
                 // 100000 raw USDC (6 decimals) at $1 = $0.10 = 10_000_000 e8
                 10_000_000
@@ -423,6 +423,7 @@ impl Settings {
                 })
             })
             .collect::<Result<Vec<_>>>()?;
+        validate_dex_configs(&dexes)?;
 
         Ok(Self {
             chain,
@@ -496,6 +497,32 @@ fn resolve_address_from_env_name(env_name: &str) -> Result<Option<Address>> {
 
 fn parse_address(value: &str) -> Result<Address> {
     Address::from_str(value).with_context(|| format!("invalid address: {value}"))
+}
+
+fn validate_dex_configs(dexes: &[DexConfig]) -> Result<()> {
+    if env_bool("ALLOW_DUPLICATE_DEX_FACTORIES", false) {
+        return Ok(());
+    }
+
+    let mut seen = HashMap::<(DiscoveryKind, AmmKind, Address), String>::new();
+    for dex in dexes.iter().filter(|dex| dex.enabled) {
+        let Some(factory) = dex.factory else {
+            continue;
+        };
+        let key = (dex.discovery_kind, dex.amm_kind, factory);
+        if let Some(existing) = seen.get(&key) {
+            anyhow::bail!(
+                "duplicate enabled DEX factory config: {} and {} both use {} for {:?}/{:?}. Set ALLOW_DUPLICATE_DEX_FACTORIES=true only if this is intentional.",
+                existing,
+                dex.name,
+                factory,
+                dex.discovery_kind,
+                dex.amm_kind
+            );
+        }
+        seen.insert(key, dex.name.clone());
+    }
+    Ok(())
 }
 
 fn env_req(key: &str) -> Result<String> {

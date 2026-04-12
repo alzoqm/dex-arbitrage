@@ -4,7 +4,7 @@ use alloy::{
     primitives::{Address, U256},
     sol_types::SolCall,
 };
-use anyhow::Result;
+use anyhow::{Context, Result};
 
 use crate::{
     abi::{IBalancerPool, IBalancerVault, ICurvePool, IUniswapV2Pair, IUniswapV3Pool},
@@ -16,7 +16,7 @@ use crate::{
     },
 };
 
-use super::factory_scanner::DiscoveredPool;
+use super::{factory_scanner::DiscoveredPool, multicall};
 
 #[derive(Debug)]
 pub struct PoolFetcher {
@@ -34,33 +34,29 @@ impl PoolFetcher {
         }
     }
 
-    pub async fn fetch_pool(&self, spec: &DiscoveredPool) -> Result<Option<PoolState>> {
+    pub async fn fetch_pool(
+        &self,
+        spec: &DiscoveredPool,
+        block_number: Option<u64>,
+    ) -> Result<Option<PoolState>> {
         match spec.amm_kind {
-            AmmKind::UniswapV2Like => self.fetch_v2(spec).await,
-            AmmKind::UniswapV3Like => self.fetch_v3(spec).await,
-            AmmKind::CurvePlain => self.fetch_curve(spec).await,
-            AmmKind::BalancerWeighted => self.fetch_balancer(spec).await,
+            AmmKind::UniswapV2Like => self.fetch_v2(spec, block_number).await,
+            AmmKind::UniswapV3Like => self.fetch_v3(spec, block_number).await,
+            AmmKind::CurvePlain => self.fetch_curve(spec, block_number).await,
+            AmmKind::BalancerWeighted => self.fetch_balancer(spec, block_number).await,
         }
     }
 
-    async fn fetch_v2(&self, spec: &DiscoveredPool) -> Result<Option<PoolState>> {
-        let token0 = self
-            .call_address(spec.address, IUniswapV2Pair::token0Call {}.abi_encode())
-            .await?;
-        let token1 = self
-            .call_address(spec.address, IUniswapV2Pair::token1Call {}.abi_encode())
-            .await?;
-        let raw = self
-            .rpc
-            .best_read()
-            .eth_call(
-                spec.address,
-                None,
-                IUniswapV2Pair::getReservesCall {}.abi_encode().into(),
-                "latest",
-            )
-            .await?;
-        let ret = IUniswapV2Pair::getReservesCall::abi_decode_returns(&raw)?;
+    async fn fetch_v2(
+        &self,
+        spec: &DiscoveredPool,
+        block_number: Option<u64>,
+    ) -> Result<Option<PoolState>> {
+        let (token0, token1, reserve0, reserve1) = match self.fetch_v2_multicall(spec.address).await
+        {
+            Ok(values) => values,
+            Err(_) => self.fetch_v2_sequential(spec.address).await?,
+        };
         let fee_ppm = self
             .settings
             .dexes
@@ -81,71 +77,25 @@ impl PoolFetcher {
             admission_status: PoolAdmissionStatus::Allowed,
             health: fresh_health(10_000, false),
             state: PoolSpecificState::UniswapV2Like(V2PoolState {
-                reserve0: u256_to_u128(U256::saturating_from(ret.reserve0)),
-                reserve1: u256_to_u128(U256::saturating_from(ret.reserve1)),
+                reserve0,
+                reserve1,
                 fee_ppm,
             }),
-            last_updated_block: self
-                .rpc
-                .best_read()
-                .block_number()
-                .await
-                .unwrap_or_default(),
+            last_updated_block: block_number.unwrap_or_default(),
             extras: HashMap::new(),
         }))
     }
 
-    async fn fetch_v3(&self, spec: &DiscoveredPool) -> Result<Option<PoolState>> {
-        let token0 = self
-            .call_address(spec.address, IUniswapV3Pool::token0Call {}.abi_encode())
-            .await?;
-        let token1 = self
-            .call_address(spec.address, IUniswapV3Pool::token1Call {}.abi_encode())
-            .await?;
-        let raw_fee = self
-            .rpc
-            .best_read()
-            .eth_call(
-                spec.address,
-                None,
-                IUniswapV3Pool::feeCall {}.abi_encode().into(),
-                "latest",
-            )
-            .await?;
-        let fee_ret = IUniswapV3Pool::feeCall::abi_decode_returns(&raw_fee)?;
-        let raw_spacing = self
-            .rpc
-            .best_read()
-            .eth_call(
-                spec.address,
-                None,
-                IUniswapV3Pool::tickSpacingCall {}.abi_encode().into(),
-                "latest",
-            )
-            .await?;
-        let spacing_ret = IUniswapV3Pool::tickSpacingCall::abi_decode_returns(&raw_spacing)?;
-        let raw_liq = self
-            .rpc
-            .best_read()
-            .eth_call(
-                spec.address,
-                None,
-                IUniswapV3Pool::liquidityCall {}.abi_encode().into(),
-                "latest",
-            )
-            .await?;
-        let liq_ret = IUniswapV3Pool::liquidityCall::abi_decode_returns(&raw_liq)?;
-        let raw_slot0 = self
-            .rpc
-            .best_read()
-            .eth_call(
-                spec.address,
-                None,
-                IUniswapV3Pool::slot0Call {}.abi_encode().into(),
-                "latest",
-            )
-            .await?;
-        let slot0 = IUniswapV3Pool::slot0Call::abi_decode_returns(&raw_slot0)?;
+    async fn fetch_v3(
+        &self,
+        spec: &DiscoveredPool,
+        block_number: Option<u64>,
+    ) -> Result<Option<PoolState>> {
+        let (token0, token1, fee, tick_spacing, liquidity, sqrt_price_x96, tick) =
+            match self.fetch_v3_multicall(spec.address).await {
+                Ok(values) => values,
+                Err(_) => self.fetch_v3_sequential(spec.address).await?,
+            };
 
         Ok(Some(PoolState {
             pool_id: spec.address,
@@ -160,23 +110,22 @@ impl PoolFetcher {
             admission_status: PoolAdmissionStatus::Allowed,
             health: fresh_health(10_000, false),
             state: PoolSpecificState::UniswapV3Like(V3PoolState {
-                sqrt_price_x96: U256::saturating_from(slot0.sqrtPriceX96),
-                liquidity: liq_ret,
-                tick: i32::try_from(slot0.tick).unwrap_or(0),
-                fee: u32::try_from(fee_ret).unwrap_or(u32::MAX),
-                tick_spacing: i32::try_from(spacing_ret).unwrap_or(0),
+                sqrt_price_x96,
+                liquidity,
+                tick,
+                fee,
+                tick_spacing,
             }),
-            last_updated_block: self
-                .rpc
-                .best_read()
-                .block_number()
-                .await
-                .unwrap_or_default(),
+            last_updated_block: block_number.unwrap_or_default(),
             extras: HashMap::new(),
         }))
     }
 
-    async fn fetch_curve(&self, spec: &DiscoveredPool) -> Result<Option<PoolState>> {
+    async fn fetch_curve(
+        &self,
+        spec: &DiscoveredPool,
+        block_number: Option<u64>,
+    ) -> Result<Option<PoolState>> {
         let amp_raw = self
             .rpc
             .best_read()
@@ -259,17 +208,16 @@ impl PoolFetcher {
                 fee: u256_to_u128(fee_ret).min(u32::MAX as u128) as u32,
                 supports_underlying: true,
             }),
-            last_updated_block: self
-                .rpc
-                .best_read()
-                .block_number()
-                .await
-                .unwrap_or_default(),
+            last_updated_block: block_number.unwrap_or_default(),
             extras: HashMap::new(),
         }))
     }
 
-    async fn fetch_balancer(&self, spec: &DiscoveredPool) -> Result<Option<PoolState>> {
+    async fn fetch_balancer(
+        &self,
+        spec: &DiscoveredPool,
+        block_number: Option<u64>,
+    ) -> Result<Option<PoolState>> {
         let pool_id = match spec.balancer_pool_id {
             Some(id) => id,
             None => {
@@ -381,14 +329,199 @@ impl PoolFetcher {
                 normalized_weights_1e18: weights_ret.iter().cloned().map(u256_to_u128).collect(),
                 swap_fee_ppm: u256_to_u128(fee_ret).min(u32::MAX as u128) as u32,
             }),
-            last_updated_block: self
-                .rpc
-                .best_read()
-                .block_number()
-                .await
-                .unwrap_or_default(),
+            last_updated_block: block_number.unwrap_or_default(),
             extras: HashMap::new(),
         }))
+    }
+
+    async fn fetch_v2_multicall(&self, pool: Address) -> Result<(Address, Address, u128, u128)> {
+        let results = multicall::aggregate3(
+            &self.rpc,
+            vec![
+                (pool, IUniswapV2Pair::token0Call {}.abi_encode()),
+                (pool, IUniswapV2Pair::token1Call {}.abi_encode()),
+                (pool, IUniswapV2Pair::getReservesCall {}.abi_encode()),
+            ],
+        )
+        .await?;
+        let token0 = IUniswapV2Pair::token0Call::abi_decode_returns(
+            results
+                .first()
+                .and_then(|value| value.as_ref())
+                .context("multicall token0 failed")?,
+        )?;
+        let token1 = IUniswapV2Pair::token1Call::abi_decode_returns(
+            results
+                .get(1)
+                .and_then(|value| value.as_ref())
+                .context("multicall token1 failed")?,
+        )?;
+        let reserves = IUniswapV2Pair::getReservesCall::abi_decode_returns(
+            results
+                .get(2)
+                .and_then(|value| value.as_ref())
+                .context("multicall getReserves failed")?,
+        )?;
+        Ok((
+            token0,
+            token1,
+            u256_to_u128(U256::saturating_from(reserves.reserve0)),
+            u256_to_u128(U256::saturating_from(reserves.reserve1)),
+        ))
+    }
+
+    async fn fetch_v2_sequential(&self, pool: Address) -> Result<(Address, Address, u128, u128)> {
+        let token0 = self
+            .call_address(pool, IUniswapV2Pair::token0Call {}.abi_encode())
+            .await?;
+        let token1 = self
+            .call_address(pool, IUniswapV2Pair::token1Call {}.abi_encode())
+            .await?;
+        let raw = self
+            .rpc
+            .best_read()
+            .eth_call(
+                pool,
+                None,
+                IUniswapV2Pair::getReservesCall {}.abi_encode().into(),
+                "latest",
+            )
+            .await?;
+        let reserves = IUniswapV2Pair::getReservesCall::abi_decode_returns(&raw)?;
+        Ok((
+            token0,
+            token1,
+            u256_to_u128(U256::saturating_from(reserves.reserve0)),
+            u256_to_u128(U256::saturating_from(reserves.reserve1)),
+        ))
+    }
+
+    async fn fetch_v3_multicall(
+        &self,
+        pool: Address,
+    ) -> Result<(Address, Address, u32, i32, u128, U256, i32)> {
+        let results = multicall::aggregate3(
+            &self.rpc,
+            vec![
+                (pool, IUniswapV3Pool::token0Call {}.abi_encode()),
+                (pool, IUniswapV3Pool::token1Call {}.abi_encode()),
+                (pool, IUniswapV3Pool::feeCall {}.abi_encode()),
+                (pool, IUniswapV3Pool::tickSpacingCall {}.abi_encode()),
+                (pool, IUniswapV3Pool::liquidityCall {}.abi_encode()),
+                (pool, IUniswapV3Pool::slot0Call {}.abi_encode()),
+            ],
+        )
+        .await?;
+        let token0 = IUniswapV3Pool::token0Call::abi_decode_returns(
+            results
+                .first()
+                .and_then(|value| value.as_ref())
+                .context("multicall v3 token0 failed")?,
+        )?;
+        let token1 = IUniswapV3Pool::token1Call::abi_decode_returns(
+            results
+                .get(1)
+                .and_then(|value| value.as_ref())
+                .context("multicall v3 token1 failed")?,
+        )?;
+        let fee = IUniswapV3Pool::feeCall::abi_decode_returns(
+            results
+                .get(2)
+                .and_then(|value| value.as_ref())
+                .context("multicall v3 fee failed")?,
+        )?;
+        let tick_spacing = IUniswapV3Pool::tickSpacingCall::abi_decode_returns(
+            results
+                .get(3)
+                .and_then(|value| value.as_ref())
+                .context("multicall v3 tickSpacing failed")?,
+        )?;
+        let liquidity = IUniswapV3Pool::liquidityCall::abi_decode_returns(
+            results
+                .get(4)
+                .and_then(|value| value.as_ref())
+                .context("multicall v3 liquidity failed")?,
+        )?;
+        let slot0 = IUniswapV3Pool::slot0Call::abi_decode_returns(
+            results
+                .get(5)
+                .and_then(|value| value.as_ref())
+                .context("multicall v3 slot0 failed")?,
+        )?;
+        Ok((
+            token0,
+            token1,
+            u32::try_from(fee).unwrap_or(u32::MAX),
+            i32::try_from(tick_spacing).unwrap_or(0),
+            liquidity,
+            U256::saturating_from(slot0.sqrtPriceX96),
+            i32::try_from(slot0.tick).unwrap_or(0),
+        ))
+    }
+
+    async fn fetch_v3_sequential(
+        &self,
+        pool: Address,
+    ) -> Result<(Address, Address, u32, i32, u128, U256, i32)> {
+        let token0 = self
+            .call_address(pool, IUniswapV3Pool::token0Call {}.abi_encode())
+            .await?;
+        let token1 = self
+            .call_address(pool, IUniswapV3Pool::token1Call {}.abi_encode())
+            .await?;
+        let raw_fee = self
+            .rpc
+            .best_read()
+            .eth_call(
+                pool,
+                None,
+                IUniswapV3Pool::feeCall {}.abi_encode().into(),
+                "latest",
+            )
+            .await?;
+        let fee = IUniswapV3Pool::feeCall::abi_decode_returns(&raw_fee)?;
+        let raw_spacing = self
+            .rpc
+            .best_read()
+            .eth_call(
+                pool,
+                None,
+                IUniswapV3Pool::tickSpacingCall {}.abi_encode().into(),
+                "latest",
+            )
+            .await?;
+        let tick_spacing = IUniswapV3Pool::tickSpacingCall::abi_decode_returns(&raw_spacing)?;
+        let raw_liq = self
+            .rpc
+            .best_read()
+            .eth_call(
+                pool,
+                None,
+                IUniswapV3Pool::liquidityCall {}.abi_encode().into(),
+                "latest",
+            )
+            .await?;
+        let liquidity = IUniswapV3Pool::liquidityCall::abi_decode_returns(&raw_liq)?;
+        let raw_slot0 = self
+            .rpc
+            .best_read()
+            .eth_call(
+                pool,
+                None,
+                IUniswapV3Pool::slot0Call {}.abi_encode().into(),
+                "latest",
+            )
+            .await?;
+        let slot0 = IUniswapV3Pool::slot0Call::abi_decode_returns(&raw_slot0)?;
+        Ok((
+            token0,
+            token1,
+            u32::try_from(fee).unwrap_or(u32::MAX),
+            i32::try_from(tick_spacing).unwrap_or(0),
+            liquidity,
+            U256::saturating_from(slot0.sqrtPriceX96),
+            i32::try_from(slot0.tick).unwrap_or(0),
+        ))
     }
 
     async fn call_address(&self, to: Address, data: Vec<u8>) -> Result<Address> {

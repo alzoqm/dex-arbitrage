@@ -105,14 +105,14 @@ impl DiscoveryKind {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum FinalityLevel {
     Pending,
     Sealed,
     Finalized,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PoolAdmissionStatus {
     Allowed,
     Quarantined,
@@ -154,7 +154,7 @@ impl From<AmmKind> for AdapterType {
     }
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct TokenBehavior {
     pub fee_on_transfer: bool,
     pub rebasing: bool,
@@ -173,7 +173,7 @@ impl TokenBehavior {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TokenInfo {
     pub address: Address,
     pub symbol: String,
@@ -188,22 +188,13 @@ pub struct TokenInfo {
     pub max_flash_loan_usd_e8: Option<u128>,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
 pub struct LiquidityInfo {
     pub estimated_usd_e8: u64,
     pub safe_capacity_in: u128,
 }
 
-impl Default for LiquidityInfo {
-    fn default() -> Self {
-        Self {
-            estimated_usd_e8: 0,
-            safe_capacity_in: 0,
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PoolHealth {
     pub stale: bool,
     pub paused: bool,
@@ -243,14 +234,14 @@ impl PoolHealth {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct V2PoolState {
     pub reserve0: u128,
     pub reserve1: u128,
     pub fee_ppm: u32,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct V3PoolState {
     pub sqrt_price_x96: U256,
     pub liquidity: u128,
@@ -259,7 +250,7 @@ pub struct V3PoolState {
     pub tick_spacing: i32,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CurvePoolState {
     pub balances: Vec<u128>,
     pub amp: u128,
@@ -267,7 +258,7 @@ pub struct CurvePoolState {
     pub supports_underlying: bool,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BalancerPoolState {
     pub pool_id: B256,
     pub balances: Vec<u128>,
@@ -275,7 +266,7 @@ pub struct BalancerPoolState {
     pub swap_fee_ppm: u32,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum PoolSpecificState {
     UniswapV2Like(V2PoolState),
     UniswapV3Like(V3PoolState),
@@ -283,7 +274,7 @@ pub enum PoolSpecificState {
     BalancerWeighted(BalancerPoolState),
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PoolState {
     pub pool_id: Address,
     pub dex_name: String,
@@ -321,7 +312,7 @@ pub struct Edge {
     pub dex_name: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BlockRef {
     pub number: u64,
     pub hash: B256,
@@ -442,10 +433,53 @@ pub struct SubmissionResult {
 }
 
 #[derive(Debug, Clone)]
+pub enum PoolStatePatch {
+    UniswapV2Sync {
+        pool_id: Address,
+        reserve0: u128,
+        reserve1: u128,
+        block_number: Option<u64>,
+    },
+    UniswapV3Swap {
+        pool_id: Address,
+        sqrt_price_x96: U256,
+        liquidity: u128,
+        tick: i32,
+        block_number: Option<u64>,
+    },
+    BalancerSwap {
+        pool_id: Address,
+        token_in: Address,
+        token_out: Address,
+        amount_in: u128,
+        amount_out: u128,
+        block_number: Option<u64>,
+    },
+    BalancerBalanceChanged {
+        pool_id: Address,
+        tokens: Vec<Address>,
+        deltas: Vec<i128>,
+        block_number: Option<u64>,
+    },
+}
+
+impl PoolStatePatch {
+    pub fn pool_id(&self) -> Address {
+        match self {
+            Self::UniswapV2Sync { pool_id, .. }
+            | Self::UniswapV3Swap { pool_id, .. }
+            | Self::BalancerSwap { pool_id, .. }
+            | Self::BalancerBalanceChanged { pool_id, .. } => *pool_id,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct RefreshTrigger {
     pub pool_id: Option<Address>,
     pub full_refresh: bool,
     pub source: String,
+    pub patch: Option<PoolStatePatch>,
 }
 
 #[derive(Debug, Clone, Default)]

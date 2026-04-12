@@ -6,6 +6,7 @@ use alloy::{
 };
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use tracing::warn;
 
 use crate::{
     abi::{ICurveRegistry, IUniswapV2Factory},
@@ -13,6 +14,8 @@ use crate::{
     rpc::RpcClients,
     types::{AmmKind, BlockRef, DiscoveryKind, FinalityLevel},
 };
+
+use super::multicall;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DiscoveredPool {
@@ -132,18 +135,14 @@ impl FactoryScanner {
             .filter(|cached| cached.matches(dex, latest))
             .map(|cached| cached.cursor.count.min(len))
             .unwrap_or(0);
-        for idx in start..len {
-            let data = IUniswapV2Factory::allPairsCall {
-                index: U256::saturating_from(idx),
+        let new_pairs = match self.scan_v2_pairs_multicall(factory, start, len).await {
+            Ok(pairs) => pairs,
+            Err(err) => {
+                warn!(dex = %dex.name, error = %err, "multicall allPairs scan failed; falling back to sequential eth_call");
+                self.scan_v2_pairs_sequential(factory, start, len).await?
             }
-            .abi_encode();
-            let raw = self
-                .rpc
-                .best_read()
-                .eth_call(factory, None, data.into(), "latest")
-                .await?;
-            let ret = IUniswapV2Factory::allPairsCall::abi_decode_returns(&raw)
-                .context("decode allPairs failed")?;
+        };
+        for ret in new_pairs {
             pools.push(DiscoveredPool {
                 address: ret,
                 dex_name: dex.name.clone(),
@@ -234,18 +233,15 @@ impl FactoryScanner {
             .filter(|cached| cached.matches(dex, latest))
             .map(|cached| cached.cursor.count.min(len))
             .unwrap_or(0);
-        for idx in start..len {
-            let data = ICurveRegistry::pool_listCall {
-                index: U256::saturating_from(idx),
+        let new_pools = match self.scan_curve_pools_multicall(registry, start, len).await {
+            Ok(pools) => pools,
+            Err(err) => {
+                warn!(dex = %dex.name, error = %err, "multicall curve pool_list scan failed; falling back to sequential eth_call");
+                self.scan_curve_pools_sequential(registry, start, len)
+                    .await?
             }
-            .abi_encode();
-            let raw = self
-                .rpc
-                .best_read()
-                .eth_call(registry, None, data.into(), "latest")
-                .await?;
-            let ret = ICurveRegistry::pool_listCall::abi_decode_returns(&raw)
-                .context("decode curve pool_list failed")?;
+        };
+        for ret in new_pools {
             pools.push(DiscoveredPool {
                 address: ret,
                 dex_name: dex.name.clone(),
@@ -343,6 +339,130 @@ impl FactoryScanner {
             start = end.saturating_add(1);
         }
         Ok(all)
+    }
+
+    async fn scan_v2_pairs_multicall(
+        &self,
+        factory: Address,
+        start: u64,
+        len: u64,
+    ) -> Result<Vec<Address>> {
+        if multicall_disabled() {
+            anyhow::bail!("multicall disabled");
+        }
+        let mut out = Vec::new();
+        let chunk_size = multicall_chunk_size();
+        let mut idx = start;
+        while idx < len {
+            let end = idx.saturating_add(chunk_size).min(len);
+            let calls = (idx..end)
+                .map(|index| {
+                    (
+                        factory,
+                        IUniswapV2Factory::allPairsCall {
+                            index: U256::saturating_from(index),
+                        }
+                        .abi_encode(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            let results = multicall::aggregate3(&self.rpc, calls).await?;
+            for raw in results.into_iter().flatten() {
+                out.push(
+                    IUniswapV2Factory::allPairsCall::abi_decode_returns(&raw)
+                        .context("decode multicall allPairs failed")?,
+                );
+            }
+            idx = end;
+        }
+        Ok(out)
+    }
+
+    async fn scan_v2_pairs_sequential(
+        &self,
+        factory: Address,
+        start: u64,
+        len: u64,
+    ) -> Result<Vec<Address>> {
+        let mut out = Vec::new();
+        for idx in start..len {
+            let data = IUniswapV2Factory::allPairsCall {
+                index: U256::saturating_from(idx),
+            }
+            .abi_encode();
+            let raw = self
+                .rpc
+                .best_read()
+                .eth_call(factory, None, data.into(), "latest")
+                .await?;
+            out.push(
+                IUniswapV2Factory::allPairsCall::abi_decode_returns(&raw)
+                    .context("decode allPairs failed")?,
+            );
+        }
+        Ok(out)
+    }
+
+    async fn scan_curve_pools_multicall(
+        &self,
+        registry: Address,
+        start: u64,
+        len: u64,
+    ) -> Result<Vec<Address>> {
+        if multicall_disabled() {
+            anyhow::bail!("multicall disabled");
+        }
+        let mut out = Vec::new();
+        let chunk_size = multicall_chunk_size();
+        let mut idx = start;
+        while idx < len {
+            let end = idx.saturating_add(chunk_size).min(len);
+            let calls = (idx..end)
+                .map(|index| {
+                    (
+                        registry,
+                        ICurveRegistry::pool_listCall {
+                            index: U256::saturating_from(index),
+                        }
+                        .abi_encode(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            let results = multicall::aggregate3(&self.rpc, calls).await?;
+            for raw in results.into_iter().flatten() {
+                out.push(
+                    ICurveRegistry::pool_listCall::abi_decode_returns(&raw)
+                        .context("decode multicall curve pool_list failed")?,
+                );
+            }
+            idx = end;
+        }
+        Ok(out)
+    }
+
+    async fn scan_curve_pools_sequential(
+        &self,
+        registry: Address,
+        start: u64,
+        len: u64,
+    ) -> Result<Vec<Address>> {
+        let mut out = Vec::new();
+        for idx in start..len {
+            let data = ICurveRegistry::pool_listCall {
+                index: U256::saturating_from(idx),
+            }
+            .abi_encode();
+            let raw = self
+                .rpc
+                .best_read()
+                .eth_call(registry, None, data.into(), "latest")
+                .await?;
+            out.push(
+                ICurveRegistry::pool_listCall::abi_decode_returns(&raw)
+                    .context("decode curve pool_list failed")?,
+            );
+        }
+        Ok(out)
     }
 }
 
@@ -465,4 +585,18 @@ fn decode_address_from_word(word: &[u8]) -> Address {
 
 fn u256_to_u64(value: alloy::primitives::U256) -> u64 {
     value.to_string().parse::<u64>().unwrap_or(0)
+}
+
+fn multicall_chunk_size() -> u64 {
+    std::env::var("MULTICALL_CHUNK_SIZE")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(500)
+}
+
+fn multicall_disabled() -> bool {
+    std::env::var("DISABLE_MULTICALL")
+        .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+        .unwrap_or(false)
 }

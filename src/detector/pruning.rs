@@ -4,13 +4,7 @@ pub fn ranked_outgoing(snapshot: &GraphSnapshot, vertex: usize) -> Vec<EdgeRef> 
     let mut refs = snapshot
         .adjacency
         .get(vertex)
-        .map(|edges| {
-            edges
-                .iter()
-                .enumerate()
-                .map(|(edge_idx, edge)| (edge_idx, edge))
-                .collect::<Vec<_>>()
-        })
+        .map(|edges| edges.iter().enumerate().collect::<Vec<_>>())
         .unwrap_or_default();
 
     refs.sort_by(|(_, a), (_, b)| {

@@ -57,3 +57,9 @@ impl NonceManager {
         self.states.lock().insert(nonce, NonceState::Dropped);
     }
 }
+
+impl Default for NonceManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}

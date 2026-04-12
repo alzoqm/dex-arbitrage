@@ -1,7 +1,12 @@
-use std::sync::Arc;
+use std::{
+    collections::HashMap,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use alloy::{signers::local::PrivateKeySigner, sol_types::SolCall};
 use anyhow::Result;
+use parking_lot::Mutex;
 
 use crate::{
     abi::IERC20,
@@ -15,11 +20,22 @@ use crate::{
 pub struct CapitalSelector {
     settings: Arc<Settings>,
     rpc: Arc<RpcClients>,
+    balance_cache: Arc<Mutex<HashMap<alloy::primitives::Address, CachedBalance>>>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct CachedBalance {
+    fetched_at: Instant,
+    value: u128,
 }
 
 impl CapitalSelector {
     pub fn new(settings: Arc<Settings>, rpc: Arc<RpcClients>) -> Self {
-        Self { settings, rpc }
+        Self {
+            settings,
+            rpc,
+            balance_cache: Arc::new(Mutex::new(HashMap::new())),
+        }
     }
 
     pub async fn choose(
@@ -124,6 +140,19 @@ impl CapitalSelector {
     }
 
     async fn executor_balance(&self, token: alloy::primitives::Address) -> Result<u128> {
+        let ttl = Duration::from_millis(
+            std::env::var("EXECUTOR_BALANCE_CACHE_MS")
+                .ok()
+                .and_then(|value| value.parse::<u64>().ok())
+                .filter(|value| *value > 0)
+                .unwrap_or(1_500),
+        );
+        if let Some(cached) = self.balance_cache.lock().get(&token).copied() {
+            if cached.fetched_at.elapsed() <= ttl {
+                return Ok(cached.value);
+            }
+        }
+
         let Some(executor) = self.settings.contracts.executor_address else {
             return Ok(0);
         };
@@ -140,6 +169,14 @@ impl CapitalSelector {
             )
             .await?;
         let ret = IERC20::balanceOfCall::abi_decode_returns(&raw)?;
-        Ok(ret.to_string().parse::<u128>().unwrap_or(u128::MAX))
+        let value = ret.to_string().parse::<u128>().unwrap_or(u128::MAX);
+        self.balance_cache.lock().insert(
+            token,
+            CachedBalance {
+                fetched_at: Instant::now(),
+                value,
+            },
+        );
+        Ok(value)
     }
 }

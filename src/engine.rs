@@ -114,7 +114,8 @@ pub async fn run_chain(
         }
 
         let changed_specs = collect_changed_specs(snapshot.as_ref(), &batch);
-        if changed_specs.is_empty() {
+        let patches = collect_patches(&batch);
+        if changed_specs.is_empty() && patches.is_empty() {
             debug!(
                 trigger_count = batch.triggers.len(),
                 "no matching pool specs for refresh batch"
@@ -126,6 +127,7 @@ pub async fn run_chain(
         info!(
             trigger_count = batch.triggers.len(),
             refresh_pool_count = changed_specs.len(),
+            patch_count = patches.len(),
             latest_block,
             "refreshing changed pools"
         );
@@ -137,6 +139,7 @@ pub async fn run_chain(
                 snapshot.tokens.clone(),
                 snapshot.pools.clone(),
                 changed_specs,
+                patches,
                 block_ref,
             )
             .await
@@ -328,16 +331,23 @@ fn all_edge_refs(snapshot: &GraphSnapshot) -> Vec<EdgeRef> {
 
 fn collect_changed_specs(snapshot: &GraphSnapshot, batch: &RefreshBatch) -> Vec<DiscoveredPool> {
     if batch.triggers.iter().any(|trigger| trigger.full_refresh) {
-        return snapshot
-            .pools
-            .values()
-            .map(pool_to_spec)
+        let mut seen = HashSet::<Address>::new();
+        return batch
+            .triggers
+            .iter()
+            .filter(|trigger| trigger.full_refresh)
+            .filter_map(|trigger| trigger.pool_id)
+            .filter(|pool_id| seen.insert(*pool_id))
+            .filter_map(|pool_id| snapshot.pool(pool_id).map(pool_to_spec))
             .collect::<Vec<_>>();
     }
 
     let mut seen = HashSet::<Address>::new();
     let mut out = Vec::new();
     for trigger in &batch.triggers {
+        if trigger.patch.is_some() {
+            continue;
+        }
         let Some(pool_id) = trigger.pool_id else {
             continue;
         };
@@ -349,6 +359,15 @@ fn collect_changed_specs(snapshot: &GraphSnapshot, batch: &RefreshBatch) -> Vec<
         }
     }
     out
+}
+
+fn collect_patches(batch: &RefreshBatch) -> Vec<crate::types::PoolStatePatch> {
+    batch
+        .triggers
+        .iter()
+        .filter(|trigger| !trigger.full_refresh)
+        .filter_map(|trigger| trigger.patch.clone())
+        .collect()
 }
 
 fn pool_to_spec(pool: &crate::types::PoolState) -> DiscoveredPool {
