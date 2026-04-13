@@ -45,22 +45,13 @@ contract MockERC20 {
 contract MockAavePool {
     uint128 public constant FLASH_PREMIUM_BPS = 9;
 
-    function flashLoanSimple(
-        address receiverAddress,
-        address asset,
-        uint256 amount,
-        bytes calldata params,
-        uint16
-    ) external {
+    function flashLoanSimple(address receiverAddress, address asset, uint256 amount, bytes calldata params, uint16)
+        external
+    {
         uint256 premium = amount * FLASH_PREMIUM_BPS / 10_000;
         require(MockERC20(asset).transfer(receiverAddress, amount), "LOAN_TRANSFER");
-        bool ok = IFlashLoanSimpleReceiver(receiverAddress).executeOperation(
-            asset,
-            amount,
-            premium,
-            receiverAddress,
-            params
-        );
+        bool ok =
+            IFlashLoanSimpleReceiver(receiverAddress).executeOperation(asset, amount, premium, receiverAddress, params);
         require(ok, "CALLBACK");
         require(MockERC20(asset).transferFrom(receiverAddress, address(this), amount + premium), "REPAY");
     }
@@ -123,8 +114,7 @@ contract ArbitrageExecutorMixedTest {
         uint256 loanAmount = 600_000;
         uint256 minProfit = 100_000;
 
-        ArbitrageExecutor.FlashLoanParams memory params =
-            _flashParams(inputAmount, loanAmount, minProfit);
+        ArbitrageExecutor.FlashLoanParams memory params = _flashParams(inputAmount, loanAmount, minProfit);
         executor.executeFlashLoan(params);
 
         uint256 premium = loanAmount * 9 / 10_000;
@@ -177,20 +167,19 @@ contract ArbitrageExecutorMixedTest {
         assert(tokenA.balanceOf(address(executor)) > 400_000);
     }
 
-    function _flashParams(
-        uint256 inputAmount,
-        uint256 loanAmount,
-        uint256 minProfit
-    ) private view returns (ArbitrageExecutor.FlashLoanParams memory) {
+    function _flashParams(uint256 inputAmount, uint256 loanAmount, uint256 minProfit)
+        private
+        view
+        returns (ArbitrageExecutor.FlashLoanParams memory)
+    {
         return _flashParamsWithFee(inputAmount, loanAmount, minProfit, 3000);
     }
 
-    function _flashParamsWithFee(
-        uint256 inputAmount,
-        uint256 loanAmount,
-        uint256 minProfit,
-        uint256 feePpm
-    ) private view returns (ArbitrageExecutor.FlashLoanParams memory) {
+    function _flashParamsWithFee(uint256 inputAmount, uint256 loanAmount, uint256 minProfit, uint256 feePpm)
+        private
+        view
+        returns (ArbitrageExecutor.FlashLoanParams memory)
+    {
         ArbitrageExecutor.ExecutionParams memory execution;
         execution.inputToken = address(tokenA);
         execution.inputAmount = inputAmount;
@@ -224,19 +213,17 @@ contract ArbitrageExecutorMixedTest {
             extraData: abi.encode(feePpm)
         });
 
-        return ArbitrageExecutor.FlashLoanParams({
-            loanAsset: address(tokenA),
-            loanAmount: loanAmount,
-            execution: execution
-        });
+        return
+            ArbitrageExecutor.FlashLoanParams({
+                loanAsset: address(tokenA), loanAmount: loanAmount, execution: execution
+            });
     }
 
-    function _amountOut(
-        uint256 amountIn,
-        uint256 reserveIn,
-        uint256 reserveOut,
-        uint256 feePpm
-    ) private pure returns (uint256) {
+    function _amountOut(uint256 amountIn, uint256 reserveIn, uint256 reserveOut, uint256 feePpm)
+        private
+        pure
+        returns (uint256)
+    {
         uint256 amountInWithFee = amountIn * (1_000_000 - feePpm);
         return amountInWithFee * reserveOut / (reserveIn * 1_000_000 + amountInWithFee);
     }
