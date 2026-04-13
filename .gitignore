@@ -4,6 +4,8 @@
 state/
 out/
 cache/
+!src/cache/
+!src/cache/**
 broadcast/
 target/
 .DS_Store

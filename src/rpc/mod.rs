@@ -1,29 +1,113 @@
-use std::{
-    sync::atomic::{AtomicU64, Ordering},
-    time::Instant,
-};
+pub mod scheduler;
 
 use alloy::primitives::{Address, Bytes, B256, U256};
 use anyhow::{Context, Result};
 use reqwest::header::{HeaderMap, HeaderValue, CONTENT_TYPE};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::{
+    collections::HashMap,
+    sync::atomic::{AtomicU64, Ordering},
+    sync::{Arc, OnceLock},
+    time::{Duration, Instant},
+};
+use tokio::time::sleep;
 
 use crate::config::RpcSettings;
+use crate::types::Chain;
 
 #[derive(Debug)]
 pub struct RpcClient {
     url: String,
+    fallback_urls: Vec<String>,
     http: reqwest::Client,
     request_id: AtomicU64,
+    endpoint_status: parking_lot::Mutex<HashMap<String, EndpointStatus>>,
 }
+
+#[derive(Debug, Clone, Copy, Default)]
+struct EndpointStatus {
+    consecutive_failures: u64,
+    open_until: Option<Instant>,
+}
+
+#[derive(Debug)]
+struct RpcCuLimiter {
+    capacity: u64,
+    refill_rate: u64,
+    tokens: AtomicU64,
+    last_refill: parking_lot::Mutex<Instant>,
+}
+
+impl RpcCuLimiter {
+    fn new(capacity: u64, refill_rate: u64) -> Self {
+        Self {
+            capacity,
+            refill_rate,
+            tokens: AtomicU64::new(capacity),
+            last_refill: parking_lot::Mutex::new(Instant::now()),
+        }
+    }
+
+    fn try_consume(&self, amount: u64) -> bool {
+        if amount == 0 {
+            return true;
+        }
+
+        self.refill();
+        let mut current = self.tokens.load(Ordering::SeqCst);
+        loop {
+            if current < amount {
+                return false;
+            }
+            match self.tokens.compare_exchange_weak(
+                current,
+                current - amount,
+                Ordering::SeqCst,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return true,
+                Err(actual) => current = actual,
+            }
+        }
+    }
+
+    fn wait_duration(&self, amount: u64) -> Duration {
+        if amount == 0 {
+            return Duration::ZERO;
+        }
+        let current = self.tokens.load(Ordering::SeqCst);
+        if current >= amount {
+            return Duration::ZERO;
+        }
+        let missing = amount - current;
+        Duration::from_secs_f64((missing as f64 / self.refill_rate.max(1) as f64).max(0.01))
+    }
+
+    fn refill(&self) {
+        let mut last = self.last_refill.lock();
+        let elapsed = last.elapsed().as_secs_f64();
+        let refill = (elapsed * self.refill_rate as f64) as u64;
+        if refill == 0 {
+            return;
+        }
+        let current = self.tokens.load(Ordering::SeqCst);
+        self.tokens.store(
+            current.saturating_add(refill).min(self.capacity),
+            Ordering::SeqCst,
+        );
+        *last = Instant::now();
+    }
+}
+
+static RPC_CU_LIMITER: OnceLock<RpcCuLimiter> = OnceLock::new();
 
 #[derive(Debug, Clone)]
 pub struct RpcClients {
-    pub public: std::sync::Arc<RpcClient>,
-    pub fallback: Option<std::sync::Arc<RpcClient>>,
-    pub preconf: Option<std::sync::Arc<RpcClient>>,
-    pub protected: Option<std::sync::Arc<RpcClient>>,
+    pub public: Arc<RpcClient>,
+    pub fallback: Option<Arc<RpcClient>>,
+    pub preconf: Option<Arc<RpcClient>>,
+    pub protected: Option<Arc<RpcClient>>,
 }
 
 #[derive(Debug, Clone)]
@@ -60,34 +144,50 @@ struct RpcError {
 
 impl RpcClients {
     pub fn from_settings(settings: &RpcSettings) -> Result<Self> {
+        let public_read_fallbacks = compact_unique_urls([
+            settings.preconf_rpc_url.clone(),
+            settings.fallback_rpc_url.clone(),
+        ]);
+        let fallback_read_fallbacks = compact_unique_urls([
+            Some(settings.public_rpc_url.clone()),
+            settings.preconf_rpc_url.clone(),
+        ]);
+        let preconf_read_fallbacks = compact_unique_urls([
+            Some(settings.public_rpc_url.clone()),
+            settings.fallback_rpc_url.clone(),
+        ]);
+
         Ok(Self {
-            public: std::sync::Arc::new(RpcClient::new(settings.public_rpc_url.clone())?),
+            public: Arc::new(RpcClient::with_fallbacks(
+                settings.public_rpc_url.clone(),
+                public_read_fallbacks,
+            )?),
             fallback: settings
                 .fallback_rpc_url
                 .clone()
-                .map(RpcClient::new)
+                .map(|url| RpcClient::with_fallbacks(url, fallback_read_fallbacks))
                 .transpose()?
-                .map(std::sync::Arc::new),
+                .map(Arc::new),
             preconf: settings
                 .preconf_rpc_url
                 .clone()
-                .map(RpcClient::new)
+                .map(|url| RpcClient::with_fallbacks(url, preconf_read_fallbacks))
                 .transpose()?
-                .map(std::sync::Arc::new),
+                .map(Arc::new),
             protected: settings
                 .protected_rpc_url
                 .clone()
                 .map(RpcClient::new)
                 .transpose()?
-                .map(std::sync::Arc::new),
+                .map(Arc::new),
         })
     }
 
-    pub fn best_read(&self) -> std::sync::Arc<RpcClient> {
+    pub fn best_read(&self) -> Arc<RpcClient> {
         self.preconf.clone().unwrap_or_else(|| self.public.clone())
     }
 
-    pub fn best_write(&self) -> std::sync::Arc<RpcClient> {
+    pub fn best_write(&self) -> Arc<RpcClient> {
         self.protected
             .clone()
             .unwrap_or_else(|| self.public.clone())
@@ -96,24 +196,152 @@ impl RpcClients {
 
 impl RpcClient {
     pub fn new(url: String) -> Result<Self> {
+        Self::with_fallbacks(url, Vec::new())
+    }
+
+    pub fn with_fallbacks(url: String, fallback_urls: Vec<String>) -> Result<Self> {
         let mut headers = HeaderMap::new();
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
 
         Ok(Self {
             url,
+            fallback_urls,
             http: reqwest::Client::builder()
                 .default_headers(headers)
                 .build()
                 .context("failed to build reqwest client")?,
             request_id: AtomicU64::new(1),
+            endpoint_status: parking_lot::Mutex::new(HashMap::new()),
         })
     }
 
     pub async fn request(&self, method: &str, params: Value) -> Result<Value> {
-        let started = Instant::now();
-        metrics::counter!("rpc_requests_total", "method" => method.to_string()).increment(1);
-        metrics::counter!("rpc_compute_units_total", "method" => method.to_string())
-            .increment(rpc_compute_units(method));
+        let max_retries = rpc_max_retries(method);
+        let mut last_error = None;
+
+        for attempt in 0..=max_retries {
+            for endpoint in self.endpoints_for_method(method) {
+                if self.endpoint_is_open(&endpoint) {
+                    metrics::counter!(
+                        "rpc_provider_skipped_total",
+                        "method" => method.to_string(),
+                        "provider" => provider_label(&endpoint)
+                    )
+                    .increment(1);
+                    continue;
+                }
+
+                acquire_rpc_budget(method).await;
+                let started = Instant::now();
+                metrics::counter!(
+                    "rpc_requests_total",
+                    "method" => method.to_string(),
+                    "provider" => provider_label(&endpoint)
+                )
+                .increment(1);
+                metrics::counter!(
+                    "rpc_compute_units_total",
+                    "method" => method.to_string(),
+                    "provider" => provider_label(&endpoint)
+                )
+                .increment(rpc_compute_units(method));
+
+                match tokio::time::timeout(
+                    rpc_timeout(method),
+                    self.request_once(&endpoint, method, params.clone()),
+                )
+                .await
+                {
+                    Ok(Ok(value)) => {
+                        self.record_endpoint_success(&endpoint);
+                        metrics::histogram!(
+                            "rpc_request_duration_seconds",
+                            "method" => method.to_string(),
+                            "provider" => provider_label(&endpoint)
+                        )
+                        .record(started.elapsed().as_secs_f64());
+                        return Ok(value);
+                    }
+                    Ok(Err(err)) => {
+                        self.record_endpoint_failure(&endpoint);
+                        metrics::counter!(
+                            "rpc_errors_total",
+                            "method" => method.to_string(),
+                            "provider" => provider_label(&endpoint)
+                        )
+                        .increment(1);
+                        last_error = Some(err);
+                    }
+                    Err(_) => {
+                        self.record_endpoint_failure(&endpoint);
+                        metrics::counter!(
+                            "rpc_errors_total",
+                            "method" => method.to_string(),
+                            "provider" => provider_label(&endpoint)
+                        )
+                        .increment(1);
+                        last_error = Some(anyhow::anyhow!(
+                            "rpc timeout after {:?} for method {}",
+                            rpc_timeout(method),
+                            method
+                        ));
+                    }
+                }
+            }
+
+            if attempt < max_retries {
+                sleep(rpc_backoff(method, attempt)).await;
+            }
+        }
+
+        Err(last_error.unwrap_or_else(|| anyhow::anyhow!("rpc request failed for {method}")))
+    }
+
+    fn endpoints_for_method(&self, method: &str) -> Vec<String> {
+        let mut endpoints = vec![self.url.clone()];
+        if rpc_is_idempotent(method) {
+            for url in &self.fallback_urls {
+                if !endpoints.iter().any(|existing| existing == url) {
+                    endpoints.push(url.clone());
+                }
+            }
+        }
+        endpoints
+    }
+
+    fn endpoint_is_open(&self, endpoint: &str) -> bool {
+        let mut status = self.endpoint_status.lock();
+        let Some(endpoint_status) = status.get_mut(endpoint) else {
+            return false;
+        };
+        match endpoint_status.open_until {
+            Some(until) if Instant::now() < until => true,
+            Some(_) => {
+                endpoint_status.open_until = None;
+                false
+            }
+            None => false,
+        }
+    }
+
+    fn record_endpoint_success(&self, endpoint: &str) {
+        self.endpoint_status
+            .lock()
+            .insert(endpoint.to_string(), EndpointStatus::default());
+    }
+
+    fn record_endpoint_failure(&self, endpoint: &str) {
+        let threshold = env_u64("RPC_PROVIDER_FAILURE_THRESHOLD", 3);
+        let open_ms = env_u64("RPC_PROVIDER_CIRCUIT_OPEN_MS", 30_000);
+        let mut status = self.endpoint_status.lock();
+        let entry = status.entry(endpoint.to_string()).or_default();
+        entry.consecutive_failures = entry.consecutive_failures.saturating_add(1);
+        if entry.consecutive_failures >= threshold {
+            entry.open_until = Some(Instant::now() + Duration::from_millis(open_ms));
+        }
+    }
+
+    async fn request_once(&self, endpoint: &str, method: &str, params: Value) -> Result<Value> {
         let id = self.request_id.fetch_add(1, Ordering::Relaxed);
         let payload = json!({
             "jsonrpc": "2.0",
@@ -124,7 +352,7 @@ impl RpcClient {
 
         let response = self
             .http
-            .post(&self.url)
+            .post(endpoint)
             .json(&payload)
             .send()
             .await
@@ -137,14 +365,12 @@ impl RpcClient {
             .context("failed to read rpc response body")?;
 
         if !status.is_success() {
-            metrics::counter!("rpc_errors_total", "method" => method.to_string()).increment(1);
             anyhow::bail!("rpc http error {} for method {}: {}", status, method, body);
         }
 
         let parsed: RpcResponse = serde_json::from_str(&body)
             .with_context(|| format!("invalid rpc response body: {body}"))?;
         if let Some(err) = parsed.error {
-            metrics::counter!("rpc_errors_total", "method" => method.to_string()).increment(1);
             anyhow::bail!(
                 "rpc error {} {} for method {}",
                 err.code,
@@ -153,8 +379,6 @@ impl RpcClient {
             );
         }
 
-        metrics::histogram!("rpc_request_duration_seconds", "method" => method.to_string())
-            .record(started.elapsed().as_secs_f64());
         parsed.result.context("missing rpc result")
     }
 
@@ -414,7 +638,7 @@ fn parse_receipt_status(value: &Value) -> Result<Option<bool>> {
     Ok(Some(status == 1))
 }
 
-fn rpc_compute_units(method: &str) -> u64 {
+pub fn rpc_compute_units(method: &str) -> u64 {
     match method {
         "net_version" | "eth_chainId" | "eth_syncing" | "eth_protocolVersion" | "net_listening" => {
             0
@@ -443,6 +667,136 @@ fn rpc_compute_units(method: &str) -> u64 {
         "eth_callMany" => 20,
         _ => 20,
     }
+}
+
+/// Get chain-aware eth_getLogs maximum block range for Pay As You Go
+pub fn max_log_range_for_chain(chain: Chain) -> u64 {
+    match chain {
+        Chain::Base => 50_000,   // Base has broader ranges, but cap at response size
+        Chain::Polygon => 2_000, // Polygon Pay As You Go limited to 2000 blocks
+    }
+}
+
+/// Adaptive log chunk size based on chain and provider mode
+pub fn adapt_log_chunk_size(chain: Chain, provider_mode: &str, current_size: u64) -> u64 {
+    let max_allowed = max_log_range_for_chain(chain);
+    let adaptive_max = match provider_mode.to_lowercase().as_str() {
+        "payg" | "payasyougo" | "free" => max_allowed,
+        "dedicated" | "growth" | "scale" => {
+            // Higher tiers may support larger ranges
+            std::cmp::max(max_allowed, 10_000)
+        }
+        _ => max_allowed,
+    };
+
+    // Start with current size, but cap at adaptive maximum
+    // If current_size is 0, use a reasonable default
+    if current_size == 0 {
+        std::cmp::min(5_000, adaptive_max)
+    } else {
+        std::cmp::min(current_size, adaptive_max)
+    }
+}
+
+/// Check if a log range error indicates we should reduce chunk size
+pub fn should_reduce_chunk_size(error: &str) -> bool {
+    let error_lower = error.to_lowercase();
+    error_lower.contains("query returned more than")
+        || error_lower.contains("exceeds range limit")
+        || error_lower.contains("block range too large")
+        || error_lower.contains("too many results")
+        || error_lower.contains("timeout")
+}
+
+async fn acquire_rpc_budget(method: &str) {
+    let cu = rpc_compute_units(method);
+    let limiter = rpc_cu_limiter();
+    while !limiter.try_consume(cu) {
+        sleep(limiter.wait_duration(cu)).await;
+    }
+}
+
+fn rpc_cu_limiter() -> &'static RpcCuLimiter {
+    RPC_CU_LIMITER.get_or_init(|| {
+        let refill_rate = env_u64("RPC_CU_PER_SECOND", 10_000).max(1);
+        let capacity = env_u64("RPC_CU_BURST", refill_rate).max(refill_rate);
+        RpcCuLimiter::new(capacity, refill_rate)
+    })
+}
+
+fn rpc_max_retries(method: &str) -> usize {
+    if matches!(
+        method,
+        "eth_sendRawTransaction" | "eth_sendPrivateTransaction" | "flashbots_sendBundle"
+    ) {
+        return env_usize("RPC_SUBMIT_MAX_RETRIES", 0);
+    }
+    match method {
+        "eth_getLogs" | "eth_getBlockReceipts" => env_usize("RPC_LOG_MAX_RETRIES", 3),
+        "eth_call" | "eth_estimateGas" => env_usize("RPC_SIMULATION_MAX_RETRIES", 2),
+        "eth_getTransactionReceipt" | "eth_getTransactionByHash" => {
+            env_usize("RPC_RECEIPT_MAX_RETRIES", 2)
+        }
+        _ => env_usize("RPC_MAX_RETRIES", 1),
+    }
+}
+
+fn rpc_is_idempotent(method: &str) -> bool {
+    !matches!(
+        method,
+        "eth_sendRawTransaction" | "eth_sendPrivateTransaction" | "flashbots_sendBundle"
+    )
+}
+
+fn rpc_timeout(method: &str) -> Duration {
+    let default_ms = match method {
+        "eth_getLogs" | "eth_getBlockReceipts" => 60_000,
+        "eth_call" | "eth_estimateGas" => 30_000,
+        "eth_sendRawTransaction" | "eth_sendPrivateTransaction" => 10_000,
+        _ => 20_000,
+    };
+    Duration::from_millis(env_u64("RPC_REQUEST_TIMEOUT_MS", default_ms))
+}
+
+fn rpc_backoff(method: &str, attempt: usize) -> Duration {
+    let base = env_u64("RPC_RETRY_BASE_DELAY_MS", 100);
+    let exp = 2_u64.saturating_pow(attempt as u32);
+    let jitter = method.bytes().fold(attempt as u64, |acc, byte| {
+        acc.wrapping_mul(31) ^ u64::from(byte)
+    }) % 50;
+    Duration::from_millis(base.saturating_mul(exp).saturating_add(jitter))
+}
+
+fn compact_unique_urls<const N: usize>(urls: [Option<String>; N]) -> Vec<String> {
+    let mut out = Vec::new();
+    for url in urls.into_iter().flatten() {
+        if !out.iter().any(|existing| existing == &url) {
+            out.push(url);
+        }
+    }
+    out
+}
+
+fn provider_label(url: &str) -> String {
+    url::Url::parse(url)
+        .ok()
+        .and_then(|parsed| parsed.host_str().map(ToOwned::to_owned))
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+fn env_u64(key: &str, default: u64) -> u64 {
+    std::env::var(key)
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(default)
+}
+
+fn env_usize(key: &str, default: usize) -> usize {
+    std::env::var(key)
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(default)
 }
 
 #[cfg(test)]
