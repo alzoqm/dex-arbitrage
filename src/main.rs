@@ -12,7 +12,7 @@ use dex_arbitrage::{
 #[derive(Debug, Parser)]
 #[command(author, version, about = "DEX N-Hop cyclic arbitrage bot")]
 struct Cli {
-    #[arg(long, value_parser = ["base", "polygon"])]
+    #[arg(long, env = "CHAIN", value_parser = ["base", "polygon"])]
     chain: String,
     #[arg(long, default_value_t = false)]
     once: bool,
