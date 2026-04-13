@@ -15,7 +15,9 @@ use crate::{
         validator::Validator,
     },
     graph::{DistanceCache, GraphSnapshot, GraphStore},
-    risk::limits::RiskManager,
+    monitoring::metrics as telemetry,
+    reorg::{ReorgDetector, ReorgEvent},
+    risk::{depeg_guard::DepegGuard, limits::RiskManager},
     router::Router,
     rpc::RpcClients,
     types::{
@@ -30,7 +32,7 @@ pub async fn run_chain(
     simulate_only_flag: bool,
 ) -> Result<()> {
     let simulate_only = simulate_only_flag || settings.simulation_only;
-    validate_runtime_prerequisites(&settings)?;
+    validate_runtime_prerequisites(&settings, simulate_only)?;
 
     std::fs::create_dir_all("state").ok();
 
@@ -41,7 +43,8 @@ pub async fn run_chain(
     let validator = Validator::new(settings.clone(), rpc.clone());
     let submitter = Submitter::new(settings.clone(), rpc.clone());
     let risk = RiskManager::new(&settings);
-    let nonce_manager = NonceManager::new();
+    let depeg_guard = DepegGuard::new(&settings);
+    let nonce_manager = NonceManager::with_replacement(settings.execution.enable_nonce_replacement);
 
     let operator = validator
         .operator_address()
@@ -65,7 +68,11 @@ pub async fn run_chain(
     );
 
     let store = GraphStore::new(bootstrap.snapshot, 8);
+    let reorg_detector = ReorgDetector::new();
     let initial_snapshot = store.load();
+    if let Some(block_ref) = initial_snapshot.block_ref.clone() {
+        reorg_detector.update_chain(block_ref).ok();
+    }
     let initial_changed_edges = all_edge_refs(initial_snapshot.as_ref());
     process_refresh(
         settings.clone(),
@@ -76,6 +83,7 @@ pub async fn run_chain(
         &validator,
         &submitter,
         &risk,
+        &depeg_guard,
         &nonce_manager,
         simulate_only,
     )
@@ -111,6 +119,22 @@ pub async fn run_chain(
             }
         };
         poll_from_block = latest_block;
+
+        let mut reorg_handled = false;
+        if let Ok(Some(block_ref)) = current_block_ref(rpc.as_ref()).await.map(Some) {
+            telemetry::record_state_lag(
+                latest_block.saturating_sub(block_ref.number),
+                settings.chain.as_str(),
+            );
+            if let Some(event) = reorg_detector.update_chain(block_ref)? {
+                handle_reorg_event(&settings, &store, &event, &mut poll_from_block);
+                reorg_handled = true;
+            }
+        }
+        if reorg_handled {
+            sleep(Duration::from_millis(settings.risk.poll_interval_ms)).await;
+            continue;
+        }
 
         if batch.triggers.is_empty() {
             sleep(Duration::from_millis(settings.risk.poll_interval_ms)).await;
@@ -168,6 +192,12 @@ pub async fn run_chain(
         }
 
         let published = store.publish(next_snapshot);
+        telemetry::record_snapshot_update(
+            published.snapshot_id,
+            changed_pool_ids.len(),
+            changed_edges.len(),
+            settings.chain.as_str(),
+        );
         process_refresh(
             settings.clone(),
             published,
@@ -177,6 +207,7 @@ pub async fn run_chain(
             &validator,
             &submitter,
             &risk,
+            &depeg_guard,
             &nonce_manager,
             simulate_only,
         )
@@ -196,6 +227,7 @@ async fn process_refresh(
     validator: &Validator,
     submitter: &Submitter,
     risk: &RiskManager,
+    depeg_guard: &DepegGuard,
     nonce_manager: &NonceManager,
     simulate_only: bool,
 ) -> Result<()> {
@@ -203,8 +235,17 @@ async fn process_refresh(
         return Ok(());
     }
 
+    // Check stable token depeg status
+    if !depeg_guard.stable_routes_allowed() {
+        warn!("stable tokens detected as depegged, rejecting all candidates");
+        return Ok(());
+    }
+
     let distance_cache = DistanceCache::recompute(snapshot.as_ref());
     let mut candidates = detector.detect(snapshot.as_ref(), &changed_edges, &distance_cache);
+    for _ in &candidates {
+        telemetry::record_candidate_detected(snapshot.snapshot_id, settings.chain.as_str());
+    }
     if candidates.is_empty() {
         debug!(snapshot_id = snapshot.snapshot_id, "no candidates detected");
         return Ok(());
@@ -228,6 +269,7 @@ async fn process_refresh(
             validator,
             submitter,
             risk,
+            depeg_guard,
             nonce_manager,
             simulate_only,
         )
@@ -249,6 +291,7 @@ async fn process_candidate(
     validator: &Validator,
     submitter: &Submitter,
     risk: &RiskManager,
+    depeg_guard: &DepegGuard,
     nonce_manager: &NonceManager,
     simulate_only: bool,
 ) -> Result<Option<SubmissionResult>> {
@@ -257,11 +300,33 @@ async fn process_candidate(
     };
 
     let Some(mut executable) = validator.prepare(plan, snapshot).await? else {
+        telemetry::record_candidate_rejected("validation", settings.chain.as_str());
         return Ok(None);
     };
+    telemetry::record_candidate_validated(executable.exact.snapshot_id, settings.chain.as_str());
+    telemetry::record_opportunity_found(
+        executable.exact.snapshot_id,
+        i128_to_i64_saturating(executable.exact.net_profit_usd_e8),
+        settings.chain.as_str(),
+    );
+
+    // Check depeg status for all stable tokens in the route
+    for hop in &executable.exact.hops {
+        for pool_address in [&hop.token_in, &hop.token_out] {
+            if !depeg_guard.token_is_healthy(*pool_address) {
+                debug!(
+                    token = %pool_address,
+                    "token is unhealthy (depegged), rejecting candidate"
+                );
+                telemetry::record_candidate_rejected("depeg", settings.chain.as_str());
+                return Ok(None);
+            }
+        }
+    }
 
     if let Err(err) = risk.pre_trade_check(&executable) {
         debug!(error = %err, path_len = candidate.path.len(), "risk pre-trade check rejected plan");
+        telemetry::record_candidate_rejected("risk", settings.chain.as_str());
         return Ok(None);
     }
 
@@ -296,29 +361,63 @@ async fn process_candidate(
 
     match submitter.submit(&executable).await {
         Ok(result) => {
-            nonce_manager.mark_submitted(executable.nonce);
+            telemetry::record_transaction_submitted(
+                &result.tx_hash.to_string(),
+                &result.channel,
+                settings.chain.as_str(),
+            );
+            nonce_manager.mark_submitted(
+                executable.nonce,
+                result.tx_hash,
+                executable.max_priority_fee_per_gas,
+                executable.max_fee_per_gas,
+            );
             risk.on_submission_result(&result);
             match submitter.wait_for_receipt(result.tx_hash).await {
                 Ok(ReceiptOutcome::Included) => {
                     nonce_manager.mark_included(executable.nonce);
-                    risk.mark_finalized(0);
+                    let realized = i128_to_i64_saturating(executable.exact.net_profit_usd_e8);
+                    risk.mark_finalized(i128::from(realized));
+                    telemetry::record_transaction_included(
+                        &result.tx_hash.to_string(),
+                        settings.chain.as_str(),
+                        executable.exact.gas_limit,
+                    );
+                    telemetry::record_pnl_realized(realized, settings.chain.as_str());
                     Ok(Some(result))
                 }
                 Ok(ReceiptOutcome::Reverted) => {
                     nonce_manager.mark_included(executable.nonce);
                     risk.mark_finalized(-executable.exact.gas_cost_usd_e8);
+                    telemetry::record_transaction_reverted(
+                        &result.tx_hash.to_string(),
+                        settings.chain.as_str(),
+                        "receipt_status_0",
+                    );
+                    telemetry::record_pnl_realized(
+                        i128_to_i64_saturating(-executable.exact.gas_cost_usd_e8),
+                        settings.chain.as_str(),
+                    );
                     warn!(tx_hash = %result.tx_hash, nonce = executable.nonce, "submitted transaction reverted");
                     Ok(None)
                 }
                 Ok(ReceiptOutcome::TimedOut) => {
-                    nonce_manager.mark_dropped(executable.nonce);
                     risk.mark_failed_submission();
+                    telemetry::record_transaction_failed(
+                        &result.tx_hash.to_string(),
+                        settings.chain.as_str(),
+                        "receipt_timeout",
+                    );
                     warn!(tx_hash = %result.tx_hash, nonce = executable.nonce, "submitted transaction receipt wait timed out");
                     Ok(None)
                 }
                 Err(err) => {
-                    nonce_manager.mark_dropped(executable.nonce);
                     risk.mark_failed_submission();
+                    telemetry::record_transaction_failed(
+                        &result.tx_hash.to_string(),
+                        settings.chain.as_str(),
+                        "receipt_error",
+                    );
                     warn!(error = %err, tx_hash = %result.tx_hash, nonce = executable.nonce, "failed while waiting for transaction receipt");
                     Ok(None)
                 }
@@ -327,18 +426,36 @@ async fn process_candidate(
         Err(err) => {
             nonce_manager.mark_dropped(executable.nonce);
             risk.mark_failed_submission();
+            telemetry::record_candidate_rejected("submission", settings.chain.as_str());
             warn!(error = %err, nonce = executable.nonce, "submission failed");
             Ok(None)
         }
     }
 }
 
-fn validate_runtime_prerequisites(settings: &Settings) -> Result<()> {
+fn validate_runtime_prerequisites(settings: &Settings, simulate_only: bool) -> Result<()> {
     if settings.operator_private_key.is_none() {
         anyhow::bail!("OPERATOR_PRIVATE_KEY is required");
     }
     if settings.contracts.executor_address.is_none() {
         anyhow::bail!("chain executor address env is required");
+    }
+    if settings.tokens.is_empty() {
+        anyhow::bail!("at least one configured token address is required");
+    }
+    if !settings.dexes.iter().any(|dex| dex.enabled) {
+        anyhow::bail!("at least one enabled DEX is required");
+    }
+    if !simulate_only
+        && !settings.execution.allow_public_fallback
+        && settings.rpc.protected_rpc_url.is_none()
+    {
+        anyhow::bail!(
+            "live trading with ALLOW_PUBLIC_FALLBACK=false requires a protected/private RPC URL"
+        );
+    }
+    if settings.risk.stable_depeg_cutoff_e6 > 1_000_000 {
+        anyhow::bail!("STABLE_DEPEG_CUTOFF_E6 cannot exceed 1000000");
     }
     Ok(())
 }
@@ -417,4 +534,68 @@ async fn current_block_ref(rpc: &RpcClients) -> Result<BlockRef> {
         parent_hash,
         finality: FinalityLevel::Sealed,
     })
+}
+
+fn handle_reorg_event(
+    settings: &Settings,
+    store: &GraphStore,
+    event: &ReorgEvent,
+    poll_from_block: &mut u64,
+) {
+    match event {
+        ReorgEvent::Detected {
+            common_ancestor_block,
+            depth,
+            ..
+        } => {
+            telemetry::record_reorg_detected(
+                *depth,
+                *common_ancestor_block,
+                *common_ancestor_block,
+                settings.chain.as_str(),
+            );
+            warn!(
+                common_ancestor_block,
+                depth,
+                "chain reorg detected; rolling graph snapshot back to the common ancestor window"
+            );
+            if let Some(snapshot) = store.rollback_to_block(*common_ancestor_block) {
+                let rollback_block = snapshot
+                    .block_ref
+                    .as_ref()
+                    .map(|block| block.number)
+                    .unwrap_or(*common_ancestor_block);
+                *poll_from_block =
+                    rollback_block.saturating_sub(settings.risk.event_backfill_blocks);
+            } else {
+                *poll_from_block =
+                    common_ancestor_block.saturating_sub(settings.risk.event_backfill_blocks);
+            }
+        }
+        ReorgEvent::Rollback {
+            from_block,
+            to_block,
+        }
+        | ReorgEvent::Replay {
+            from_block,
+            to_block,
+        } => {
+            telemetry::record_reorg_rollback(*from_block, *to_block, settings.chain.as_str());
+            if let Some(snapshot) = store.rollback_to_block(*to_block) {
+                let rollback_block = snapshot
+                    .block_ref
+                    .as_ref()
+                    .map(|block| block.number)
+                    .unwrap_or(*to_block);
+                *poll_from_block =
+                    rollback_block.saturating_sub(settings.risk.event_backfill_blocks);
+            } else {
+                *poll_from_block = to_block.saturating_sub(settings.risk.event_backfill_blocks);
+            }
+        }
+    }
+}
+
+fn i128_to_i64_saturating(value: i128) -> i64 {
+    value.clamp(i128::from(i64::MIN), i128::from(i64::MAX)) as i64
 }

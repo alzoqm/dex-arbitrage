@@ -15,14 +15,16 @@ use alloy::{
     primitives::{Address, U256},
     sol_types::SolCall,
 };
-use anyhow::Result;
+use anyhow::{Context, Result};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 
 use crate::{
     abi::{IAavePool, IERC20},
+    cache::{load_cache, load_legacy_cache, repair_cache, AtomicCacheWriter, CacheLoadResult},
     config::Settings,
     graph::GraphSnapshot,
+    monitoring::metrics as telemetry,
     rpc::RpcClients,
     types::{
         BlockRef, PoolHealth, PoolSpecificState, PoolState, PoolStatePatch, TokenBehavior,
@@ -584,20 +586,42 @@ impl TokenMetadataCache {
     }
 
     fn load(settings: &Settings) -> Result<Self> {
-        let raw = fs::read_to_string(settings.data_path("token_metadata_cache"))?;
-        let cache: Self = serde_json::from_str(&raw)?;
-        if cache.version != 1 || cache.chain_id != settings.chain_id {
-            anyhow::bail!("token metadata cache version or chain id mismatch");
-        }
+        let path = settings.data_path("token_metadata_cache");
+        let cache = match load_cache::<Self, _>(&path) {
+            CacheLoadResult::Ok(cache) => {
+                telemetry::record_cache_hit("token_metadata_cache", "binary");
+                cache
+            }
+            CacheLoadResult::NotFound => {
+                telemetry::record_cache_miss("token_metadata_cache", "binary");
+                load_legacy_cache::<Self, _>(&path)?.context("token metadata cache not found")?
+            }
+            CacheLoadResult::VersionMismatch { .. } | CacheLoadResult::Corrupt { .. } => {
+                telemetry::record_cache_miss("token_metadata_cache", "binary");
+                match load_legacy_cache::<Self, _>(&path)? {
+                    Some(cache) => cache,
+                    None => {
+                        repair_cache(&path).ok();
+                        telemetry::record_cache_flush("token_metadata_cache", "repair");
+                        anyhow::bail!("token metadata cache is corrupt");
+                    }
+                }
+            }
+        };
+        cache.validate(settings)?;
         Ok(cache)
     }
 
     fn save(&self, settings: &Settings) -> Result<()> {
         fs::create_dir_all("state").ok();
-        fs::write(
-            settings.data_path("token_metadata_cache"),
-            serde_json::to_string(self)?,
-        )?;
+        AtomicCacheWriter::new(settings.data_path("token_metadata_cache"), true).write(self)?;
+        Ok(())
+    }
+
+    fn validate(&self, settings: &Settings) -> Result<()> {
+        if self.version != 1 || self.chain_id != settings.chain_id {
+            anyhow::bail!("token metadata cache version or chain id mismatch");
+        }
         Ok(())
     }
 }
@@ -612,11 +636,29 @@ impl PoolStateCache {
     }
 
     fn load(settings: &Settings) -> Result<Self> {
-        let raw = fs::read_to_string(settings.data_path("pool_state_cache"))?;
-        let cache: Self = serde_json::from_str(&raw)?;
-        if cache.version != 1 || cache.chain_id != settings.chain_id {
-            anyhow::bail!("pool state cache version or chain id mismatch");
-        }
+        let path = settings.data_path("pool_state_cache");
+        let cache = match load_cache::<Self, _>(&path) {
+            CacheLoadResult::Ok(cache) => {
+                telemetry::record_cache_hit("pool_state_cache", "binary");
+                cache
+            }
+            CacheLoadResult::NotFound => {
+                telemetry::record_cache_miss("pool_state_cache", "binary");
+                load_legacy_cache::<Self, _>(&path)?.context("pool state cache not found")?
+            }
+            CacheLoadResult::VersionMismatch { .. } | CacheLoadResult::Corrupt { .. } => {
+                telemetry::record_cache_miss("pool_state_cache", "binary");
+                match load_legacy_cache::<Self, _>(&path)? {
+                    Some(cache) => cache,
+                    None => {
+                        repair_cache(&path).ok();
+                        telemetry::record_cache_flush("pool_state_cache", "repair");
+                        anyhow::bail!("pool state cache is corrupt");
+                    }
+                }
+            }
+        };
+        cache.validate(settings)?;
         Ok(cache)
     }
 
@@ -625,10 +667,14 @@ impl PoolStateCache {
             return Ok(());
         }
         fs::create_dir_all("state").ok();
-        fs::write(
-            settings.data_path("pool_state_cache"),
-            serde_json::to_string(self)?,
-        )?;
+        AtomicCacheWriter::new(settings.data_path("pool_state_cache"), true).write(self)?;
+        Ok(())
+    }
+
+    fn validate(&self, settings: &Settings) -> Result<()> {
+        if self.version != 1 || self.chain_id != settings.chain_id {
+            anyhow::bail!("pool state cache version or chain id mismatch");
+        }
         Ok(())
     }
 }

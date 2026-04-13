@@ -132,6 +132,8 @@ impl Submitter {
 
     fn channels(&self) -> Vec<SubmitChannel> {
         let mut out = Vec::new();
+        let allow_public_fallback = self.settings.execution.allow_public_fallback;
+
         match self.settings.chain {
             crate::types::Chain::Base => {
                 if let Some(url) = self.settings.rpc.protected_rpc_url.clone() {
@@ -141,12 +143,16 @@ impl Submitter {
                         &self.settings,
                     ));
                 }
-                out.push(SubmitChannel::public(
-                    "base-public",
-                    self.settings.rpc.public_rpc_url.clone(),
-                ));
-                if let Some(url) = self.settings.rpc.fallback_rpc_url.clone() {
-                    out.push(SubmitChannel::public("base-fallback", url));
+                // Public fallback is disabled by default for production safety
+                // Must be explicitly enabled via ALLOW_PUBLIC_FALLBACK env var
+                if allow_public_fallback {
+                    out.push(SubmitChannel::public(
+                        "base-public",
+                        self.settings.rpc.public_rpc_url.clone(),
+                    ));
+                    if let Some(url) = self.settings.rpc.fallback_rpc_url.clone() {
+                        out.push(SubmitChannel::public("base-fallback", url));
+                    }
                 }
             }
             crate::types::Chain::Polygon => {
@@ -157,15 +163,26 @@ impl Submitter {
                         &self.settings,
                     ));
                 }
-                out.push(SubmitChannel::public(
-                    "polygon-public",
-                    self.settings.rpc.public_rpc_url.clone(),
-                ));
-                if let Some(url) = self.settings.rpc.fallback_rpc_url.clone() {
-                    out.push(SubmitChannel::public("polygon-fallback", url));
+                // Public fallback is disabled by default for production safety
+                if allow_public_fallback {
+                    out.push(SubmitChannel::public(
+                        "polygon-public",
+                        self.settings.rpc.public_rpc_url.clone(),
+                    ));
+                    if let Some(url) = self.settings.rpc.fallback_rpc_url.clone() {
+                        out.push(SubmitChannel::public("polygon-fallback", url));
+                    }
                 }
             }
         }
+
+        // If no channels configured, emit a warning
+        if out.is_empty() {
+            tracing::warn!(
+                "no submit channels configured - configure PROTECTED_RPC_URL or set ALLOW_PUBLIC_FALLBACK=true"
+            );
+        }
+
         out
     }
 
@@ -223,8 +240,8 @@ mod tests {
 
     use crate::{
         config::{
-            ContractSettings, RiskSettings, RpcSettings, SearchSettings, Settings, TokenConfig,
-            UniversePolicy,
+            ContractSettings, ExecutionSettings, RiskSettings, RpcSettings, SearchSettings,
+            Settings, TokenConfig, UniversePolicy,
         },
         types::Chain,
     };
@@ -281,6 +298,10 @@ mod tests {
                 stable_depeg_cutoff_e6: 0,
             },
             search: SearchSettings::default(),
+            execution: ExecutionSettings {
+                allow_public_fallback: true,
+                ..ExecutionSettings::default()
+            },
             policy: UniversePolicy::default(),
             tokens: vec![TokenConfig {
                 symbol: "ETH".to_string(),

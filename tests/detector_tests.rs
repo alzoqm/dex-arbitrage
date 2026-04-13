@@ -3,8 +3,8 @@ use std::{collections::HashMap, sync::Arc, time::SystemTime};
 use alloy::primitives::{Address, U256};
 use dex_arbitrage::{
     config::{
-        ContractSettings, DexConfig, RiskSettings, RpcSettings, SearchSettings, Settings,
-        TokenConfig, UniversePolicy,
+        ContractSettings, DexConfig, ExecutionSettings, RiskSettings, RpcSettings, SearchSettings,
+        Settings, TokenConfig, UniversePolicy,
     },
     detector::Detector,
     graph::{DistanceCache, GraphSnapshot},
@@ -127,6 +127,7 @@ fn settings() -> Arc<Settings> {
             stable_depeg_cutoff_e6: 995_000,
         },
         search: SearchSettings::default(),
+        execution: ExecutionSettings::default(),
         policy: UniversePolicy::default(),
         tokens: vec![
             TokenConfig {

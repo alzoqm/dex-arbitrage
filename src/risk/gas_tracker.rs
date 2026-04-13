@@ -65,6 +65,9 @@ impl GasTracker {
         let max_fee = base.saturating_add(priority);
         let buffered = ((max_fee as f64) * (1.0 + self.risk_buffer_pct)) as u128;
         let buffered_total_cost_wei = U256::from(buffered) * U256::from(gas_limit);
+        metrics::gauge!("gas_max_fee_per_gas_wei").set(buffered as f64);
+        metrics::gauge!("gas_priority_fee_per_gas_wei").set(priority as f64);
+        metrics::gauge!("gas_limit_estimate").set(gas_limit as f64);
 
         Ok(GasQuote {
             max_fee_per_gas: buffered,

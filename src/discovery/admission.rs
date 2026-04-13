@@ -44,7 +44,10 @@ mod tests {
     use alloy::primitives::Address;
 
     use crate::{
-        config::{ContractSettings, RiskSettings, RpcSettings, SearchSettings, UniversePolicy},
+        config::{
+            ContractSettings, ExecutionSettings, RiskSettings, RpcSettings, SearchSettings,
+            UniversePolicy,
+        },
         types::{AmmKind, PoolHealth, PoolSpecificState, V2PoolState},
     };
 
@@ -169,6 +172,7 @@ mod tests {
                 stable_depeg_cutoff_e6: 0,
             },
             search: SearchSettings::default(),
+            execution: ExecutionSettings::default(),
             policy: UniversePolicy::default(),
             tokens: Vec::new(),
             dexes: Vec::new(),
