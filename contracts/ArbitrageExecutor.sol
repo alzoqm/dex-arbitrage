@@ -69,7 +69,13 @@ contract ArbitrageExecutor is IFlashLoanSimpleReceiver, IUniswapV3SwapCallback {
     event AllowedTargetSet(address indexed target, bool allowed);
     event StrictTargetAllowlistSet(bool enabled);
     event PausedSet(bool enabled);
-    event ExecutionStarted(address indexed caller, uint64 indexed snapshotId, address indexed inputToken, uint256 inputAmount, bool flashLoan);
+    event ExecutionStarted(
+        address indexed caller,
+        uint64 indexed snapshotId,
+        address indexed inputToken,
+        uint256 inputAmount,
+        bool flashLoan
+    );
     event SplitExecuted(
         uint64 indexed snapshotId,
         AdapterType indexed adapterType,
@@ -79,7 +85,9 @@ contract ArbitrageExecutor is IFlashLoanSimpleReceiver, IUniswapV3SwapCallback {
         uint256 amountIn,
         uint256 amountOut
     );
-    event ExecutionFinished(uint64 indexed snapshotId, address indexed inputToken, uint256 endingBalance, uint256 realizedProfit);
+    event ExecutionFinished(
+        uint64 indexed snapshotId, address indexed inputToken, uint256 endingBalance, uint256 realizedProfit
+    );
 
     modifier onlyOwner() {
         require(msg.sender == owner, "NOT_OWNER");
@@ -104,6 +112,7 @@ contract ArbitrageExecutor is IFlashLoanSimpleReceiver, IUniswapV3SwapCallback {
     }
 
     constructor(address aavePool_, address owner_) {
+        require(aavePool_ != address(0), "ZERO_AAVE_POOL");
         aavePool = aavePool_;
         owner = owner_ == address(0) ? msg.sender : owner_;
         emit OwnerTransferred(address(0), owner);
@@ -173,23 +182,18 @@ contract ArbitrageExecutor is IFlashLoanSimpleReceiver, IUniswapV3SwapCallback {
         require(params.execution.inputAmount >= params.loanAmount, "LOAN_EXCEEDS_INPUT");
         require(block.timestamp <= params.execution.deadline, "DEADLINE_EXPIRED");
 
-        emit ExecutionStarted(msg.sender, params.execution.snapshotId, params.loanAsset, params.execution.inputAmount, true);
-        IAavePool(aavePool).flashLoanSimple(
-            address(this),
-            params.loanAsset,
-            params.loanAmount,
-            abi.encode(params.execution),
-            0
+        emit ExecutionStarted(
+            msg.sender, params.execution.snapshotId, params.loanAsset, params.execution.inputAmount, true
         );
+        IAavePool(aavePool)
+            .flashLoanSimple(address(this), params.loanAsset, params.loanAmount, abi.encode(params.execution), 0);
     }
 
-    function executeOperation(
-        address asset,
-        uint256 amount,
-        uint256 premium,
-        address initiator,
-        bytes calldata data
-    ) external override returns (bool) {
+    function executeOperation(address asset, uint256 amount, uint256 premium, address initiator, bytes calldata data)
+        external
+        override
+        returns (bool)
+    {
         require(msg.sender == aavePool, "NOT_AAVE_POOL");
         require(initiator == address(this), "BAD_INITIATOR");
 
@@ -208,15 +212,13 @@ contract ArbitrageExecutor is IFlashLoanSimpleReceiver, IUniswapV3SwapCallback {
         _forceApprove(asset, aavePool, 0);
         _forceApprove(asset, aavePool, amountOwed);
 
-        emit ExecutionFinished(execution.snapshotId, execution.inputToken, endingBalance, endingBalance - startBalance - premium);
+        emit ExecutionFinished(
+            execution.snapshotId, execution.inputToken, endingBalance, endingBalance - startBalance - premium
+        );
         return true;
     }
 
-    function uniswapV3SwapCallback(
-        int256 amount0Delta,
-        int256 amount1Delta,
-        bytes calldata data
-    ) external override {
+    function uniswapV3SwapCallback(int256 amount0Delta, int256 amount1Delta, bytes calldata data) external override {
         require(amount0Delta > 0 || amount1Delta > 0, "NO_CALLBACK_PAYMENT");
         _checkTarget(msg.sender);
 
@@ -233,8 +235,8 @@ contract ArbitrageExecutor is IFlashLoanSimpleReceiver, IUniswapV3SwapCallback {
             Hop memory hop = params.hops[i];
             require(hop.splits.length > 0, "EMPTY_HOP");
 
-            uint256 hopInputSum;
-            uint256 hopOutputSum;
+            uint256 hopInputSum = 0;
+            uint256 hopOutputSum = 0;
             address nextToken = hop.splits[0].tokenOut;
 
             for (uint256 j = 0; j < hop.splits.length; ++j) {
@@ -273,13 +275,7 @@ contract ArbitrageExecutor is IFlashLoanSimpleReceiver, IUniswapV3SwapCallback {
         }
 
         emit SplitExecuted(
-            snapshotId,
-            split.adapterType,
-            split.target,
-            split.tokenIn,
-            split.tokenOut,
-            split.amountIn,
-            amountOut
+            snapshotId, split.adapterType, split.target, split.tokenIn, split.tokenOut, split.amountIn, amountOut
         );
     }
 
@@ -288,7 +284,7 @@ contract ArbitrageExecutor is IFlashLoanSimpleReceiver, IUniswapV3SwapCallback {
         address token0 = pair.token0();
         address token1 = pair.token1();
 
-        bool zeroForOne;
+        bool zeroForOne = false;
         if (split.tokenIn == token0 && split.tokenOut == token1) {
             zeroForOne = true;
         } else if (split.tokenIn == token1 && split.tokenOut == token0) {
@@ -297,7 +293,8 @@ contract ArbitrageExecutor is IFlashLoanSimpleReceiver, IUniswapV3SwapCallback {
             revert("BAD_V2_TOKEN_PAIR");
         }
 
-        (uint112 reserve0, uint112 reserve1,) = pair.getReserves();
+        (uint112 reserve0, uint112 reserve1, uint32 blockTimestampLast) = pair.getReserves();
+        blockTimestampLast;
         uint256 reserveIn = zeroForOne ? uint256(reserve0) : uint256(reserve1);
         uint256 reserveOut = zeroForOne ? uint256(reserve1) : uint256(reserve0);
         uint256 quotedOut = _getAmountOut(split.amountIn, reserveIn, reserveOut, _decodeV2FeePpm(split.extraData));
@@ -313,7 +310,7 @@ contract ArbitrageExecutor is IFlashLoanSimpleReceiver, IUniswapV3SwapCallback {
         address token0 = pool.token0();
         address token1 = pool.token1();
 
-        bool zeroForOne;
+        bool zeroForOne = false;
         if (split.tokenIn == token0 && split.tokenOut == token1) {
             zeroForOne = true;
         } else if (split.tokenIn == token1 && split.tokenOut == token0) {
@@ -324,13 +321,14 @@ contract ArbitrageExecutor is IFlashLoanSimpleReceiver, IUniswapV3SwapCallback {
 
         uint160 sqrtPriceLimitX96 = _decodeV3PriceLimit(split.extraData, zeroForOne);
         uint256 balanceBefore = IERC20(split.tokenOut).balanceOf(address(this));
-        pool.swap(
+        (int256 amount0Delta, int256 amount1Delta) = pool.swap(
             address(this),
             zeroForOne,
             int256(split.amountIn),
             sqrtPriceLimitX96,
             abi.encode(V3CallbackData({tokenIn: split.tokenIn}))
         );
+        require(zeroForOne ? amount1Delta < 0 : amount0Delta < 0, "V3_NO_OUTPUT");
         amountOut = IERC20(split.tokenOut).balanceOf(address(this)) - balanceBefore;
     }
 
@@ -340,17 +338,18 @@ contract ArbitrageExecutor is IFlashLoanSimpleReceiver, IUniswapV3SwapCallback {
         _forceApprove(split.tokenIn, split.target, 0);
         _forceApprove(split.tokenIn, split.target, split.amountIn);
 
-        if (underlying) {
-            ICurvePool(split.target).exchange_underlying(i, j, split.amountIn, split.minAmountOut);
-        } else {
-            ICurvePool(split.target).exchange(i, j, split.amountIn, split.minAmountOut);
-        }
+        uint256 returnedAmount = underlying
+            ? ICurvePool(split.target).exchange_underlying(i, j, split.amountIn, split.minAmountOut)
+            : ICurvePool(split.target).exchange(i, j, split.amountIn, split.minAmountOut);
+        require(returnedAmount >= split.minAmountOut, "CURVE_MIN_OUT");
 
         amountOut = IERC20(split.tokenOut).balanceOf(address(this)) - balanceBefore;
     }
 
     function _swapBalancer(Split memory split) internal returns (uint256 amountOut) {
-        bytes32 poolId = split.extraData.length >= 32 ? abi.decode(split.extraData, (bytes32)) : IBalancerPool(split.target).getPoolId();
+        bytes32 poolId = split.extraData.length >= 32
+            ? abi.decode(split.extraData, (bytes32))
+            : IBalancerPool(split.target).getPoolId();
         address vault = IBalancerPool(split.target).getVault();
         _checkTarget(vault);
 
@@ -358,24 +357,26 @@ contract ArbitrageExecutor is IFlashLoanSimpleReceiver, IUniswapV3SwapCallback {
         _forceApprove(split.tokenIn, vault, split.amountIn);
 
         uint256 balanceBefore = IERC20(split.tokenOut).balanceOf(address(this));
-        IBalancerVault(vault).swap(
-            IBalancerVault.SingleSwap({
-                poolId: poolId,
-                kind: IBalancerVault.SwapKind.GIVEN_IN,
-                assetIn: split.tokenIn,
-                assetOut: split.tokenOut,
-                amount: split.amountIn,
-                userData: ""
-            }),
-            IBalancerVault.FundManagement({
-                sender: address(this),
-                fromInternalBalance: false,
-                recipient: payable(address(this)),
-                toInternalBalance: false
-            }),
-            split.minAmountOut,
-            block.timestamp
-        );
+        uint256 returnedAmount = IBalancerVault(vault)
+            .swap(
+                IBalancerVault.SingleSwap({
+                    poolId: poolId,
+                    kind: IBalancerVault.SwapKind.GIVEN_IN,
+                    assetIn: split.tokenIn,
+                    assetOut: split.tokenOut,
+                    amount: split.amountIn,
+                    userData: ""
+                }),
+                IBalancerVault.FundManagement({
+                    sender: address(this),
+                    fromInternalBalance: false,
+                    recipient: payable(address(this)),
+                    toInternalBalance: false
+                }),
+                split.minAmountOut,
+                block.timestamp
+            );
+        require(returnedAmount >= split.minAmountOut, "BALANCER_MIN_OUT");
         amountOut = IERC20(split.tokenOut).balanceOf(address(this)) - balanceBefore;
     }
 
@@ -407,7 +408,7 @@ contract ArbitrageExecutor is IFlashLoanSimpleReceiver, IUniswapV3SwapCallback {
 
     function _readInt128(bytes memory data, uint256 offset) internal pure returns (int128 value) {
         require(data.length >= offset + 16, "OUT_OF_BOUNDS");
-        uint128 raw;
+        uint128 raw = 0;
         for (uint256 i = 0; i < 16; ++i) {
             raw = (raw << 8) | uint8(data[offset + i]);
         }
@@ -420,7 +421,11 @@ contract ArbitrageExecutor is IFlashLoanSimpleReceiver, IUniswapV3SwapCallback {
         }
     }
 
-    function _getAmountOut(uint256 amountIn, uint256 reserveIn, uint256 reserveOut, uint256 feePpm) internal pure returns (uint256) {
+    function _getAmountOut(uint256 amountIn, uint256 reserveIn, uint256 reserveOut, uint256 feePpm)
+        internal
+        pure
+        returns (uint256)
+    {
         require(amountIn > 0, "ZERO_INPUT");
         require(reserveIn > 0 && reserveOut > 0, "BAD_RESERVES");
         uint256 feeDenominator = 1_000_000;

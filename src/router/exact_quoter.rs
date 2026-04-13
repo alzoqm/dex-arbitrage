@@ -1,4 +1,7 @@
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::{HashMap, VecDeque},
+    sync::Arc,
+};
 
 use alloy::{
     primitives::{Uint, U160, U256},
@@ -11,6 +14,7 @@ use crate::{
     abi::{ICurvePool, IV3QuoterV2},
     amm,
     graph::GraphSnapshot,
+    monitoring::metrics as telemetry,
     rpc::RpcClients,
     types::{PoolSpecificState, PoolState},
 };
@@ -18,9 +22,11 @@ use crate::{
 #[derive(Debug, Clone)]
 pub struct ExactQuoter {
     rpc: Arc<RpcClients>,
-    quote_cache: Arc<Mutex<HashMap<QuoteKey, u128>>>,
+    quote_cache: Arc<Mutex<QuoteCache>>,
     curve_underlying_support: Arc<Mutex<HashMap<alloy::primitives::Address, bool>>>,
     use_v3_rpc_quoter: bool,
+    use_curve_rpc_quoter: bool,
+    chain_label: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -33,14 +39,18 @@ struct QuoteKey {
 }
 
 impl ExactQuoter {
-    pub fn new(_settings: Arc<crate::config::Settings>, rpc: Arc<RpcClients>) -> Self {
+    pub fn new(settings: Arc<crate::config::Settings>, rpc: Arc<RpcClients>) -> Self {
         Self {
             rpc,
-            quote_cache: Arc::new(Mutex::new(HashMap::new())),
+            quote_cache: Arc::new(Mutex::new(QuoteCache::from_env())),
             curve_underlying_support: Arc::new(Mutex::new(HashMap::new())),
             use_v3_rpc_quoter: std::env::var("USE_V3_RPC_QUOTER")
                 .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
-                .unwrap_or(true),
+                .unwrap_or(false),
+            use_curve_rpc_quoter: std::env::var("USE_CURVE_RPC_QUOTER")
+                .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+                .unwrap_or(false),
+            chain_label: settings.chain.as_str().to_string(),
         }
     }
 
@@ -59,9 +69,11 @@ impl ExactQuoter {
             token_out,
             amount_in,
         };
-        if let Some(cached) = self.quote_cache.lock().get(&cache_key).copied() {
+        if let Some(cached) = self.quote_cache.lock().get(&cache_key) {
+            telemetry::record_quote_cache_hit(&pool.pool_id.to_string(), &self.chain_label);
             return Ok(cached);
         }
+        telemetry::record_quote_cache_miss(&pool.pool_id.to_string(), &self.chain_label);
 
         let Some(i) = pool
             .token_addresses
@@ -130,6 +142,11 @@ impl ExactQuoter {
                 }
             }
             PoolSpecificState::CurvePlain(state) => {
+                if !self.use_curve_rpc_quoter {
+                    let amount = amm::curve::fallback_quote(state, i, j, amount_in);
+                    self.insert_quote(cache_key, amount);
+                    return Ok(amount);
+                }
                 let try_underlying = self
                     .curve_underlying_support
                     .lock()
@@ -214,14 +231,143 @@ impl ExactQuoter {
     }
 
     fn insert_quote(&self, key: QuoteKey, value: u128) {
-        let mut cache = self.quote_cache.lock();
-        if cache.len() > 20_000 {
-            cache.clear();
-        }
-        cache.insert(key, value);
+        self.quote_cache.lock().insert(key, value);
     }
+}
+
+#[derive(Debug)]
+struct QuoteCache {
+    max_segments: usize,
+    max_entries_per_segment: usize,
+    segments: HashMap<u64, QuoteSegment>,
+}
+
+#[derive(Debug, Default)]
+struct QuoteSegment {
+    entries: HashMap<QuoteKey, u128>,
+    lru: VecDeque<QuoteKey>,
+}
+
+impl QuoteCache {
+    fn from_env() -> Self {
+        Self {
+            max_segments: env_usize("QUOTE_CACHE_MAX_SEGMENTS", 4),
+            max_entries_per_segment: env_usize("QUOTE_CACHE_MAX_ENTRIES_PER_SEGMENT", 20_000),
+            segments: HashMap::new(),
+        }
+    }
+
+    fn get(&mut self, key: &QuoteKey) -> Option<u128> {
+        let segment = self.segments.get_mut(&key.snapshot_id)?;
+        let value = segment.entries.get(key).copied()?;
+        segment.touch(*key);
+        Some(value)
+    }
+
+    fn insert(&mut self, key: QuoteKey, value: u128) {
+        if !self.segments.contains_key(&key.snapshot_id) {
+            self.evict_old_segments_for_new_segment();
+        }
+        let segment = self.segments.entry(key.snapshot_id).or_default();
+        if !segment.entries.contains_key(&key) {
+            segment.lru.push_back(key);
+        } else {
+            segment.touch(key);
+        }
+        segment.entries.insert(key, value);
+        while segment.entries.len() > self.max_entries_per_segment {
+            if let Some(oldest) = segment.lru.pop_front() {
+                segment.entries.remove(&oldest);
+            } else {
+                break;
+            }
+        }
+    }
+
+    fn evict_old_segments_for_new_segment(&mut self) {
+        while self.segments.len() >= self.max_segments {
+            let Some(oldest) = self.segments.keys().min().copied() else {
+                break;
+            };
+            self.segments.remove(&oldest);
+        }
+    }
+}
+
+impl QuoteSegment {
+    fn touch(&mut self, key: QuoteKey) {
+        self.lru.retain(|existing| *existing != key);
+        self.lru.push_back(key);
+    }
+}
+
+fn env_usize(key: &str, default: usize) -> usize {
+    std::env::var(key)
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(default)
 }
 
 fn u256_to_u128(value: alloy::primitives::U256) -> u128 {
     value.to_string().parse::<u128>().unwrap_or(u128::MAX)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use alloy::primitives::Address;
+
+    use super::{QuoteCache, QuoteKey};
+
+    fn key(snapshot_id: u64, amount_in: u128) -> QuoteKey {
+        QuoteKey {
+            snapshot_id,
+            pool_id: Address::repeat_byte(1),
+            token_in: Address::repeat_byte(2),
+            token_out: Address::repeat_byte(3),
+            amount_in,
+        }
+    }
+
+    #[test]
+    fn quote_cache_evicts_per_snapshot_without_full_flush() {
+        let mut cache = QuoteCache {
+            max_segments: 2,
+            max_entries_per_segment: 2,
+            segments: HashMap::new(),
+        };
+
+        cache.insert(key(1, 1), 10);
+        cache.insert(key(1, 2), 20);
+        cache.insert(key(1, 3), 30);
+        assert!(cache.get(&key(1, 1)).is_none());
+        assert_eq!(cache.get(&key(1, 2)), Some(20));
+        assert_eq!(cache.get(&key(1, 3)), Some(30));
+
+        cache.insert(key(2, 1), 40);
+        cache.insert(key(3, 1), 50);
+        assert!(cache.segments.contains_key(&2));
+        assert!(cache.segments.contains_key(&3));
+        assert!(!cache.segments.contains_key(&1));
+    }
+
+    #[test]
+    fn quote_cache_does_not_evict_segments_when_updating_existing_segment_at_capacity() {
+        let mut cache = QuoteCache {
+            max_segments: 2,
+            max_entries_per_segment: 4,
+            segments: HashMap::new(),
+        };
+
+        cache.insert(key(1, 1), 10);
+        cache.insert(key(2, 1), 20);
+        cache.insert(key(2, 2), 30);
+
+        assert_eq!(cache.get(&key(1, 1)), Some(10));
+        assert_eq!(cache.get(&key(2, 1)), Some(20));
+        assert_eq!(cache.get(&key(2, 2)), Some(30));
+        assert_eq!(cache.segments.len(), 2);
+    }
 }

@@ -23,10 +23,7 @@ interface IBalancerVault {
         bool toInternalBalance;
     }
 
-    function swap(
-        SingleSwap calldata singleSwap,
-        FundManagement calldata funds,
-        uint256 limit,
-        uint256 deadline
-    ) external returns (uint256 amountCalculated);
+    function swap(SingleSwap calldata singleSwap, FundManagement calldata funds, uint256 limit, uint256 deadline)
+        external
+        returns (uint256 amountCalculated);
 }

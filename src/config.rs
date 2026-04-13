@@ -22,6 +22,7 @@ pub struct Settings {
     pub risk: RiskSettings,
     pub search: SearchSettings,
     pub policy: UniversePolicy,
+    pub execution: ExecutionSettings,
     pub tokens: Vec<TokenConfig>,
     pub dexes: Vec<DexConfig>,
 }
@@ -35,6 +36,37 @@ pub struct RpcSettings {
     pub protected_rpc_url: Option<String>,
     pub private_submit_method: String,
     pub simulate_method: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct ExecutionSettings {
+    /// Allow public RPC fallback for transaction submission.
+    /// Default: false (private/protected only for production safety).
+    pub allow_public_fallback: bool,
+    /// Require fresh simulation immediately before signing.
+    /// Default: true (production safety).
+    pub require_fresh_simulation: bool,
+    /// Enable nonce replacement for stuck transactions.
+    /// Default: true.
+    pub enable_nonce_replacement: bool,
+    /// Minimum priority fee bump for nonce replacement (in wei).
+    /// Default: 1 gwei.
+    pub nonce_bump_priority_fee_wei: u128,
+    /// Minimum base fee bump for nonce replacement (in wei).
+    /// Default: 1 gwei.
+    pub nonce_bump_base_fee_wei: u128,
+}
+
+impl Default for ExecutionSettings {
+    fn default() -> Self {
+        Self {
+            allow_public_fallback: false,
+            require_fresh_simulation: true,
+            enable_nonce_replacement: true,
+            nonce_bump_priority_fee_wei: 1_000_000_000,
+            nonce_bump_base_fee_wei: 1_000_000_000,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -497,6 +529,16 @@ impl Settings {
             .collect::<Result<Vec<_>>>()?;
         validate_dex_configs(&dexes)?;
 
+        let execution = ExecutionSettings {
+            allow_public_fallback: env_bool("ALLOW_PUBLIC_FALLBACK", false), // Default: false for production safety
+            require_fresh_simulation: env_bool("REQUIRE_FRESH_SIMULATION", true),
+            enable_nonce_replacement: env_bool("ENABLE_NONCE_REPLACEMENT", true),
+            nonce_bump_priority_fee_wei: env_opt_u128("NONCE_BUMP_PRIORITY_FEE_WEI")
+                .unwrap_or(1_000_000_000), // 1 gwei default
+            nonce_bump_base_fee_wei: env_opt_u128("NONCE_BUMP_BASE_FEE_WEI")
+                .unwrap_or(1_000_000_000), // 1 gwei default
+        };
+
         Ok(Self {
             chain,
             chain_id: file_cfg.chain_id,
@@ -512,6 +554,7 @@ impl Settings {
             risk,
             search,
             policy,
+            execution,
             tokens,
             dexes,
         })

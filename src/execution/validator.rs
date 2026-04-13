@@ -305,7 +305,9 @@ impl Validator {
     ) -> Result<bool> {
         let best = self.rpc.best_read();
         let method = self.settings.rpc.simulate_method.as_str();
+
         if method != "eth_call" {
+            // Use custom simulation method (eth_simulateV1, eth_callBundle, etc.)
             let custom = best
                 .custom_simulate(
                     method,
@@ -320,13 +322,153 @@ impl Validator {
                     ]),
                 )
                 .await;
-            if custom.is_ok() {
-                return Ok(true);
-            }
+
+            return match custom {
+                Ok(result) => {
+                    // Parse the simulation result
+                    match self.parse_simulation_result(result) {
+                        Ok(success) => Ok(success),
+                        Err(e) => {
+                            warn!(
+                                error = %e,
+                                "failed to parse simulation result, treating as failure"
+                            );
+                            Ok(false)
+                        }
+                    }
+                }
+                Err(e) => {
+                    warn!(error = %e, "custom simulation call failed");
+                    Ok(false)
+                }
+            };
         }
+
+        // Fallback to standard eth_call
         let result = best
             .eth_call(executor, Some(operator), calldata.clone(), "pending")
             .await;
-        Ok(result.is_ok())
+
+        match result {
+            Ok(return_data) => {
+                // Parse the return data to ensure successful execution
+                match Self::parse_call_return_data(return_data) {
+                    Ok(success) => Ok(success),
+                    Err(e) => {
+                        warn!(error = %e, "failed to parse eth_call return data");
+                        Ok(false)
+                    }
+                }
+            }
+            Err(e) => {
+                warn!(error = %e, "eth_call failed");
+                Ok(false)
+            }
+        }
+    }
+
+    /// Parse the result from custom simulation methods
+    fn parse_simulation_result(&self, result: serde_json::Value) -> Result<bool> {
+        // Handle different response formats from providers
+
+        // Format 1: Alchemy eth_simulateV1 - array of simulation results
+        if let Some(array) = result.as_array() {
+            if !array.is_empty() {
+                let first = &array[0];
+
+                // Check for error in the simulation result
+                if let Some(error) = first.get("error") {
+                    if error.is_object() {
+                        let message = error
+                            .get("message")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("unknown error");
+                        debug!(%message, "simulation returned error");
+                        return Ok(false);
+                    }
+                }
+
+                // Check for revert reason in result
+                if let Some(revert_reason) = first.get("revertReason") {
+                    if revert_reason.is_string() && !revert_reason.as_str().unwrap().is_empty() {
+                        warn!(revert = %revert_reason.as_str().unwrap(), "simulation reverted");
+                        return Ok(false);
+                    }
+                }
+
+                // Check if the transaction succeeded
+                if let Some(success) = first.get("success") {
+                    return Ok(success.as_bool().unwrap_or(false));
+                }
+
+                // Check for gasUsed (some providers only include it on success)
+                if first.get("gasUsed").is_some() {
+                    return Ok(true);
+                }
+            }
+        }
+
+        // Format 2: Single simulation result object
+        if result.is_object() {
+            if let Some(error) = result.get("error") {
+                if error.is_object() {
+                    let message = error
+                        .get("message")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("unknown error");
+                    debug!(%message, "simulation returned error");
+                    return Ok(false);
+                }
+            }
+
+            if let Some(success) = result.get("success") {
+                return Ok(success.as_bool().unwrap_or(false));
+            }
+
+            if result.get("gasUsed").is_some() {
+                return Ok(true);
+            }
+        }
+
+        warn!("unable to determine simulation success from result");
+        Ok(false)
+    }
+
+    /// Parse the return data from eth_call
+    fn parse_call_return_data(data: alloy::primitives::Bytes) -> Result<bool> {
+        // A successful eth_call to a no-return function returns empty bytes.
+        // Reverts are surfaced by the RPC as errors before this parser runs.
+        if data.is_empty() {
+            return Ok(true);
+        }
+
+        if data.len() < 32 {
+            return Ok(false);
+        }
+
+        let last_byte = data[data.len() - 1];
+        Ok(last_byte == 1)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use alloy::primitives::Bytes;
+
+    use super::Validator;
+
+    #[test]
+    fn eth_call_empty_return_data_is_success_for_no_return_functions() {
+        assert!(Validator::parse_call_return_data(Bytes::new()).unwrap());
+    }
+
+    #[test]
+    fn eth_call_bool_return_data_is_parsed() {
+        let mut truthy = vec![0u8; 32];
+        truthy[31] = 1;
+        assert!(Validator::parse_call_return_data(Bytes::from(truthy)).unwrap());
+
+        let falsy = vec![0u8; 32];
+        assert!(!Validator::parse_call_return_data(Bytes::from(falsy)).unwrap());
     }
 }

@@ -20,7 +20,8 @@ use tracing::warn;
 use crate::{
     config::Settings,
     graph::GraphSnapshot,
-    rpc::{RpcClients, RpcLog},
+    monitoring::metrics as telemetry,
+    rpc::{adapt_log_chunk_size, should_reduce_chunk_size, RpcClients, RpcLog},
     types::{AmmKind, PoolSpecificState, PoolStatePatch, RefreshBatch, RefreshTrigger},
 };
 
@@ -65,7 +66,9 @@ impl EventStream {
                 &addresses,
                 &event_topics(),
             ));
+            let log_count = logs.len();
             let batch = self.build_refresh_batch(snapshot, logs);
+            telemetry::record_event_ingestion("wss", log_count, self.settings.chain.as_str());
             return Ok((latest, batch));
         }
 
@@ -77,7 +80,13 @@ impl EventStream {
         let logs = self
             .poll_logs(from_block + 1, latest, &addresses, &event_topics())
             .await?;
+        let log_count = logs.len();
         let batch = self.build_refresh_batch(snapshot, logs);
+        telemetry::record_event_ingestion(
+            event_ingest_mode().as_str(),
+            log_count,
+            self.settings.chain.as_str(),
+        );
         Ok((latest, batch))
     }
 
@@ -227,32 +236,80 @@ impl EventStream {
         if from_block > to_block {
             return Ok(Vec::new());
         }
-        let chunk_blocks = std::env::var("EVENT_LOG_CHUNK_BLOCKS")
+
+        // Use chain-aware chunk size with adaptive splitting
+        let provider_mode = std::env::var("RPC_PROVIDER_MODE")
+            .ok()
+            .unwrap_or_else(|| "payg".to_string());
+        let mut chunk_blocks = std::env::var("EVENT_LOG_CHUNK_BLOCKS")
             .ok()
             .and_then(|value| value.parse::<u64>().ok())
             .filter(|value| *value > 0)
             .unwrap_or(5_000);
+
+        // Apply chain-aware limits
+        chunk_blocks = adapt_log_chunk_size(self.settings.chain, &provider_mode, chunk_blocks);
+
         let address_chunk_size = std::env::var("EVENT_LOG_ADDRESS_CHUNK_SIZE")
             .ok()
             .and_then(|value| value.parse::<usize>().ok())
             .filter(|value| *value > 0)
             .unwrap_or(200);
+
         let mut logs = Vec::new();
         let mut start = from_block;
+        const MAX_RETRIES: usize = 3;
+
         while start <= to_block {
-            let end = start.saturating_add(chunk_blocks - 1).min(to_block);
-            for address_chunk in addresses.chunks(address_chunk_size) {
-                let mut chunk = self
-                    .rpc
-                    .best_read()
-                    .get_logs(start, end, address_chunk, topics)
-                    .await?;
-                logs.append(&mut chunk);
-            }
-            if end == u64::MAX {
+            let mut retry_count = 0;
+
+            loop {
+                let end = start.saturating_add(chunk_blocks - 1).min(to_block);
+                let mut range_logs = Vec::new();
+                let mut retry_range = false;
+
+                for address_chunk in addresses.chunks(address_chunk_size) {
+                    match self
+                        .rpc
+                        .best_read()
+                        .get_logs(start, end, address_chunk, topics)
+                        .await
+                    {
+                        Ok(mut chunk) => {
+                            range_logs.append(&mut chunk);
+                        }
+                        Err(e) => {
+                            let error_msg = e.to_string();
+                            if should_reduce_chunk_size(&error_msg) && retry_count < MAX_RETRIES {
+                                tracing::warn!(
+                                    %error_msg,
+                                    chunk_size = chunk_blocks,
+                                    retry = retry_count,
+                                    block_range = %format!("{}..{}", start, end),
+                                    "address log query failed, reducing chunk size and retrying block range"
+                                );
+                                chunk_blocks = (chunk_blocks / 2).max(1);
+                                retry_count += 1;
+                                retry_range = true;
+                                break;
+                            } else {
+                                return Err(e.context("failed to get address logs after retries"));
+                            }
+                        }
+                    }
+                }
+
+                if retry_range {
+                    continue;
+                }
+
+                logs.append(&mut range_logs);
+                if end == u64::MAX {
+                    return Ok(logs);
+                }
+                start = end.saturating_add(1);
                 break;
             }
-            start = end.saturating_add(1);
         }
         Ok(logs)
     }
@@ -323,6 +380,17 @@ enum EventIngestMode {
     BlockReceipts,
     TopicLogs,
     AddressLogs,
+}
+
+impl EventIngestMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            EventIngestMode::Wss => "wss",
+            EventIngestMode::BlockReceipts => "block_receipts",
+            EventIngestMode::TopicLogs => "topic_logs",
+            EventIngestMode::AddressLogs => "address_logs",
+        }
+    }
 }
 
 fn event_ingest_mode() -> EventIngestMode {

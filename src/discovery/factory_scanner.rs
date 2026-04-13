@@ -10,8 +10,10 @@ use tracing::warn;
 
 use crate::{
     abi::{ICurveRegistry, IUniswapV2Factory},
+    cache::{load_cache, load_legacy_cache, repair_cache, AtomicCacheWriter, CacheLoadResult},
     config::{DexConfig, Settings},
-    rpc::RpcClients,
+    monitoring::metrics as telemetry,
+    rpc::{adapt_log_chunk_size, should_reduce_chunk_size, RpcClients},
     types::{AmmKind, BlockRef, DiscoveryKind, FinalityLevel},
 };
 
@@ -318,25 +320,62 @@ impl FactoryScanner {
         if from_block > to_block {
             return Ok(Vec::new());
         }
-        let chunk_blocks = std::env::var("DISCOVERY_LOG_CHUNK_BLOCKS")
+
+        // Use chain-aware chunk size with adaptive splitting
+        let provider_mode = std::env::var("RPC_PROVIDER_MODE")
+            .ok()
+            .unwrap_or_else(|| "payg".to_string());
+        let mut chunk_blocks = std::env::var("DISCOVERY_LOG_CHUNK_BLOCKS")
             .ok()
             .and_then(|value| value.parse::<u64>().ok())
             .filter(|value| *value > 0)
             .unwrap_or(50_000);
+
+        // Apply chain-aware limits
+        chunk_blocks = adapt_log_chunk_size(self.settings.chain, &provider_mode, chunk_blocks);
+
         let mut all = Vec::new();
         let mut start = from_block;
+        let mut retry_count = 0;
+        const MAX_RETRIES: usize = 3;
+
         while start <= to_block {
             let end = start.saturating_add(chunk_blocks - 1).min(to_block);
-            let mut logs = self
+            match self
                 .rpc
                 .best_read()
                 .get_logs(start, end, addresses, topics)
-                .await?;
-            all.append(&mut logs);
-            if end == u64::MAX {
-                break;
+                .await
+            {
+                Ok(mut logs) => {
+                    all.append(&mut logs);
+                    retry_count = 0; // Reset retry count on success
+                    if end == u64::MAX {
+                        break;
+                    }
+                    start = end.saturating_add(1);
+                }
+                Err(e) => {
+                    let error_msg = e.to_string();
+                    if should_reduce_chunk_size(&error_msg) && retry_count < MAX_RETRIES {
+                        warn!(
+                            %error_msg,
+                            chunk_size = chunk_blocks,
+                            retry = retry_count,
+                            "log query failed, reducing chunk size and retrying"
+                        );
+                        chunk_blocks /= 2; // Halve the chunk size
+                        if chunk_blocks == 0 {
+                            chunk_blocks = 1; // Ensure at least 1 block per chunk
+                        }
+                        retry_count += 1;
+                        continue; // Retry with smaller chunk
+                    } else {
+                        // Either not a chunk size issue or max retries exceeded
+                        return Err(e.context("failed to get logs after retries"));
+                    }
+                }
             }
-            start = end.saturating_add(1);
         }
         Ok(all)
     }
@@ -533,20 +572,42 @@ impl DiscoveryCache {
     }
 
     fn load(settings: &Settings) -> Result<Self> {
-        let raw = fs::read_to_string(settings.data_path("discovery_cache"))?;
-        let cache: Self = serde_json::from_str(&raw)?;
-        if cache.version != 1 || cache.chain_id != settings.chain_id {
-            anyhow::bail!("discovery cache version or chain id mismatch");
-        }
+        let path = settings.data_path("discovery_cache");
+        let cache = match load_cache::<Self, _>(&path) {
+            CacheLoadResult::Ok(cache) => {
+                telemetry::record_cache_hit("discovery_cache", "binary");
+                cache
+            }
+            CacheLoadResult::NotFound => {
+                telemetry::record_cache_miss("discovery_cache", "binary");
+                load_legacy_cache::<Self, _>(&path)?.context("discovery cache not found")?
+            }
+            CacheLoadResult::VersionMismatch { .. } | CacheLoadResult::Corrupt { .. } => {
+                telemetry::record_cache_miss("discovery_cache", "binary");
+                match load_legacy_cache::<Self, _>(&path)? {
+                    Some(cache) => cache,
+                    None => {
+                        repair_cache(&path).ok();
+                        telemetry::record_cache_flush("discovery_cache", "repair");
+                        anyhow::bail!("discovery cache is corrupt");
+                    }
+                }
+            }
+        };
+        cache.validate(settings)?;
         Ok(cache)
     }
 
     fn save(&self, settings: &Settings) -> Result<()> {
         fs::create_dir_all("state").ok();
-        fs::write(
-            settings.data_path("discovery_cache"),
-            serde_json::to_string_pretty(self)?,
-        )?;
+        AtomicCacheWriter::new(settings.data_path("discovery_cache"), true).write(self)?;
+        Ok(())
+    }
+
+    fn validate(&self, settings: &Settings) -> Result<()> {
+        if self.version != 1 || self.chain_id != settings.chain_id {
+            anyhow::bail!("discovery cache version or chain id mismatch");
+        }
         Ok(())
     }
 }

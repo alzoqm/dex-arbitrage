@@ -3,7 +3,8 @@ use std::{collections::HashMap, sync::Arc};
 use alloy::primitives::Address;
 use dex_arbitrage::{
     config::{
-        ContractSettings, RiskSettings, RpcSettings, SearchSettings, Settings, UniversePolicy,
+        ContractSettings, ExecutionSettings, RiskSettings, RpcSettings, SearchSettings, Settings,
+        UniversePolicy,
     },
     graph::GraphSnapshot,
     router::quantity_search::QuantitySearcher,
@@ -63,6 +64,7 @@ fn settings() -> Arc<Settings> {
             stable_depeg_cutoff_e6: 995_000,
         },
         search: SearchSettings::default(),
+        execution: ExecutionSettings::default(),
         policy: UniversePolicy::default(),
         tokens: Vec::new(),
         dexes: vec![dex_arbitrage::config::DexConfig {

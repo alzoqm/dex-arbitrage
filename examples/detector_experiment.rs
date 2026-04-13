@@ -6,7 +6,10 @@ use std::{
 
 use alloy::primitives::{Address, U256};
 use dex_arbitrage::{
-    config::{ContractSettings, RiskSettings, RpcSettings, Settings, TokenConfig, UniversePolicy},
+    config::{
+        ContractSettings, ExecutionSettings, RiskSettings, RpcSettings, Settings, TokenConfig,
+        UniversePolicy,
+    },
     detector::{pruning, Detector},
     graph::{DistanceCache, GraphSnapshot},
     types::{AmmKind, Chain, Edge, EdgeRef, LiquidityInfo, PoolHealth, TokenBehavior, TokenInfo},
@@ -806,6 +809,7 @@ fn settings(max_hops: usize, screening_margin_bps: u32) -> Arc<Settings> {
             stable_depeg_cutoff_e6: 995_000,
         },
         search: dex_arbitrage::config::SearchSettings::default(),
+        execution: ExecutionSettings::default(),
         policy: UniversePolicy::default(),
         tokens: Vec::<TokenConfig>::new(),
         dexes: Vec::new(),
