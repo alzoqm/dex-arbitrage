@@ -634,6 +634,12 @@ SKIPPED_POOL_CACHE_TTL_SECS=86400
 USE_V3_RPC_QUOTER=false
 SEARCH_MAX_CANDIDATES_PER_REFRESH=64
 INITIAL_REFRESH_MAX_EDGES=1024
+EVENT_INGEST_MODE=wss
+EVENT_WSS_FILTER_MODE=topic_logs
+EVENT_WSS_RECONCILE_MODE=topic_logs
+EVENT_WSS_RECONCILE_INTERVAL_BLOCKS=2
+EVENT_WSS_RECONCILE_INTERVAL_MS=10000
+EVENT_WSS_RECENT_LOG_CACHE=100000
 ```
 
 의미:
@@ -680,6 +686,14 @@ INITIAL_REFRESH_MAX_EDGES:
   discovery 범위를 줄이는 설정이 아니라, 이미 구성된 전체 Base 그래프에서
   가장 유망한 edge부터 초기 후보 탐색에 넣어 첫 구동 지연을 제한한다.
   기본 1024로 두고, 0 또는 미설정이면 전체 edge를 평가한다.
+
+EVENT_INGEST_MODE / EVENT_WSS_*:
+  Base 전체 pool 주소를 address_logs로 매 블록 조회하면 pool 수만큼 address chunk가 늘어나
+  Alchemy CU 비용이 커진다. 기본값은 wss로 두고, WSS는 topic-only 구독으로 즉시 로그를 받는다.
+  topic-only WSS는 pool 주소 필터를 RPC에 싣지 않고, 로컬에서 현재 snapshot의 watched pool만 필터링한다.
+  알파가 존재하는 짧은 구간은 WSS 실시간 로그로 보존하고, WSS 누락/끊김 가능성은
+  EVENT_WSS_RECONCILE_INTERVAL_BLOCKS=2 주기의 topic_logs backfill로 빠르게 보정한다.
+  EVENT_WSS_RECENT_LOG_CACHE는 WSS로 이미 처리한 로그를 backfill에서 중복 적용하지 않기 위한 최근 로그 키 캐시다.
 ```
 
 주의:

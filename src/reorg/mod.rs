@@ -262,11 +262,12 @@ impl ReorgDetector {
         }
 
         // Parent doesn't exist - might be a reorg or just missing history
-        warn!(
+        debug!(
             block = entry.number,
             parent = %entry.parent_hash,
-            "received block with unknown parent - may indicate reorg or missing history"
+            "received block with unknown parent; anchoring new tip after missing history"
         );
+        self.append_block(chain, block_by_hash, block_by_number, entry);
 
         Ok(None)
     }
@@ -408,5 +409,31 @@ mod tests {
 
         let result = detector.update_chain(block1_alt).unwrap();
         assert!(matches!(result, Some(ReorgEvent::Rollback { .. })));
+    }
+
+    #[test]
+    fn test_gap_with_unknown_parent_anchors_new_tip() {
+        let detector = ReorgDetector::new();
+
+        detector
+            .update_chain(BlockRef {
+                number: 100,
+                hash: B256::from([1u8; 32]),
+                parent_hash: B256::from([0u8; 32]),
+                finality: FinalityLevel::Sealed,
+            })
+            .unwrap();
+
+        let result = detector
+            .update_chain(BlockRef {
+                number: 110,
+                hash: B256::from([10u8; 32]),
+                parent_hash: B256::from([9u8; 32]),
+                finality: FinalityLevel::Sealed,
+            })
+            .unwrap();
+
+        assert!(result.is_none());
+        assert_eq!(detector.current_tip().unwrap().number, 110);
     }
 }

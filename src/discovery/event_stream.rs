@@ -1,9 +1,11 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
+    hash::{DefaultHasher, Hash, Hasher},
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc,
     },
+    time::{Duration, Instant},
 };
 
 use alloy::{
@@ -15,7 +17,7 @@ use anyhow::Result;
 use futures::StreamExt;
 use parking_lot::Mutex;
 use tokio::sync::mpsc;
-use tracing::warn;
+use tracing::{info, warn};
 
 use crate::{
     config::Settings,
@@ -28,8 +30,10 @@ use crate::{
 pub struct EventStream {
     settings: Arc<Settings>,
     rpc: Arc<RpcClients>,
-    ws_started: AtomicBool,
+    ws_started: Arc<AtomicBool>,
     ws_rx: Arc<Mutex<Option<mpsc::Receiver<RpcLog>>>>,
+    recent_wss_logs: Arc<Mutex<RecentLogKeys>>,
+    last_wss_reconcile_at: Arc<Mutex<Option<Instant>>>,
 }
 
 impl EventStream {
@@ -37,8 +41,10 @@ impl EventStream {
         Self {
             settings,
             rpc,
-            ws_started: AtomicBool::new(false),
+            ws_started: Arc::new(AtomicBool::new(false)),
             ws_rx: Arc::new(Mutex::new(None)),
+            recent_wss_logs: Arc::new(Mutex::new(RecentLogKeys::default())),
+            last_wss_reconcile_at: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -53,23 +59,9 @@ impl EventStream {
         }
 
         if matches!(event_ingest_mode(), EventIngestMode::Wss) {
-            let latest = self.rpc.best_read().block_number().await?;
-            self.start_wss(&addresses, &event_topics());
-            let mut logs = if latest > from_block {
-                self.get_address_logs_chunked(from_block + 1, latest, &addresses, &event_topics())
-                    .await?
-            } else {
-                Vec::new()
-            };
-            logs.extend(filter_watched_logs(
-                self.drain_wss_logs(),
-                &addresses,
-                &event_topics(),
-            ));
-            let log_count = logs.len();
-            let batch = self.build_refresh_batch(snapshot, logs);
-            telemetry::record_event_ingestion("wss", log_count, self.settings.chain.as_str());
-            return Ok((latest, batch));
+            return self
+                .poll_wss_hybrid(snapshot, from_block, &addresses, &event_topics())
+                .await;
         }
 
         let latest = self.rpc.best_read().block_number().await?;
@@ -88,6 +80,74 @@ impl EventStream {
             self.settings.chain.as_str(),
         );
         Ok((latest, batch))
+    }
+
+    async fn poll_wss_hybrid(
+        &self,
+        snapshot: &GraphSnapshot,
+        from_block: u64,
+        addresses: &[Address],
+        topics: &[B256],
+    ) -> Result<(u64, RefreshBatch)> {
+        let latest = self.rpc.best_read().block_number().await?;
+        if !self.start_wss(addresses, topics) {
+            if latest <= from_block {
+                return Ok((from_block, RefreshBatch::default()));
+            }
+            let logs = self
+                .poll_wss_reconcile_logs(from_block + 1, latest, addresses, topics)
+                .await?;
+            let log_count = logs.len();
+            let batch = self.build_refresh_batch(snapshot, logs);
+            telemetry::record_event_ingestion(
+                "wss-fallback",
+                log_count,
+                self.settings.chain.as_str(),
+            );
+            return Ok((latest, batch));
+        }
+
+        let mut wss_logs = filter_watched_logs(self.drain_wss_logs(), addresses, topics);
+        wss_logs.retain(|log| {
+            log.block_number
+                .map(|block| block > from_block)
+                .unwrap_or(true)
+        });
+        self.record_wss_log_keys(&wss_logs);
+
+        let should_reconcile = latest > from_block && self.wss_reconcile_due(from_block, latest);
+        let mut next_from_block = from_block;
+        let mut logs = Vec::new();
+        let wss_log_count = wss_logs.len();
+        let mut backfill_log_count = 0usize;
+
+        if should_reconcile {
+            let backfill_logs = self
+                .poll_wss_reconcile_logs(from_block + 1, latest, addresses, topics)
+                .await?;
+            backfill_log_count = backfill_logs.len();
+            logs.extend(self.filter_seen_wss_logs(backfill_logs));
+            next_from_block = latest;
+            *self.last_wss_reconcile_at.lock() = Some(Instant::now());
+        }
+
+        logs.extend(wss_logs);
+        let logs = dedup_logs(logs);
+        let log_count = logs.len();
+        let batch = self.build_refresh_batch(snapshot, logs);
+        if should_reconcile {
+            info!(
+                from_block = from_block + 1,
+                to_block = latest,
+                wss_logs = wss_log_count,
+                backfill_logs = backfill_log_count,
+                accepted_logs = log_count,
+                mode = wss_reconcile_mode().as_str(),
+                "wss reconciliation complete"
+            );
+        }
+        telemetry::record_event_ingestion("wss", log_count, self.settings.chain.as_str());
+        Ok((next_from_block, batch))
     }
 
     async fn poll_logs(
@@ -143,16 +203,63 @@ impl EventStream {
         }
     }
 
-    fn start_wss(&self, addresses: &[Address], topics: &[B256]) {
+    async fn poll_wss_reconcile_logs(
+        &self,
+        from_block: u64,
+        to_block: u64,
+        addresses: &[Address],
+        topics: &[B256],
+    ) -> Result<Vec<RpcLog>> {
+        match wss_reconcile_mode() {
+            EventIngestMode::BlockReceipts => {
+                let max_receipt_blocks = std::env::var("EVENT_RECEIPT_MAX_BLOCKS")
+                    .ok()
+                    .and_then(|value| value.parse::<u64>().ok())
+                    .filter(|value| *value > 0)
+                    .unwrap_or(64);
+                let span = to_block.saturating_sub(from_block).saturating_add(1);
+                if span <= max_receipt_blocks {
+                    match self
+                        .get_block_receipts_range(from_block, to_block, addresses, topics)
+                        .await
+                    {
+                        Ok(logs) => Ok(logs),
+                        Err(err) => {
+                            warn!(error = %err, "wss reconciliation via block receipts failed; falling back to topic logs");
+                            self.get_topic_logs_chunked(from_block, to_block, topics)
+                                .await
+                                .map(|logs| filter_watched_logs(logs, addresses, topics))
+                        }
+                    }
+                } else {
+                    self.get_topic_logs_chunked(from_block, to_block, topics)
+                        .await
+                        .map(|logs| filter_watched_logs(logs, addresses, topics))
+                }
+            }
+            EventIngestMode::AddressLogs => {
+                self.get_address_logs_chunked(from_block, to_block, addresses, topics)
+                    .await
+            }
+            EventIngestMode::Wss | EventIngestMode::TopicLogs => self
+                .get_topic_logs_chunked(from_block, to_block, topics)
+                .await
+                .map(|logs| filter_watched_logs(logs, addresses, topics)),
+        }
+    }
+
+    fn start_wss(&self, addresses: &[Address], topics: &[B256]) -> bool {
         if self.ws_started.swap(true, Ordering::SeqCst) {
-            return;
+            return true;
         }
         let Some(ws_url) = self.settings.rpc.ws_url.clone() else {
             warn!("EVENT_INGEST_MODE=wss requested but chain WSS URL is not configured; no WSS logs will be received");
-            return;
+            self.ws_started.store(false, Ordering::SeqCst);
+            return false;
         };
         let topics = topics.to_vec();
         let addresses = addresses.to_vec();
+        let filter_mode = wss_filter_mode();
         let capacity = std::env::var("EVENT_WSS_CHANNEL_CAPACITY")
             .ok()
             .and_then(|value| value.parse::<usize>().ok())
@@ -160,11 +267,16 @@ impl EventStream {
             .unwrap_or(16_384);
         let (tx, rx) = mpsc::channel(capacity);
         *self.ws_rx.lock() = Some(rx);
+        let ws_started = self.ws_started.clone();
         tokio::spawn(async move {
-            if let Err(err) = run_wss_log_subscription(ws_url, addresses, topics, tx).await {
+            if let Err(err) =
+                run_wss_log_subscription(ws_url, addresses, topics, filter_mode, tx).await
+            {
                 warn!(error = %err, "WSS log subscription stopped");
             }
+            ws_started.store(false, Ordering::SeqCst);
         });
+        true
     }
 
     fn drain_wss_logs(&self) -> Vec<RpcLog> {
@@ -177,6 +289,32 @@ impl EventStream {
             out.push(log);
         }
         out
+    }
+
+    fn record_wss_log_keys(&self, logs: &[RpcLog]) {
+        let capacity = recent_wss_log_capacity();
+        let mut recent = self.recent_wss_logs.lock();
+        for log in logs {
+            recent.insert(log_key(log), capacity);
+        }
+    }
+
+    fn filter_seen_wss_logs(&self, logs: Vec<RpcLog>) -> Vec<RpcLog> {
+        let recent = self.recent_wss_logs.lock();
+        logs.into_iter()
+            .filter(|log| !recent.contains(&log_key(log)))
+            .collect()
+    }
+
+    fn wss_reconcile_due(&self, from_block: u64, latest: u64) -> bool {
+        let block_gap = latest.saturating_sub(from_block);
+        if block_gap >= wss_reconcile_interval_blocks() {
+            return true;
+        }
+        let Some(last) = *self.last_wss_reconcile_at.lock() else {
+            return block_gap > 0;
+        };
+        last.elapsed() >= wss_reconcile_interval()
     }
 
     async fn get_block_receipts_range(
@@ -382,6 +520,12 @@ enum EventIngestMode {
     AddressLogs,
 }
 
+#[derive(Debug, Clone, Copy)]
+enum WssFilterMode {
+    TopicLogs,
+    AddressLogs,
+}
+
 impl EventIngestMode {
     fn as_str(self) -> &'static str {
         match self {
@@ -389,6 +533,15 @@ impl EventIngestMode {
             EventIngestMode::BlockReceipts => "block_receipts",
             EventIngestMode::TopicLogs => "topic_logs",
             EventIngestMode::AddressLogs => "address_logs",
+        }
+    }
+}
+
+impl WssFilterMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            WssFilterMode::TopicLogs => "topic_logs",
+            WssFilterMode::AddressLogs => "address_logs",
         }
     }
 }
@@ -406,16 +559,75 @@ fn event_ingest_mode() -> EventIngestMode {
     }
 }
 
+fn wss_reconcile_mode() -> EventIngestMode {
+    match std::env::var("EVENT_WSS_RECONCILE_MODE")
+        .unwrap_or_else(|_| "topic_logs".to_string())
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "block_receipts" | "receipts" => EventIngestMode::BlockReceipts,
+        "address_logs" | "address" | "legacy" => EventIngestMode::AddressLogs,
+        _ => EventIngestMode::TopicLogs,
+    }
+}
+
+fn wss_filter_mode() -> WssFilterMode {
+    match std::env::var("EVENT_WSS_FILTER_MODE")
+        .unwrap_or_else(|_| "topic_logs".to_string())
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "address_logs" | "address" | "legacy" => WssFilterMode::AddressLogs,
+        _ => WssFilterMode::TopicLogs,
+    }
+}
+
+fn wss_reconcile_interval_blocks() -> u64 {
+    std::env::var("EVENT_WSS_RECONCILE_INTERVAL_BLOCKS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(2)
+}
+
+fn wss_reconcile_interval() -> Duration {
+    Duration::from_millis(
+        std::env::var("EVENT_WSS_RECONCILE_INTERVAL_MS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(10_000),
+    )
+}
+
+fn recent_wss_log_capacity() -> usize {
+    std::env::var("EVENT_WSS_RECENT_LOG_CACHE")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(100_000)
+}
+
 async fn run_wss_log_subscription(
     ws_url: String,
     addresses: Vec<Address>,
     topics: Vec<B256>,
+    filter_mode: WssFilterMode,
     tx: mpsc::Sender<RpcLog>,
 ) -> Result<()> {
     let provider = ProviderBuilder::new()
         .connect_ws(WsConnect::new(ws_url))
         .await?;
-    let filter = Filter::new().address(addresses).event_signature(topics);
+    info!(
+        mode = filter_mode.as_str(),
+        topic_count = topics.len(),
+        address_count = addresses.len(),
+        "starting WSS log subscription"
+    );
+    let filter = match filter_mode {
+        WssFilterMode::AddressLogs => Filter::new().address(addresses).event_signature(topics),
+        WssFilterMode::TopicLogs => Filter::new().event_signature(topics),
+    };
     let sub = provider.subscribe_logs(&filter).await?;
     let mut stream = sub.into_stream();
     while let Some(log) = stream.next().await {
@@ -432,6 +644,63 @@ async fn run_wss_log_subscription(
         }
     }
     Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct LogKey {
+    block_number: Option<u64>,
+    tx_hash: Option<B256>,
+    address: Address,
+    topic0: Option<B256>,
+    data_hash: u64,
+}
+
+#[derive(Debug, Default)]
+struct RecentLogKeys {
+    order: VecDeque<LogKey>,
+    set: HashSet<LogKey>,
+}
+
+impl RecentLogKeys {
+    fn insert(&mut self, key: LogKey, capacity: usize) {
+        if self.set.insert(key) {
+            self.order.push_back(key);
+        }
+        while self.order.len() > capacity {
+            if let Some(oldest) = self.order.pop_front() {
+                self.set.remove(&oldest);
+            } else {
+                break;
+            }
+        }
+    }
+
+    fn contains(&self, key: &LogKey) -> bool {
+        self.set.contains(key)
+    }
+}
+
+fn dedup_logs(logs: Vec<RpcLog>) -> Vec<RpcLog> {
+    let mut seen = HashSet::new();
+    logs.into_iter()
+        .filter(|log| seen.insert(log_key(log)))
+        .collect()
+}
+
+fn log_key(log: &RpcLog) -> LogKey {
+    LogKey {
+        block_number: log.block_number,
+        tx_hash: log.tx_hash,
+        address: log.address,
+        topic0: log.topics.first().copied(),
+        data_hash: hash_log_data(log.data.as_ref()),
+    }
+}
+
+fn hash_log_data(data: &[u8]) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    data.hash(&mut hasher);
+    hasher.finish()
 }
 
 fn upsert_trigger(
@@ -796,6 +1065,51 @@ mod tests {
         }
 
         assert!(matches!(mode, EventIngestMode::AddressLogs));
+    }
+
+    #[test]
+    fn wss_modes_default_to_topic_logs_when_unset() {
+        let _guard = ENV_LOCK.get_or_init(Mutex::default).lock().unwrap();
+        let filter_key = "EVENT_WSS_FILTER_MODE";
+        let reconcile_key = "EVENT_WSS_RECONCILE_MODE";
+        let previous_filter = std::env::var_os(filter_key);
+        let previous_reconcile = std::env::var_os(reconcile_key);
+        std::env::remove_var(filter_key);
+        std::env::remove_var(reconcile_key);
+
+        let filter_mode = wss_filter_mode();
+        let reconcile_mode = wss_reconcile_mode();
+
+        match previous_filter {
+            Some(value) => std::env::set_var(filter_key, value),
+            None => std::env::remove_var(filter_key),
+        }
+        match previous_reconcile {
+            Some(value) => std::env::set_var(reconcile_key, value),
+            None => std::env::remove_var(reconcile_key),
+        }
+
+        assert!(matches!(filter_mode, WssFilterMode::TopicLogs));
+        assert!(matches!(reconcile_mode, EventIngestMode::TopicLogs));
+    }
+
+    #[test]
+    fn recent_wss_log_keys_prevent_duplicate_backfill_logs() {
+        let log = RpcLog {
+            address: addr(7),
+            topics: vec![signature_hash("Sync(uint112,uint112)")],
+            data: encode_words(&[123, 456]),
+            block_number: Some(42),
+            block_hash: None,
+            tx_hash: Some(B256::from([3u8; 32])),
+        };
+        let mut recent = RecentLogKeys::default();
+        let key = log_key(&log);
+
+        recent.insert(key, 16);
+
+        assert!(recent.contains(&key));
+        assert_eq!(dedup_logs(vec![log.clone(), log]).len(), 1);
     }
 
     #[test]
