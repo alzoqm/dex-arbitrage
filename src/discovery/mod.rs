@@ -8,16 +8,17 @@ use std::{
     collections::HashMap,
     fs,
     sync::Arc,
-    time::{Duration, Instant, SystemTime},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use alloy::{
-    primitives::{Address, U256},
+    primitives::{Address, Bytes, U256},
     sol_types::SolCall,
 };
 use anyhow::{Context, Result};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
+use tracing::{info, warn};
 
 use crate::{
     abi::{IAavePool, IERC20},
@@ -27,7 +28,7 @@ use crate::{
     monitoring::metrics as telemetry,
     rpc::RpcClients,
     types::{
-        BlockRef, PoolHealth, PoolSpecificState, PoolState, PoolStatePatch, TokenBehavior,
+        AmmKind, BlockRef, PoolHealth, PoolSpecificState, PoolState, PoolStatePatch, TokenBehavior,
         TokenInfo,
     },
 };
@@ -36,7 +37,7 @@ use self::{
     admission::AdmissionEngine,
     event_stream::EventStream,
     factory_scanner::{DiscoveredPool, FactoryScanner},
-    pool_fetcher::PoolFetcher,
+    pool_fetcher::{PoolFetcher, SkippedPoolFetch},
 };
 
 #[derive(Debug, Clone)]
@@ -83,31 +84,140 @@ impl DiscoveryManager {
     pub async fn bootstrap(&self) -> Result<DiscoveryOutput> {
         let discovered = self.scanner.scan_all().await?;
         let mut pools = HashMap::new();
-        let mut cached_pools = PoolStateCache::load(&self.settings)
-            .ok()
-            .filter(|_| !pool_state_cache_disabled())
-            .map(|cache| {
-                cache
-                    .pools
-                    .into_iter()
-                    .map(|pool| (pool.pool_id, pool))
-                    .collect::<HashMap<_, _>>()
-            })
-            .unwrap_or_default();
+        let (mut cached_pools, mut skipped_pool_cache) = if pool_state_cache_disabled() {
+            (HashMap::new(), HashMap::new())
+        } else {
+            PoolStateCache::load(&self.settings)
+                .ok()
+                .map(|cache| {
+                    let pools = cache
+                        .pools
+                        .into_iter()
+                        .map(|pool| (pool.pool_id, pool))
+                        .collect::<HashMap<_, _>>();
+                    let skipped = cache
+                        .skipped_pools
+                        .into_iter()
+                        .filter(skipped_pool_cache_entry_active)
+                        .map(|entry| (entry.spec.address, entry))
+                        .collect::<HashMap<_, _>>();
+                    (pools, skipped)
+                })
+                .unwrap_or_default()
+        };
 
+        let mut v2_to_fetch = Vec::new();
+        let mut v3_to_fetch = Vec::new();
+        let mut other_to_fetch = Vec::new();
+        let mut skipped_cache_hits = 0usize;
         for spec in discovered {
             let cached = cached_pools
                 .remove(&spec.address)
                 .filter(|pool| pool_matches_spec(pool, &spec));
-            let pool = match cached {
-                Some(pool) => Some(pool),
-                None => self.fetcher.fetch_pool(&spec, None).await?,
-            };
-            if let Some(pool) = pool {
+            if let Some(pool) = cached {
                 if self.admission.admit(&pool) {
                     pools.insert(pool.pool_id, pool);
                 }
+                continue;
             }
+
+            if let Some(entry) = skipped_pool_cache.get(&spec.address) {
+                if skipped_pool_matches_spec(entry, &spec) {
+                    skipped_cache_hits += 1;
+                    continue;
+                }
+                skipped_pool_cache.remove(&spec.address);
+            }
+
+            match spec.amm_kind {
+                AmmKind::UniswapV2Like => v2_to_fetch.push(spec),
+                AmmKind::UniswapV3Like => v3_to_fetch.push(spec),
+                _ => other_to_fetch.push(spec),
+            }
+        }
+
+        info!(
+            cached = pools.len(),
+            v2_to_fetch = v2_to_fetch.len(),
+            v3_to_fetch = v3_to_fetch.len(),
+            other_to_fetch = other_to_fetch.len(),
+            skipped_cache_hits,
+            "pool state fetch plan built"
+        );
+
+        let v2_batch = self.fetcher.fetch_v2_batch(&v2_to_fetch, None).await?;
+        for skipped in v2_batch.skipped {
+            insert_skipped_pool(&mut skipped_pool_cache, skipped);
+        }
+        for pool in v2_batch.pools {
+            if self.admission.admit(&pool) {
+                skipped_pool_cache.remove(&pool.pool_id);
+                pools.insert(pool.pool_id, pool);
+            }
+        }
+        if !v2_to_fetch.is_empty() {
+            self.save_pool_state_checkpoint(&pools, &skipped_pool_cache, "v2");
+        }
+
+        let v3_batch = self.fetcher.fetch_v3_batch(&v3_to_fetch, None).await?;
+        for skipped in v3_batch.skipped {
+            insert_skipped_pool(&mut skipped_pool_cache, skipped);
+        }
+        for pool in v3_batch.pools {
+            if self.admission.admit(&pool) {
+                skipped_pool_cache.remove(&pool.pool_id);
+                pools.insert(pool.pool_id, pool);
+            }
+        }
+        if !v3_to_fetch.is_empty() {
+            self.save_pool_state_checkpoint(&pools, &skipped_pool_cache, "v3");
+        }
+
+        let mut skipped_other = 0usize;
+        for (idx, spec) in other_to_fetch.into_iter().enumerate() {
+            match self.fetcher.fetch_pool_with_retries(&spec, None).await {
+                Ok(Some(pool)) => {
+                    if self.admission.admit(&pool) {
+                        skipped_pool_cache.remove(&pool.pool_id);
+                        pools.insert(pool.pool_id, pool);
+                    }
+                }
+                Ok(None) => {
+                    skipped_other += 1;
+                    insert_skipped_pool_reason(
+                        &mut skipped_pool_cache,
+                        spec,
+                        "non_v2_v3_fetch_returned_none",
+                    );
+                }
+                Err(err) => {
+                    skipped_other += 1;
+                    warn!(
+                        pool = %spec.address,
+                        dex = %spec.dex_name,
+                        kind = ?spec.amm_kind,
+                        error = %err,
+                        "skipping non-v2/v3 pool after retries"
+                    );
+                    insert_skipped_pool_reason(
+                        &mut skipped_pool_cache,
+                        spec,
+                        "non_v2_v3_fetch_failed",
+                    );
+                }
+            }
+            if (idx + 1) % 500 == 0 {
+                info!(
+                    fetched = idx + 1,
+                    admitted = pools.len(),
+                    skipped = skipped_other,
+                    "non-v2 pool state fetch progress"
+                );
+                self.save_pool_state_checkpoint(&pools, &skipped_pool_cache, "non_v2_v3");
+            }
+        }
+        if skipped_other > 0 || !pools.is_empty() {
+            self.save_pool_state_checkpoint(&pools, &skipped_pool_cache, "post_fetch");
         }
 
         let mut tokens = self.discover_tokens(&pools).await?;
@@ -121,14 +231,45 @@ impl DiscoveryManager {
         };
 
         let snapshot = GraphSnapshot::build(0, block_ref, tokens.clone(), pools.clone());
-        PoolStateCache::from_pools(&self.settings, pools.values().cloned().collect())
-            .save(&self.settings)
-            .ok();
+        PoolStateCache::from_parts(
+            &self.settings,
+            pools.values().cloned().collect(),
+            skipped_pool_cache.values().cloned().collect(),
+        )
+        .save(&self.settings)
+        .ok();
         Ok(DiscoveryOutput {
             tokens,
             pools,
             snapshot,
         })
+    }
+
+    fn save_pool_state_checkpoint(
+        &self,
+        pools: &HashMap<Address, PoolState>,
+        skipped_pool_cache: &HashMap<Address, SkippedPoolCacheEntry>,
+        phase: &str,
+    ) {
+        let cache = PoolStateCache::from_parts(
+            &self.settings,
+            pools.values().cloned().collect(),
+            skipped_pool_cache.values().cloned().collect(),
+        );
+        match cache.save(&self.settings) {
+            Ok(()) => info!(
+                phase,
+                pools = pools.len(),
+                skipped_pools = skipped_pool_cache.len(),
+                "pool state checkpoint saved"
+            ),
+            Err(err) => warn!(
+                phase,
+                pools = pools.len(),
+                error = %err,
+                "pool state checkpoint save failed"
+            ),
+        }
     }
 
     pub async fn refresh_pools(
@@ -220,31 +361,14 @@ impl DiscoveryManager {
             .map(|token| token.address)
             .collect::<std::collections::HashSet<_>>();
         let metadata_cache_len = self.token_metadata_cache.lock().len();
+        let mut discovered_addresses = Vec::new();
 
         for pool in pools {
             for address in pool.token_addresses.iter().copied() {
                 if !known.insert(address) {
                     continue;
                 }
-                let (symbol, decimals) = self.fetch_token_metadata(address).await;
-                if !self.settings.policy.symbol_allowed(&symbol) {
-                    continue;
-                }
-                let flash_loan_enabled = flash_reserves.contains_key(&address);
-                let is_stable = is_stable_symbol(&symbol);
-                tokens.push(TokenInfo {
-                    address,
-                    symbol,
-                    decimals,
-                    is_stable,
-                    is_cycle_anchor: flash_loan_enabled,
-                    flash_loan_enabled,
-                    allow_self_funded: false,
-                    behavior: TokenBehavior::default(),
-                    manual_price_usd_e8: is_stable.then_some(100_000_000),
-                    max_position_usd_e8: None,
-                    max_flash_loan_usd_e8: None,
-                });
+                discovered_addresses.push(address);
             }
         }
 
@@ -252,18 +376,27 @@ impl DiscoveryManager {
             if !known.insert(address) {
                 continue;
             }
-            let (symbol, decimals) = self.fetch_token_metadata(address).await;
+            discovered_addresses.push(address);
+        }
+
+        let metadata = self.fetch_token_metadata_batch(&discovered_addresses).await;
+        for address in discovered_addresses {
+            let (symbol, decimals) = metadata
+                .get(&address)
+                .cloned()
+                .unwrap_or_else(|| (address.to_string(), 18));
             if !self.settings.policy.symbol_allowed(&symbol) {
                 continue;
             }
+            let flash_loan_enabled = flash_reserves.contains_key(&address);
             let is_stable = is_stable_symbol(&symbol);
             tokens.push(TokenInfo {
                 address,
                 symbol,
                 decimals,
                 is_stable,
-                is_cycle_anchor: true,
-                flash_loan_enabled: true,
+                is_cycle_anchor: flash_loan_enabled,
+                flash_loan_enabled,
                 allow_self_funded: false,
                 behavior: TokenBehavior::default(),
                 manual_price_usd_e8: is_stable.then_some(100_000_000),
@@ -277,6 +410,101 @@ impl DiscoveryManager {
         }
 
         Ok(())
+    }
+
+    async fn fetch_token_metadata_batch(
+        &self,
+        addresses: &[Address],
+    ) -> HashMap<Address, (String, u8)> {
+        let mut out = HashMap::new();
+        if addresses.is_empty() {
+            return out;
+        }
+
+        let mut missing = Vec::new();
+        {
+            let cache = self.token_metadata_cache.lock();
+            for address in addresses.iter().copied() {
+                if let Some(metadata) = cache.get(&address).cloned() {
+                    out.insert(address, metadata);
+                } else {
+                    missing.push(address);
+                }
+            }
+        }
+
+        if missing.is_empty() {
+            return out;
+        }
+
+        let chunk_size = token_metadata_multicall_chunk_size();
+        info!(
+            total = missing.len(),
+            chunk_size, "starting token metadata batch fetch"
+        );
+
+        let mut fetched = 0usize;
+        let mut fallback = 0usize;
+        for (chunk_index, chunk) in missing.chunks(chunk_size).enumerate() {
+            let mut calls = Vec::with_capacity(chunk.len() * 2);
+            for address in chunk {
+                calls.push((*address, IERC20::symbolCall {}.abi_encode()));
+                calls.push((*address, IERC20::decimalsCall {}.abi_encode()));
+            }
+
+            match multicall::aggregate3(&self.rpc, calls).await {
+                Ok(results) => {
+                    let mut cache = self.token_metadata_cache.lock();
+                    for (address, raw) in chunk.iter().copied().zip(results.chunks(2)) {
+                        let symbol = raw
+                            .first()
+                            .and_then(|value| value.as_ref())
+                            .and_then(decode_token_symbol_return)
+                            .unwrap_or_else(|| address.to_string());
+                        let decimals = raw
+                            .get(1)
+                            .and_then(|value| value.as_ref())
+                            .and_then(|raw| IERC20::decimalsCall::abi_decode_returns(raw).ok())
+                            .unwrap_or(18);
+                        let metadata = (symbol, decimals);
+                        cache.insert(address, metadata.clone());
+                        out.insert(address, metadata);
+                        fetched += 1;
+                    }
+                }
+                Err(err) => {
+                    warn!(
+                        chunk_index,
+                        count = chunk.len(),
+                        error = %err,
+                        "token metadata multicall failed; falling back to per-token fetch"
+                    );
+                    for address in chunk.iter().copied() {
+                        let metadata = self.fetch_token_metadata(address).await;
+                        out.insert(address, metadata);
+                        fallback += 1;
+                    }
+                }
+            }
+
+            if (chunk_index + 1) % 25 == 0 || fetched + fallback == missing.len() {
+                info!(
+                    fetched = fetched + fallback,
+                    total = missing.len(),
+                    multicall = fetched,
+                    fallback,
+                    "token metadata batch fetch progress"
+                );
+            }
+        }
+
+        info!(
+            total = missing.len(),
+            multicall = fetched,
+            fallback,
+            "token metadata batch fetch complete"
+        );
+        out
     }
 
     async fn aave_flash_reserves(&self) -> Result<HashMap<Address, ()>> {
@@ -397,14 +625,7 @@ impl DiscoveryManager {
             .await
             .ok()?;
 
-        if let Ok(symbol) = IERC20::symbolCall::abi_decode_returns(&raw) {
-            let trimmed = symbol.trim();
-            if !trimmed.is_empty() {
-                return Some(trimmed.to_string());
-            }
-        }
-
-        decode_bytes32_string(raw.as_ref())
+        decode_token_symbol_return(&raw)
     }
 
     async fn fetch_token_decimals(&self, address: Address) -> Option<u8> {
@@ -546,6 +767,8 @@ struct PoolStateCache {
     version: u32,
     chain_id: u64,
     pools: Vec<PoolState>,
+    #[serde(default)]
+    skipped_pools: Vec<SkippedPoolCacheEntry>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -560,6 +783,13 @@ struct TokenMetadataCacheEntry {
     address: Address,
     symbol: String,
     decimals: u8,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SkippedPoolCacheEntry {
+    spec: DiscoveredPool,
+    reason: String,
+    skipped_at_unix_secs: u64,
 }
 
 impl TokenMetadataCache {
@@ -627,11 +857,16 @@ impl TokenMetadataCache {
 }
 
 impl PoolStateCache {
-    fn from_pools(settings: &Settings, pools: Vec<PoolState>) -> Self {
+    fn from_parts(
+        settings: &Settings,
+        pools: Vec<PoolState>,
+        skipped_pools: Vec<SkippedPoolCacheEntry>,
+    ) -> Self {
         Self {
             version: 1,
             chain_id: settings.chain_id,
             pools,
+            skipped_pools,
         }
     }
 
@@ -689,10 +924,77 @@ fn pool_matches_spec(pool: &PoolState, spec: &DiscoveredPool) -> bool {
         && pool.quoter == spec.quoter
 }
 
+fn skipped_pool_matches_spec(entry: &SkippedPoolCacheEntry, spec: &DiscoveredPool) -> bool {
+    discovered_pool_matches_spec(&entry.spec, spec)
+}
+
+fn discovered_pool_matches_spec(left: &DiscoveredPool, right: &DiscoveredPool) -> bool {
+    left.address == right.address
+        && left.dex_name == right.dex_name
+        && left.amm_kind == right.amm_kind
+        && left.factory == right.factory
+        && left.registry == right.registry
+        && left.vault == right.vault
+        && left.quoter == right.quoter
+        && left.balancer_pool_id == right.balancer_pool_id
+}
+
+fn insert_skipped_pool(
+    skipped_pool_cache: &mut HashMap<Address, SkippedPoolCacheEntry>,
+    skipped: SkippedPoolFetch,
+) {
+    insert_skipped_pool_reason(skipped_pool_cache, skipped.spec, skipped.reason);
+}
+
+fn insert_skipped_pool_reason(
+    skipped_pool_cache: &mut HashMap<Address, SkippedPoolCacheEntry>,
+    spec: DiscoveredPool,
+    reason: impl Into<String>,
+) {
+    skipped_pool_cache.insert(
+        spec.address,
+        SkippedPoolCacheEntry {
+            spec,
+            reason: reason.into(),
+            skipped_at_unix_secs: now_unix_secs(),
+        },
+    );
+}
+
+fn skipped_pool_cache_entry_active(entry: &SkippedPoolCacheEntry) -> bool {
+    if skipped_pool_cache_disabled() {
+        return false;
+    }
+    let ttl = skipped_pool_cache_ttl();
+    now_unix_secs().saturating_sub(entry.skipped_at_unix_secs) <= ttl.as_secs()
+}
+
 fn pool_state_cache_disabled() -> bool {
     std::env::var("DISABLE_POOL_STATE_CACHE")
         .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
         .unwrap_or(false)
+}
+
+fn skipped_pool_cache_disabled() -> bool {
+    std::env::var("DISABLE_SKIPPED_POOL_CACHE")
+        .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+        .unwrap_or(false)
+}
+
+fn skipped_pool_cache_ttl() -> Duration {
+    Duration::from_secs(
+        std::env::var("SKIPPED_POOL_CACHE_TTL_SECS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(86_400),
+    )
+}
+
+fn now_unix_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or_default()
 }
 
 fn derive_missing_prices_from_pools(tokens: &mut [TokenInfo], pools: &HashMap<Address, PoolState>) {
@@ -801,6 +1103,17 @@ fn reserve_bit(config_data: U256, bit: usize) -> bool {
     ((config_data >> bit) & U256::from(1u8)) == U256::from(1u8)
 }
 
+fn decode_token_symbol_return(raw: &Bytes) -> Option<String> {
+    if let Ok(symbol) = IERC20::symbolCall::abi_decode_returns(raw) {
+        let trimmed = symbol.trim();
+        if !trimmed.is_empty() {
+            return Some(trimmed.to_string());
+        }
+    }
+
+    decode_bytes32_string(raw.as_ref())
+}
+
 fn decode_bytes32_string(bytes: &[u8]) -> Option<String> {
     if bytes.len() != 32 {
         return None;
@@ -817,6 +1130,14 @@ fn decode_bytes32_string(bytes: &[u8]) -> Option<String> {
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(ToString::to_string)
+}
+
+fn token_metadata_multicall_chunk_size() -> usize {
+    std::env::var("TOKEN_METADATA_MULTICALL_CHUNK_SIZE")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(250)
 }
 
 fn stable_price_for_symbol(symbol: &str) -> Option<u64> {

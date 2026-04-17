@@ -2,7 +2,7 @@ use std::{sync::Arc, time::Duration};
 
 use crate::{
     config::Settings,
-    types::{PoolAdmissionStatus, PoolState},
+    types::{PoolAdmissionStatus, PoolSpecificState, PoolState},
 };
 
 #[derive(Debug)]
@@ -32,8 +32,22 @@ impl AdmissionEngine {
         {
             return false;
         }
+        if !has_usable_liquidity(pool) {
+            return false;
+        }
 
         true
+    }
+}
+
+fn has_usable_liquidity(pool: &PoolState) -> bool {
+    match &pool.state {
+        PoolSpecificState::UniswapV2Like(state) => state.reserve0 > 0 && state.reserve1 > 0,
+        PoolSpecificState::UniswapV3Like(state) => state.liquidity > 0,
+        PoolSpecificState::CurvePlain(state) => state.balances.iter().any(|balance| *balance > 0),
+        PoolSpecificState::BalancerWeighted(state) => {
+            state.balances.iter().any(|balance| *balance > 0)
+        }
     }
 }
 
@@ -116,12 +130,21 @@ mod tests {
                 recent_revert_count: 0,
             },
         );
+        let zero_reserve_pool = PoolState {
+            state: PoolSpecificState::UniswapV2Like(V2PoolState {
+                reserve0: 0,
+                reserve1: 20,
+                fee_ppm: 3_000,
+            }),
+            ..healthy_pool.clone()
+        };
 
         assert!(engine.admit(&healthy_pool));
         assert!(!engine.admit(&short_pool));
         assert!(!engine.admit(&excluded_pool));
         assert!(!engine.admit(&low_confidence_pool));
         assert!(!engine.admit(&stale_pool));
+        assert!(!engine.admit(&zero_reserve_pool));
     }
 
     fn test_settings(pool_health_min_bps: u16, staleness_timeout_ms: u64) -> Settings {

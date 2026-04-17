@@ -45,6 +45,17 @@ impl SplitOptimizer {
                 .await;
         }
 
+        if let Some(allocations) = super::v2_split::optimal_v2_allocations(
+            snapshot, &edge_refs, token_in, token_out, total_in,
+        ) {
+            let materialized = self
+                .materialize_allocations(snapshot, &edge_refs, token_in, token_out, allocations)
+                .await?;
+            if !materialized.0.is_empty() {
+                return Ok(materialized);
+            }
+        }
+
         let mut allocations = vec![0u128; edge_refs.len()];
         let mut quoted_outputs = vec![0u128; edge_refs.len()];
         let mut assigned = 0u128;

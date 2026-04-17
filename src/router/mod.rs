@@ -1,7 +1,9 @@
 pub mod exact_quoter;
+pub mod fast_sizer;
 pub mod quantity_search;
 pub mod split_decision;
 pub mod split_optimizer;
+pub mod v2_split;
 
 use std::sync::Arc;
 
@@ -15,13 +17,15 @@ use crate::{
 };
 
 use self::{
-    exact_quoter::ExactQuoter, quantity_search::QuantitySearcher, split_optimizer::SplitOptimizer,
+    exact_quoter::ExactQuoter, fast_sizer::FastSizer, quantity_search::QuantitySearcher,
+    split_optimizer::SplitOptimizer,
 };
 
 #[derive(Debug)]
 pub struct Router {
     split_optimizer: SplitOptimizer,
     quantity_searcher: QuantitySearcher,
+    fast_sizer: FastSizer,
     flash: FlashLoanEngine,
 }
 
@@ -30,10 +34,12 @@ impl Router {
         let exact_quoter = ExactQuoter::new(settings.clone(), rpc.clone());
         let split_optimizer = SplitOptimizer::new(settings.clone(), exact_quoter.clone());
         let quantity_searcher = QuantitySearcher::new(settings.clone());
+        let fast_sizer = FastSizer::new();
         let flash = FlashLoanEngine::new(settings, rpc);
         Self {
             split_optimizer,
             quantity_searcher,
+            fast_sizer,
             flash,
         }
     }
@@ -51,6 +57,21 @@ impl Router {
             return Ok(None);
         };
         let mut evaluated = std::collections::HashMap::<u128, Option<ExactPlan>>::new();
+
+        if let Some(plan) = self
+            .search_fast_sized(
+                snapshot,
+                candidate,
+                min_amount,
+                max_amount,
+                premium_ppm,
+                &mut evaluated,
+            )
+            .await?
+        {
+            return Ok(Some(plan));
+        }
+
         let mut ordered = self.quantity_searcher.ladder(snapshot, candidate);
         if ordered.is_empty() {
             return Ok(None);
@@ -135,6 +156,92 @@ impl Router {
         Ok(best)
     }
 
+    async fn search_fast_sized(
+        &self,
+        snapshot: &GraphSnapshot,
+        candidate: &CandidatePath,
+        min_amount: u128,
+        max_amount: u128,
+        premium_ppm: u128,
+        evaluated: &mut std::collections::HashMap<u128, Option<ExactPlan>>,
+    ) -> Result<Option<ExactPlan>> {
+        let fast_points = self.fast_sizer.suggest_input_amounts(
+            snapshot,
+            candidate,
+            min_amount,
+            max_amount,
+            premium_ppm,
+        );
+        if fast_points.is_empty() {
+            return Ok(None);
+        }
+
+        let mut best = None::<ExactPlan>;
+        for &amount in &fast_points {
+            if let Some(plan) = self
+                .evaluate_amount(snapshot, candidate, amount, premium_ppm, evaluated)
+                .await?
+            {
+                best = better_plan(best, plan);
+            }
+        }
+        let Some(initial_best) = best.clone() else {
+            return Ok(None);
+        };
+
+        let center = initial_best.input_amount;
+        let mut low = center
+            .saturating_sub(center / 2)
+            .max(min_amount)
+            .min(max_amount);
+        let mut high = center
+            .saturating_add(center / 2)
+            .max(center.saturating_add(1))
+            .min(max_amount);
+        if low >= high {
+            low = min_amount.min(center);
+            high = max_amount.max(center);
+        }
+
+        for _ in 0..12 {
+            if high.saturating_sub(low) <= 32 {
+                break;
+            }
+            let width = high - low;
+            let mid_left = low + width / 3;
+            let mid_right = high - width / 3;
+            let left_profit = self
+                .evaluate_profit(snapshot, candidate, mid_left, premium_ppm, evaluated)
+                .await?;
+            let right_profit = self
+                .evaluate_profit(snapshot, candidate, mid_right, premium_ppm, evaluated)
+                .await?;
+            if left_profit < right_profit {
+                low = mid_left.saturating_add(1);
+            } else {
+                high = mid_right.saturating_sub(1).max(low);
+            }
+        }
+
+        for amount in dense_points(low, high, 16) {
+            if let Some(plan) = self
+                .evaluate_amount(snapshot, candidate, amount, premium_ppm, evaluated)
+                .await?
+            {
+                best = better_plan(best, plan);
+            }
+        }
+
+        let best = best.expect("fast search keeps an initial profitable plan");
+        let needs_wide_fallback = best.input_amount == low && low > min_amount
+            || best.input_amount == high && high < max_amount;
+        if needs_wide_fallback {
+            Ok(None)
+        } else {
+            Ok(Some(best))
+        }
+    }
+
     async fn evaluate_profit(
         &self,
         snapshot: &GraphSnapshot,
@@ -201,6 +308,13 @@ impl Router {
         if gross_profit_raw <= 0 {
             return Ok(None);
         }
+        let search_flash_fee_raw =
+            estimated_full_flash_fee_raw(snapshot, candidate, input_amount, flash_premium_ppm);
+        let expected_profit =
+            gross_profit_raw.saturating_sub(u128_to_i128_saturating(search_flash_fee_raw));
+        if expected_profit <= 0 {
+            return Ok(None);
+        }
 
         // Capital selection owns flash-fee accounting because self-funded and
         // mixed routes only pay premium on the borrowed shortfall.
@@ -212,8 +326,8 @@ impl Router {
             output_amount: next_amount,
             gross_profit_raw,
             flash_premium_ppm,
-            flash_fee_raw: 0,
-            net_profit_before_gas_raw: gross_profit_raw,
+            flash_fee_raw: search_flash_fee_raw,
+            net_profit_before_gas_raw: expected_profit,
             contract_min_profit_raw: 0, // Set later in validator
             input_value_usd_e8: 0,      // Calculated later in validator
             flash_loan_value_usd_e8: 0,
@@ -222,7 +336,7 @@ impl Router {
             actual_flash_fee_usd_e8: 0,
             gas_cost_usd_e8: 0,
             net_profit_usd_e8: 0,
-            expected_profit: gross_profit_raw,
+            expected_profit,
             gas_limit: rough_gas_limit,
             gas_cost_wei: alloy::primitives::U256::ZERO,
             capital_source: CapitalSource::SelfFunded,
@@ -231,6 +345,29 @@ impl Router {
             hops,
         }))
     }
+}
+
+fn estimated_full_flash_fee_raw(
+    snapshot: &GraphSnapshot,
+    candidate: &CandidatePath,
+    input_amount: u128,
+    flash_premium_ppm: u128,
+) -> u128 {
+    let assumes_full_flash_loan = snapshot
+        .token_index(candidate.start_token)
+        .and_then(|idx| snapshot.tokens.get(idx))
+        .map(|token| token.flash_loan_enabled && !token.allow_self_funded)
+        .unwrap_or(false);
+
+    if assumes_full_flash_loan {
+        input_amount.saturating_mul(flash_premium_ppm) / 1_000_000
+    } else {
+        0
+    }
+}
+
+fn u128_to_i128_saturating(value: u128) -> i128 {
+    i128::try_from(value).unwrap_or(i128::MAX)
 }
 
 fn better_plan(current: Option<ExactPlan>, next: ExactPlan) -> Option<ExactPlan> {
@@ -285,4 +422,68 @@ fn estimate_gas_limit(candidate: &CandidatePath, hops: &[HopPlan]) -> u64 {
             .saturating_add(split_count.saturating_sub(1) * 30_000);
     }
     gas
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use alloy::primitives::Address;
+    use smallvec::SmallVec;
+
+    use crate::{
+        graph::GraphSnapshot,
+        types::{CandidatePath, TokenBehavior, TokenInfo},
+    };
+
+    use super::estimated_full_flash_fee_raw;
+
+    fn addr(byte: u8) -> Address {
+        Address::from_slice(&[byte; 20])
+    }
+
+    fn token(flash_loan_enabled: bool, allow_self_funded: bool) -> TokenInfo {
+        TokenInfo {
+            address: addr(1),
+            symbol: "USDC".to_string(),
+            decimals: 6,
+            is_stable: true,
+            is_cycle_anchor: flash_loan_enabled,
+            flash_loan_enabled,
+            allow_self_funded,
+            behavior: TokenBehavior::default(),
+            manual_price_usd_e8: Some(100_000_000),
+            max_position_usd_e8: None,
+            max_flash_loan_usd_e8: None,
+        }
+    }
+
+    fn candidate() -> CandidatePath {
+        CandidatePath {
+            snapshot_id: 1,
+            start_token: addr(1),
+            start_symbol: "USDC".to_string(),
+            screening_score_q32: 0,
+            cycle_key: "cycle".to_string(),
+            path: SmallVec::new(),
+        }
+    }
+
+    #[test]
+    fn search_objective_charges_fee_for_full_flash_loan_entry() {
+        let snapshot = GraphSnapshot::build(1, None, vec![token(true, false)], HashMap::new());
+
+        let fee = estimated_full_flash_fee_raw(&snapshot, &candidate(), 1_000_000, 500);
+
+        assert_eq!(fee, 500);
+    }
+
+    #[test]
+    fn search_objective_keeps_self_funded_entries_fee_neutral() {
+        let snapshot = GraphSnapshot::build(1, None, vec![token(true, true)], HashMap::new());
+
+        let fee = estimated_full_flash_fee_raw(&snapshot, &candidate(), 1_000_000, 500);
+
+        assert_eq!(fee, 0);
+    }
 }

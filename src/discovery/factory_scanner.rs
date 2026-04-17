@@ -1,4 +1,4 @@
-use std::{collections::HashMap, fs, sync::Arc};
+use std::{collections::HashMap, fs, sync::Arc, time::Duration};
 
 use alloy::{
     primitives::{keccak256, Address, B256, U256},
@@ -6,7 +6,7 @@ use alloy::{
 };
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use tracing::warn;
+use tracing::{info, warn};
 
 use crate::{
     abi::{ICurveRegistry, IUniswapV2Factory},
@@ -48,6 +48,12 @@ impl FactoryScanner {
             .unwrap_or_else(|_| DiscoveryCache::new(self.settings.chain_id));
         let mut pools = Vec::new();
         for dex in self.settings.dexes.iter().filter(|dex| dex.enabled) {
+            info!(
+                dex = %dex.name,
+                discovery = ?dex.discovery_kind,
+                latest,
+                "starting dex discovery"
+            );
             let cached = cache.dexes.remove(&dex.name);
             let (mut part, next_cursor) = match dex.discovery_kind {
                 DiscoveryKind::FactoryAllPairs => {
@@ -71,9 +77,14 @@ impl FactoryScanner {
                 dex.name.clone(),
                 CachedDexScan::from_scan(dex, latest, next_cursor, &part),
             );
+            cache.save(&self.settings).ok();
+            info!(
+                dex = %dex.name,
+                pools = part.len(),
+                "dex discovery complete"
+            );
             pools.append(&mut part);
         }
-        cache.save(&self.settings).ok();
         Ok(pools)
     }
 
@@ -131,6 +142,12 @@ impl FactoryScanner {
         let ret = IUniswapV2Factory::allPairsLengthCall::abi_decode_returns(&raw)
             .context("decode allPairsLength failed")?;
         let len = u256_to_u64(ret);
+        info!(
+            dex = %dex.name,
+            factory = %factory,
+            total_pairs = len,
+            "v2 factory pair count loaded"
+        );
 
         let mut pools = cached_pools(cached, dex);
         let start = cached
@@ -333,11 +350,14 @@ impl FactoryScanner {
 
         // Apply chain-aware limits
         chunk_blocks = adapt_log_chunk_size(self.settings.chain, &provider_mode, chunk_blocks);
+        let base_chunk_blocks = chunk_blocks;
+        let min_chunk_blocks = log_min_chunk_blocks().min(base_chunk_blocks).max(1);
+        let max_retries = log_max_retries();
 
         let mut all = Vec::new();
         let mut start = from_block;
-        let mut retry_count = 0;
-        const MAX_RETRIES: usize = 3;
+        let mut retry_count = 0_usize;
+        let mut chunk_count = 0_u64;
 
         while start <= to_block {
             let end = start.saturating_add(chunk_blocks - 1).min(to_block);
@@ -348,27 +368,53 @@ impl FactoryScanner {
                 .await
             {
                 Ok(mut logs) => {
+                    let logs_found = logs.len();
                     all.append(&mut logs);
                     retry_count = 0; // Reset retry count on success
+                    chunk_count += 1;
+                    if chunk_count % 100 == 0 || end == to_block {
+                        info!(
+                            from_block = start,
+                            to_block = end,
+                            next_block = end.saturating_add(1),
+                            chunk_blocks,
+                            logs_found,
+                            total_logs = all.len(),
+                            "log scan progress"
+                        );
+                    }
                     if end == u64::MAX {
                         break;
                     }
                     start = end.saturating_add(1);
+                    if chunk_blocks < base_chunk_blocks {
+                        chunk_blocks = chunk_blocks.saturating_mul(2).min(base_chunk_blocks);
+                    }
                 }
                 Err(e) => {
                     let error_msg = e.to_string();
-                    if should_reduce_chunk_size(&error_msg) && retry_count < MAX_RETRIES {
+                    let can_reduce = chunk_blocks > min_chunk_blocks;
+                    if retry_count < max_retries
+                        && (should_reduce_chunk_size(&error_msg) || can_reduce)
+                    {
+                        let next_chunk_size = if can_reduce {
+                            chunk_blocks.saturating_div(2).max(min_chunk_blocks)
+                        } else {
+                            chunk_blocks
+                        };
                         warn!(
                             %error_msg,
+                            from_block = start,
+                            to_block = end,
                             chunk_size = chunk_blocks,
+                            next_chunk_size,
                             retry = retry_count,
                             "log query failed, reducing chunk size and retrying"
                         );
-                        chunk_blocks /= 2; // Halve the chunk size
-                        if chunk_blocks == 0 {
-                            chunk_blocks = 1; // Ensure at least 1 block per chunk
-                        }
+                        chunk_blocks = next_chunk_size;
                         retry_count += 1;
+                        let backoff_ms = (250_u64).saturating_mul(retry_count as u64).min(2_000);
+                        tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
                         continue; // Retry with smaller chunk
                     } else {
                         // Either not a chunk size issue or max retries exceeded
@@ -392,6 +438,7 @@ impl FactoryScanner {
         let mut out = Vec::new();
         let chunk_size = multicall_chunk_size();
         let mut idx = start;
+        let mut chunk_count = 0_u64;
         while idx < len {
             let end = idx.saturating_add(chunk_size).min(len);
             let calls = (idx..end)
@@ -413,6 +460,16 @@ impl FactoryScanner {
                 );
             }
             idx = end;
+            chunk_count += 1;
+            if chunk_count % 100 == 0 || idx == len {
+                info!(
+                    factory = %factory,
+                    scanned = idx,
+                    total = len,
+                    discovered = out.len(),
+                    "v2 allPairs scan progress"
+                );
+            }
         }
         Ok(out)
     }
@@ -660,4 +717,20 @@ fn multicall_disabled() -> bool {
     std::env::var("DISABLE_MULTICALL")
         .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
         .unwrap_or(false)
+}
+
+fn log_min_chunk_blocks() -> u64 {
+    std::env::var("DISCOVERY_LOG_MIN_CHUNK_BLOCKS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(100)
+}
+
+fn log_max_retries() -> usize {
+    std::env::var("DISCOVERY_LOG_MAX_RETRIES")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(12)
 }

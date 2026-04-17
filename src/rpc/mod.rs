@@ -672,7 +672,7 @@ pub fn rpc_compute_units(method: &str) -> u64 {
 /// Get chain-aware eth_getLogs maximum block range for Pay As You Go
 pub fn max_log_range_for_chain(chain: Chain) -> u64 {
     match chain {
-        Chain::Base => 50_000,   // Base has broader ranges, but cap at response size
+        Chain::Base => 10_000, // Alchemy Base eth_getLogs is capped at 10,000 blocks.
         Chain::Polygon => 2_000, // Polygon Pay As You Go limited to 2000 blocks
     }
 }
@@ -704,8 +704,12 @@ pub fn should_reduce_chunk_size(error: &str) -> bool {
     error_lower.contains("query returned more than")
         || error_lower.contains("exceeds range limit")
         || error_lower.contains("block range too large")
+        || error_lower.contains("payload too large")
+        || error_lower.contains("limited to a 10,000 range")
         || error_lower.contains("too many results")
         || error_lower.contains("timeout")
+        || error_lower.contains("timed out")
+        || error_lower.contains("413")
 }
 
 async fn acquire_rpc_budget(method: &str) {

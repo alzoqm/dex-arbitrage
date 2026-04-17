@@ -648,7 +648,11 @@ fn validate_dex_configs(dexes: &[DexConfig]) -> Result<()> {
 }
 
 fn env_req(key: &str) -> Result<String> {
-    env::var(key).with_context(|| format!("required env missing: {key}"))
+    let value = env::var(key).with_context(|| format!("required env missing: {key}"))?;
+    if is_unset_marker(&value) {
+        anyhow::bail!("required env unset: {key}");
+    }
+    Ok(value)
 }
 
 fn env_or(key: &str, default: &str) -> String {
@@ -656,7 +660,12 @@ fn env_or(key: &str, default: &str) -> String {
 }
 
 fn env_opt(key: &str) -> Option<String> {
-    env::var(key).ok().filter(|v| !v.trim().is_empty())
+    env::var(key).ok().filter(|v| !is_unset_marker(v))
+}
+
+fn is_unset_marker(value: &str) -> bool {
+    let trimmed = value.trim().trim_matches('"');
+    trimmed.is_empty() || trimmed.contains("확인 필요") || trimmed.contains("추가 세팅 필요")
 }
 
 fn env_opt_u64(key: &str) -> Option<u64> {
@@ -698,4 +707,25 @@ fn env_bool(key: &str, default: bool) -> bool {
     env_opt(key)
         .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
         .unwrap_or(default)
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn env_opt_treats_setup_markers_as_unset() {
+        let key = "DEX_ARB_TEST_SETUP_MARKER";
+        std::env::set_var(key, "추가 세팅 필요");
+        assert_eq!(super::env_opt(key), None);
+
+        std::env::set_var(key, "\"확인 필요\"");
+        assert_eq!(super::env_opt(key), None);
+
+        std::env::set_var(key, "0x0000000000000000000000000000000000000001");
+        assert_eq!(
+            super::env_opt(key),
+            Some("0x0000000000000000000000000000000000000001".to_string())
+        );
+
+        std::env::remove_var(key);
+    }
 }

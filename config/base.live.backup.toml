@@ -1,15 +1,15 @@
 
-chain = "polygon"
-chain_id = 137
-native_symbol = "POL"
+chain = "base"
+chain_id = 8453
+native_symbol = "ETH"
 max_hops = 5
 screening_margin_bps = 3
-min_net_profit_default = 150000
+min_net_profit_default = 100000
 poll_interval_ms = 400
 event_backfill_blocks = 32
 staleness_timeout_ms = 120000
 gas_risk_buffer_pct = 0.15
-gas_price_ceiling_wei = 200000000000
+gas_price_ceiling_wei = 3000000000
 max_position_default = 2000000000
 max_flash_loan_default = 10000000000
 daily_loss_limit_default = -50000000
@@ -18,8 +18,8 @@ stable_depeg_cutoff_e6 = 995000
 strict_target_allowlist = true
 
 [policy]
-venues = ["uniswap_v3"]
-symbols = ["USDC", "USDT", "WMATIC", "WETH", "DAI"]
+venues = ["uniswap_v2", "sushiswap_v2", "baseswap_v2", "uniswap_v3", "curve", "balancer"]
+symbols = []
 
 [search]
 top_k_paths_per_side = 12
@@ -31,75 +31,91 @@ max_split_parallel_pools = 5
 
 [[tokens]]
 symbol = "USDC"
-address_env = "POLYGON_USDC"
+address_env = "BASE_USDC"
 decimals = 6
 is_stable = true
-price_env = "POLYGON_USDC_PRICE_E8"
+is_cycle_anchor = false
+allow_self_funded = false
+price_env = "BASE_USDC_PRICE_E8"
 
 [[tokens]]
 symbol = "USDT"
-address_env = "POLYGON_USDT"
+address_env = "BASE_USDT"
 decimals = 6
 is_stable = true
-price_env = "POLYGON_USDT_PRICE_E8"
-
-[[tokens]]
-symbol = "WMATIC"
-address_env = "POLYGON_WMATIC"
-decimals = 18
-is_stable = false
+is_cycle_anchor = false
 allow_self_funded = false
-price_env = "POLYGON_WMATIC_PRICE_E8"
+price_env = "BASE_USDT_PRICE_E8"
 
 [[tokens]]
 symbol = "WETH"
-address_env = "POLYGON_WETH"
+address_env = "BASE_WETH"
 decimals = 18
 is_stable = false
 allow_self_funded = false
-price_env = "POLYGON_WETH_PRICE_E8"
+price_env = "BASE_WETH_PRICE_E8"
 
 [[tokens]]
 symbol = "DAI"
-address_env = "POLYGON_DAI"
+address_env = "BASE_DAI"
 decimals = 18
 is_stable = false
 allow_self_funded = false
-price_env = "POLYGON_DAI_PRICE_E8"
+price_env = "BASE_DAI_PRICE_E8"
+
+[[tokens]]
+symbol = "cbETH"
+address_env = "BASE_CBETH"
+decimals = 18
+is_stable = false
+allow_self_funded = false
+price_env = ""
 
 [[dexes]]
 name = "uniswap_v2"
 amm = "uniswap_v2_like"
 discovery = "factory_all_pairs"
-factory_env = "POLYGON_UNISWAP_V2_FACTORY"
+factory_env = "BASE_UNISWAP_V2_FACTORY"
 quoter_env = ""
 registry_env = ""
 vault_env = ""
 fee_ppm = 3000
-start_block = 0
-enabled = false
-
-[[dexes]]
-name = "quickswap_v2"
-amm = "uniswap_v2_like"
-discovery = "factory_all_pairs"
-factory_env = "POLYGON_QUICKSWAP_V2_FACTORY"
-quoter_env = ""
-registry_env = ""
-vault_env = ""
-fee_ppm = 3000
-start_block = 0
-enabled = false
+start_block = 6601915
+enabled = true
 
 [[dexes]]
 name = "sushiswap_v2"
 amm = "uniswap_v2_like"
 discovery = "factory_all_pairs"
-factory_env = "POLYGON_SUSHISWAP_V2_FACTORY"
+factory_env = "BASE_SUSHISWAP_V2_FACTORY"
 quoter_env = ""
 registry_env = ""
 vault_env = ""
 fee_ppm = 3000
+start_block = 2631214
+enabled = true
+
+[[dexes]]
+name = "baseswap_v2"
+amm = "uniswap_v2_like"
+discovery = "factory_all_pairs"
+factory_env = "BASE_BASESWAP_FACTORY"
+quoter_env = ""
+registry_env = ""
+vault_env = ""
+fee_ppm = 2500
+start_block = 2059124
+enabled = true
+
+[[dexes]]
+name = "aerodrome_v2"
+amm = "uniswap_v2_like"
+discovery = "factory_all_pairs"
+factory_env = "BASE_AERODROME_V2_FACTORY"
+quoter_env = ""
+registry_env = ""
+vault_env = ""
+fee_ppm = 2000
 start_block = 0
 enabled = false
 
@@ -107,20 +123,20 @@ enabled = false
 name = "uniswap_v3"
 amm = "uniswap_v3_like"
 discovery = "pool_created_logs"
-factory_env = "POLYGON_UNISWAP_V3_FACTORY"
-quoter_env = "POLYGON_UNISWAP_V3_QUOTER"
+factory_env = "BASE_UNISWAP_V3_FACTORY"
+quoter_env = "BASE_UNISWAP_V3_QUOTER"
 registry_env = ""
 vault_env = ""
 fee_ppm = 0
-start_block = 22757547
+start_block = 1371680
 enabled = true
 
 [[dexes]]
-name = "quickswap_v3"
+name = "aerodrome_v3"
 amm = "uniswap_v3_like"
 discovery = "pool_created_logs"
-factory_env = "POLYGON_QUICKSWAP_V3_FACTORY"
-quoter_env = "POLYGON_QUICKSWAP_V3_QUOTER"
+factory_env = "BASE_AERODROME_V3_FACTORY"
+quoter_env = "BASE_AERODROME_V3_QUOTER"
 registry_env = ""
 vault_env = ""
 fee_ppm = 0
@@ -133,11 +149,11 @@ amm = "curve_plain"
 discovery = "curve_registry"
 factory_env = ""
 quoter_env = ""
-registry_env = "POLYGON_CURVE_REGISTRY"
+registry_env = "BASE_CURVE_REGISTRY"
 vault_env = ""
 fee_ppm = 0
-start_block = 0
-enabled = false
+start_block = 14591073
+enabled = true
 
 [[dexes]]
 name = "balancer"
@@ -146,7 +162,7 @@ discovery = "balancer_vault_logs"
 factory_env = ""
 quoter_env = ""
 registry_env = ""
-vault_env = "POLYGON_BALANCER_VAULT"
+vault_env = "BASE_BALANCER_VAULT"
 fee_ppm = 0
-start_block = 0
-enabled = false
+start_block = 1196036
+enabled = true
