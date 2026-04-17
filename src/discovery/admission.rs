@@ -20,16 +20,31 @@ impl AdmissionEngine {
     }
 
     pub fn admit(&self, pool: &PoolState) -> bool {
-        if pool.token_addresses.len() < 2 {
-            return false;
-        }
-        if matches!(pool.admission_status, PoolAdmissionStatus::Excluded) {
+        if !self.pool_has_admissible_shape(pool) {
             return false;
         }
         if !pool
             .health
             .healthy(self.min_confidence_bps, self.staleness_timeout)
         {
+            return false;
+        }
+
+        true
+    }
+
+    pub fn should_refresh_cached(&self, pool: &PoolState) -> bool {
+        self.pool_has_admissible_shape(pool)
+            && !pool.health.paused
+            && !pool.health.quarantined
+            && pool.health.confidence_bps >= self.min_confidence_bps
+    }
+
+    fn pool_has_admissible_shape(&self, pool: &PoolState) -> bool {
+        if pool.token_addresses.len() < 2 {
+            return false;
+        }
+        if matches!(pool.admission_status, PoolAdmissionStatus::Excluded) {
             return false;
         }
         if !has_usable_liquidity(pool) {
@@ -145,6 +160,10 @@ mod tests {
         assert!(!engine.admit(&low_confidence_pool));
         assert!(!engine.admit(&stale_pool));
         assert!(!engine.admit(&zero_reserve_pool));
+
+        assert!(engine.should_refresh_cached(&stale_pool));
+        assert!(!engine.should_refresh_cached(&low_confidence_pool));
+        assert!(!engine.should_refresh_cached(&zero_reserve_pool));
     }
 
     fn test_settings(pool_health_min_bps: u16, staleness_timeout_ms: u64) -> Settings {

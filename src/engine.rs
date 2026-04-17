@@ -73,7 +73,12 @@ pub async fn run_chain(
     if let Some(block_ref) = initial_snapshot.block_ref.clone() {
         reorg_detector.update_chain(block_ref).ok();
     }
-    let initial_changed_edges = all_edge_refs(initial_snapshot.as_ref());
+    let initial_changed_edges = initial_edge_refs(initial_snapshot.as_ref());
+    info!(
+        selected_edges = initial_changed_edges.len(),
+        total_edges = total_edge_count(initial_snapshot.as_ref()),
+        "initial refresh edge set selected"
+    );
     process_refresh(
         settings.clone(),
         initial_snapshot,
@@ -467,6 +472,49 @@ fn all_edge_refs(snapshot: &GraphSnapshot) -> Vec<EdgeRef> {
         .enumerate()
         .flat_map(|(from, edges)| (0..edges.len()).map(move |edge_idx| EdgeRef { from, edge_idx }))
         .collect()
+}
+
+fn initial_edge_refs(snapshot: &GraphSnapshot) -> Vec<EdgeRef> {
+    let mut refs = all_edge_refs(snapshot);
+    refs.sort_by(|left, right| {
+        let left_edge = snapshot.edge(*left);
+        let right_edge = snapshot.edge(*right);
+        match (left_edge, right_edge) {
+            (Some(left_edge), Some(right_edge)) => left_edge
+                .weight_log_q32
+                .cmp(&right_edge.weight_log_q32)
+                .then_with(|| {
+                    right_edge
+                        .pool_health
+                        .confidence_bps
+                        .cmp(&left_edge.pool_health.confidence_bps)
+                })
+                .then_with(|| {
+                    right_edge
+                        .liquidity
+                        .safe_capacity_in
+                        .cmp(&left_edge.liquidity.safe_capacity_in)
+                }),
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (None, None) => std::cmp::Ordering::Equal,
+        }
+    });
+    if let Some(limit) = initial_refresh_max_edges() {
+        refs.truncate(limit);
+    }
+    refs
+}
+
+fn total_edge_count(snapshot: &GraphSnapshot) -> usize {
+    snapshot.adjacency.iter().map(Vec::len).sum()
+}
+
+fn initial_refresh_max_edges() -> Option<usize> {
+    std::env::var("INITIAL_REFRESH_MAX_EDGES")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .and_then(|value| (value > 0).then_some(value))
 }
 
 fn collect_changed_specs(snapshot: &GraphSnapshot, batch: &RefreshBatch) -> Vec<DiscoveredPool> {

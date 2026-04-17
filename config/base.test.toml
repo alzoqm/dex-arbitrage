@@ -45,7 +45,7 @@ daily_loss_limit_usd_e8 = 500000000
 # Faster test loop, still not a narrowed symbol/venue scope.
 poll_interval_ms = 800
 event_backfill_blocks = 32
-staleness_timeout_ms = 120000
+staleness_timeout_ms = 900000
 
 # Conservative gas/risk bounds for Base tests.
 gas_risk_buffer_pct = 0.20
@@ -62,7 +62,7 @@ symbols = []
 top_k_paths_per_side = 12
 max_virtual_branches_per_node = 32
 path_beam_width = 192
-max_candidates_per_refresh = 1024
+max_candidates_per_refresh = 64
 max_pair_edges_per_pair = 4
 max_split_parallel_pools = 5
 

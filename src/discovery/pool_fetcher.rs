@@ -65,7 +65,7 @@ impl PoolFetcher {
         spec: &DiscoveredPool,
         block_number: Option<u64>,
     ) -> Result<Option<PoolState>> {
-        let max_retries = pool_fetch_max_retries();
+        let max_retries = pool_fetch_max_retries_for_kind(spec.amm_kind);
         let base_delay_ms = pool_fetch_retry_base_delay_ms();
         let mut attempt = 0usize;
 
@@ -998,6 +998,16 @@ fn pool_fetch_max_retries() -> usize {
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
         .unwrap_or(5)
+}
+
+fn pool_fetch_max_retries_for_kind(kind: AmmKind) -> usize {
+    if matches!(kind, AmmKind::UniswapV2Like | AmmKind::UniswapV3Like) {
+        return pool_fetch_max_retries();
+    }
+    std::env::var("POOL_FETCH_OTHER_MAX_RETRIES")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(0)
 }
 
 fn pool_fetch_retry_base_delay_ms() -> u64 {

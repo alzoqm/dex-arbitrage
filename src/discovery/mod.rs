@@ -82,34 +82,53 @@ impl DiscoveryManager {
     }
 
     pub async fn bootstrap(&self) -> Result<DiscoveryOutput> {
+        let flash_reserves = self.aave_flash_reserves().await?;
         let discovered = self.scanner.scan_all().await?;
         let mut pools = HashMap::new();
-        let (mut cached_pools, mut skipped_pool_cache) = if pool_state_cache_disabled() {
-            (HashMap::new(), HashMap::new())
-        } else {
-            PoolStateCache::load(&self.settings)
-                .ok()
-                .map(|cache| {
-                    let pools = cache
-                        .pools
-                        .into_iter()
-                        .map(|pool| (pool.pool_id, pool))
-                        .collect::<HashMap<_, _>>();
-                    let skipped = cache
-                        .skipped_pools
-                        .into_iter()
-                        .filter(skipped_pool_cache_entry_active)
-                        .map(|entry| (entry.spec.address, entry))
-                        .collect::<HashMap<_, _>>();
-                    (pools, skipped)
-                })
-                .unwrap_or_default()
-        };
+        let (mut cached_pools, mut skipped_pool_cache, pool_state_cache_loaded) =
+            if pool_state_cache_disabled() {
+                (HashMap::new(), HashMap::new(), false)
+            } else {
+                match PoolStateCache::load(&self.settings) {
+                    Ok(cache) => {
+                        info!(
+                            pools = cache.pools.len(),
+                            skipped_pools = cache.skipped_pools.len(),
+                            "pool state cache loaded"
+                        );
+                        let pools = cache
+                            .pools
+                            .into_iter()
+                            .map(|pool| (pool.pool_id, pool))
+                            .collect::<HashMap<_, _>>();
+                        let skipped = cache
+                            .skipped_pools
+                            .into_iter()
+                            .filter(skipped_pool_cache_entry_active)
+                            .map(|entry| (entry.spec.address, entry))
+                            .collect::<HashMap<_, _>>();
+                        (pools, skipped, true)
+                    }
+                    Err(err) => {
+                        warn!(
+                            error = %err,
+                            "pool state cache load failed; falling back to full fetch"
+                        );
+                        (HashMap::new(), HashMap::new(), false)
+                    }
+                }
+            };
+        let fetch_unseen_pools = fetch_unseen_pools_on_bootstrap() || !pool_state_cache_loaded;
+        let save_intermediate_checkpoints = fetch_unseen_pools || !pool_state_cache_loaded;
+        let cached_pool_count = cached_pools.len();
+        let active_skipped_pool_count = skipped_pool_cache.len();
 
         let mut v2_to_fetch = Vec::new();
         let mut v3_to_fetch = Vec::new();
         let mut other_to_fetch = Vec::new();
         let mut skipped_cache_hits = 0usize;
+        let mut stale_cached_to_refresh = 0usize;
+        let mut unseen_pool_skips = 0usize;
         for spec in discovered {
             let cached = cached_pools
                 .remove(&spec.address)
@@ -117,6 +136,14 @@ impl DiscoveryManager {
             if let Some(pool) = cached {
                 if self.admission.admit(&pool) {
                     pools.insert(pool.pool_id, pool);
+                } else if self.admission.should_refresh_cached(&pool) {
+                    stale_cached_to_refresh += 1;
+                    push_fetch_spec(
+                        &mut v2_to_fetch,
+                        &mut v3_to_fetch,
+                        &mut other_to_fetch,
+                        spec,
+                    );
                 }
                 continue;
             }
@@ -129,19 +156,37 @@ impl DiscoveryManager {
                 skipped_pool_cache.remove(&spec.address);
             }
 
-            match spec.amm_kind {
-                AmmKind::UniswapV2Like => v2_to_fetch.push(spec),
-                AmmKind::UniswapV3Like => v3_to_fetch.push(spec),
-                _ => other_to_fetch.push(spec),
+            if !fetch_unseen_pools && is_high_cardinality_pool_kind(spec.amm_kind) {
+                unseen_pool_skips += 1;
+                continue;
             }
+
+            push_fetch_spec(
+                &mut v2_to_fetch,
+                &mut v3_to_fetch,
+                &mut other_to_fetch,
+                spec,
+            );
+        }
+
+        if pool_state_cache_loaded && !fetch_unseen_pools && unseen_pool_skips > 0 {
+            info!(
+                unseen_pool_skips,
+                cached_pool_count,
+                active_skipped_pool_count,
+                "skipping unseen discovered pools during cached bootstrap"
+            );
         }
 
         info!(
             cached = pools.len(),
+            stale_cached_to_refresh,
             v2_to_fetch = v2_to_fetch.len(),
             v3_to_fetch = v3_to_fetch.len(),
             other_to_fetch = other_to_fetch.len(),
             skipped_cache_hits,
+            unseen_pool_skips,
+            fetch_unseen_pools,
             "pool state fetch plan built"
         );
 
@@ -155,7 +200,7 @@ impl DiscoveryManager {
                 pools.insert(pool.pool_id, pool);
             }
         }
-        if !v2_to_fetch.is_empty() {
+        if !v2_to_fetch.is_empty() && save_intermediate_checkpoints {
             self.save_pool_state_checkpoint(&pools, &skipped_pool_cache, "v2");
         }
 
@@ -169,7 +214,7 @@ impl DiscoveryManager {
                 pools.insert(pool.pool_id, pool);
             }
         }
-        if !v3_to_fetch.is_empty() {
+        if !v3_to_fetch.is_empty() && save_intermediate_checkpoints {
             self.save_pool_state_checkpoint(&pools, &skipped_pool_cache, "v3");
         }
 
@@ -220,7 +265,7 @@ impl DiscoveryManager {
             self.save_pool_state_checkpoint(&pools, &skipped_pool_cache, "post_fetch");
         }
 
-        let mut tokens = self.discover_tokens(&pools).await?;
+        let mut tokens = self.discover_tokens(&pools, &flash_reserves).await?;
         derive_missing_prices_from_pools(&mut tokens, &pools);
 
         let latest = self.scanner.latest_block().await.unwrap_or(0);
@@ -338,12 +383,15 @@ impl DiscoveryManager {
             .collect()
     }
 
-    async fn discover_tokens(&self, pools: &HashMap<Address, PoolState>) -> Result<Vec<TokenInfo>> {
+    async fn discover_tokens(
+        &self,
+        pools: &HashMap<Address, PoolState>,
+        flash_reserves: &HashMap<Address, ()>,
+    ) -> Result<Vec<TokenInfo>> {
         let mut tokens = self.configured_tokens();
-        let flash_reserves = self.aave_flash_reserves().await?;
-        self.extend_tokens_with_discovered(&mut tokens, pools.values(), &flash_reserves)
+        self.extend_tokens_with_discovered(&mut tokens, pools.values(), flash_reserves)
             .await?;
-        apply_aave_flash_reserves(&mut tokens, &flash_reserves);
+        apply_aave_flash_reserves(&mut tokens, flash_reserves);
         Ok(tokens)
     }
 
@@ -553,15 +601,29 @@ impl DiscoveryManager {
                     let Some(raw) = raw else {
                         continue;
                     };
-                    let config = IAavePool::getConfigurationCall::abi_decode_returns(&raw)?;
+                    let config = match IAavePool::getConfigurationCall::abi_decode_returns(&raw) {
+                        Ok(config) => config,
+                        Err(err) => {
+                            warn!(
+                                asset = %asset,
+                                error = %err,
+                                "skipping undecodable Aave reserve configuration"
+                            );
+                            continue;
+                        }
+                    };
                     if reserve_accepts_flash_loan(config.data) {
                         out.insert(asset, ());
                     }
                 }
             }
-            Err(_) => {
+            Err(err) => {
+                warn!(
+                    error = %err,
+                    "Aave reserve multicall failed; falling back to per-reserve calls"
+                );
                 for asset in reserves {
-                    let raw = self
+                    let raw = match self
                         .rpc
                         .best_read()
                         .eth_call(
@@ -572,8 +634,29 @@ impl DiscoveryManager {
                                 .into(),
                             "latest",
                         )
-                        .await?;
-                    let config = IAavePool::getConfigurationCall::abi_decode_returns(&raw)?;
+                        .await
+                    {
+                        Ok(raw) => raw,
+                        Err(err) => {
+                            warn!(
+                                asset = %asset,
+                                error = %err,
+                                "skipping Aave reserve after configuration eth_call failure"
+                            );
+                            continue;
+                        }
+                    };
+                    let config = match IAavePool::getConfigurationCall::abi_decode_returns(&raw) {
+                        Ok(config) => config,
+                        Err(err) => {
+                            warn!(
+                                asset = %asset,
+                                error = %err,
+                                "skipping undecodable Aave reserve configuration"
+                            );
+                            continue;
+                        }
+                    };
                     if reserve_accepts_flash_loan(config.data) {
                         out.insert(asset, ());
                     }
@@ -961,6 +1044,23 @@ fn insert_skipped_pool_reason(
     );
 }
 
+fn push_fetch_spec(
+    v2_to_fetch: &mut Vec<DiscoveredPool>,
+    v3_to_fetch: &mut Vec<DiscoveredPool>,
+    other_to_fetch: &mut Vec<DiscoveredPool>,
+    spec: DiscoveredPool,
+) {
+    match spec.amm_kind {
+        AmmKind::UniswapV2Like => v2_to_fetch.push(spec),
+        AmmKind::UniswapV3Like => v3_to_fetch.push(spec),
+        _ => other_to_fetch.push(spec),
+    }
+}
+
+fn is_high_cardinality_pool_kind(kind: AmmKind) -> bool {
+    matches!(kind, AmmKind::UniswapV2Like | AmmKind::UniswapV3Like)
+}
+
 fn skipped_pool_cache_entry_active(entry: &SkippedPoolCacheEntry) -> bool {
     if skipped_pool_cache_disabled() {
         return false;
@@ -971,6 +1071,12 @@ fn skipped_pool_cache_entry_active(entry: &SkippedPoolCacheEntry) -> bool {
 
 fn pool_state_cache_disabled() -> bool {
     std::env::var("DISABLE_POOL_STATE_CACHE")
+        .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+        .unwrap_or(false)
+}
+
+fn fetch_unseen_pools_on_bootstrap() -> bool {
+    std::env::var("DISCOVERY_FETCH_UNSEEN_POOLS")
         .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
         .unwrap_or(false)
 }
