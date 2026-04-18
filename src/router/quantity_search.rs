@@ -1,5 +1,7 @@
 use std::sync::Arc;
 
+use alloy::primitives::U256;
+
 use crate::{
     config::Settings, graph::GraphSnapshot, risk::valuation::usd_e8_to_amount, types::CandidatePath,
 };
@@ -42,7 +44,9 @@ impl QuantitySearcher {
         let token_idx = snapshot.token_index(candidate.start_token)?;
         let token = &snapshot.tokens[token_idx];
         let decimals = token.decimals;
-        let max_position_raw = self.calculate_max_position_raw(token);
+        let max_position_raw = self
+            .calculate_max_position_raw(token)
+            .min(route_start_capacity_raw(snapshot, candidate).unwrap_or(u128::MAX));
         let min_trade_raw = usd_e8_to_amount(self.settings.risk.min_trade_usd_e8, token)
             .unwrap_or(10u128.pow(decimals as u32) / 100);
 
@@ -91,5 +95,50 @@ impl QuantitySearcher {
                 self.settings.risk.max_position
             }
         }
+    }
+}
+
+fn route_start_capacity_raw(snapshot: &GraphSnapshot, candidate: &CandidatePath) -> Option<u128> {
+    if candidate.path.is_empty() {
+        return None;
+    }
+
+    let mut cumulative_rate = 1.0f64;
+    let mut max_start = f64::INFINITY;
+    for hop in &candidate.path {
+        let edge = snapshot
+            .pair_edges(hop.from, hop.to)
+            .into_iter()
+            .filter_map(|edge_ref| snapshot.edge(edge_ref))
+            .find(|edge| edge.pool_id == hop.pool_id)?;
+        if edge.liquidity.safe_capacity_in == 0 || cumulative_rate <= 0.0 {
+            return Some(0);
+        }
+
+        max_start = max_start.min(edge.liquidity.safe_capacity_in as f64 / cumulative_rate);
+        let rate = q128_to_f64(edge.spot_rate_q128);
+        if !rate.is_finite() || rate <= 0.0 {
+            return Some(0);
+        }
+        cumulative_rate *= rate;
+        if !cumulative_rate.is_finite() {
+            return Some(0);
+        }
+    }
+
+    Some(f64_to_u128(max_start))
+}
+
+fn q128_to_f64(value: U256) -> f64 {
+    value.to_string().parse::<f64>().unwrap_or(0.0) / 2f64.powi(128)
+}
+
+fn f64_to_u128(value: f64) -> u128 {
+    if !value.is_finite() || value <= 0.0 {
+        0
+    } else if value >= u128::MAX as f64 {
+        u128::MAX
+    } else {
+        value as u128
     }
 }

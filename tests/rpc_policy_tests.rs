@@ -7,7 +7,8 @@ use dex_arbitrage::{
 fn alchemy_payg_log_ranges_are_chain_capped() {
     assert_eq!(max_log_range_for_chain(Chain::Polygon), 2_000);
     assert_eq!(adapt_log_chunk_size(Chain::Polygon, "payg", 50_000), 2_000);
-    assert_eq!(adapt_log_chunk_size(Chain::Base, "payg", 100_000), 50_000);
+    assert_eq!(max_log_range_for_chain(Chain::Base), 10_000);
+    assert_eq!(adapt_log_chunk_size(Chain::Base, "payg", 100_000), 10_000);
 }
 
 #[test]

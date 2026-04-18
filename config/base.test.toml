@@ -3,7 +3,7 @@
 # This profile keeps the same supported Base venue scope as config/base.toml:
 # - symbols = [] means no configured symbol allowlist.
 # - venues include every Base venue currently supported and verified by this codebase.
-# - Aerodrome stays disabled because adapter/address/execution compatibility still needs separate verification.
+# - Aerodrome classic and Slipstream factories are enabled.
 #
 # Important: the current loader reads config/base.toml for --chain base.
 # To use these values without code changes, copy this file over config/base.toml or manually copy the
@@ -55,14 +55,15 @@ stable_depeg_cutoff_e6 = 995000
 strict_target_allowlist = true
 
 [policy]
-venues = ["uniswap_v2", "sushiswap_v2", "baseswap_v2", "uniswap_v3", "curve", "balancer"]
+venues = ["uniswap_v2", "sushiswap_v2", "baseswap_v2", "aerodrome_v2", "uniswap_v3", "aerodrome_v3_legacy", "aerodrome_v3_caps", "aerodrome_v3", "curve", "balancer"]
 symbols = []
 
 [search]
 top_k_paths_per_side = 12
 max_virtual_branches_per_node = 32
 path_beam_width = 192
-max_candidates_per_refresh = 64
+max_candidates_per_refresh = 32
+candidate_selection_buffer_multiplier = 4
 max_pair_edges_per_pair = 4
 max_split_parallel_pools = 5
 
@@ -146,15 +147,15 @@ enabled = true
 
 [[dexes]]
 name = "aerodrome_v2"
-amm = "uniswap_v2_like"
-discovery = "factory_all_pairs"
+amm = "aerodrome_v2_like"
+discovery = "solidly_factory_all_pools"
 factory_env = "BASE_AERODROME_V2_FACTORY"
 quoter_env = ""
 registry_env = ""
 vault_env = ""
-fee_ppm = 2000
-start_block = 0
-enabled = false
+fee_ppm = 3000
+start_block = 320139
+enabled = true
 
 [[dexes]]
 name = "uniswap_v3"
@@ -169,16 +170,40 @@ start_block = 1371680
 enabled = true
 
 [[dexes]]
+name = "aerodrome_v3_legacy"
+amm = "uniswap_v3_like"
+discovery = "slipstream_factory_all_pools"
+factory_env = "BASE_AERODROME_V3_LEGACY_FACTORY"
+quoter_env = "BASE_AERODROME_V3_LEGACY_QUOTER"
+registry_env = ""
+vault_env = ""
+fee_ppm = 0
+start_block = 0
+enabled = true
+
+[[dexes]]
+name = "aerodrome_v3_caps"
+amm = "uniswap_v3_like"
+discovery = "slipstream_factory_all_pools"
+factory_env = "BASE_AERODROME_V3_CAPS_FACTORY"
+quoter_env = "BASE_AERODROME_V3_CAPS_QUOTER"
+registry_env = ""
+vault_env = ""
+fee_ppm = 0
+start_block = 0
+enabled = true
+
+[[dexes]]
 name = "aerodrome_v3"
 amm = "uniswap_v3_like"
-discovery = "pool_created_logs"
+discovery = "slipstream_factory_all_pools"
 factory_env = "BASE_AERODROME_V3_FACTORY"
 quoter_env = "BASE_AERODROME_V3_QUOTER"
 registry_env = ""
 vault_env = ""
 fee_ppm = 0
 start_block = 0
-enabled = false
+enabled = true
 
 [[dexes]]
 name = "curve"

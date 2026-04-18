@@ -86,6 +86,9 @@ fn map_adapter(adapter: crate::types::AdapterType) -> IArbitrageExecutor::Adapte
         crate::types::AdapterType::BalancerWeighted => {
             IArbitrageExecutor::AdapterType::BalancerWeighted
         }
+        crate::types::AdapterType::AerodromeV2Like => {
+            IArbitrageExecutor::AdapterType::AerodromeV2Like
+        }
     }
 }
 
@@ -95,6 +98,12 @@ fn encode_extra(extra: &SplitExtra) -> Bytes {
         SplitExtra::V2 { fee_ppm } => {
             let mut out = vec![0u8; 32];
             out[28..32].copy_from_slice(&fee_ppm.to_be_bytes());
+            out.into()
+        }
+        SplitExtra::AerodromeV2 { stable, fee_ppm } => {
+            let mut out = vec![0u8; 64];
+            out[31] = u8::from(*stable);
+            out[60..64].copy_from_slice(&fee_ppm.to_be_bytes());
             out.into()
         }
         SplitExtra::V3 {

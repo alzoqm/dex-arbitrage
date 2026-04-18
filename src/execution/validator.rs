@@ -1,6 +1,6 @@
 use std::{
     sync::Arc,
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::Result;
@@ -11,12 +11,13 @@ use crate::{
     config::Settings,
     execution::{capital_selector::CapitalSelector, tx_builder::TxBuilder},
     graph::GraphSnapshot,
+    monitoring::metrics as telemetry,
     risk::{
         gas_tracker::{GasQuote, GasTracker},
         valuation::{amount_to_usd_e8, calculate_contract_min_profit_raw, native_gas_to_usd_e8},
     },
     rpc::RpcClients,
-    types::{Chain, ExactPlan, ExecutablePlan},
+    types::{CapitalSource, Chain, ExactPlan, ExecutablePlan},
 };
 
 #[derive(Debug)]
@@ -112,17 +113,35 @@ impl Validator {
         let executor = self.tx_builder.executor_address()?;
         let operator = self.capital_selector.operator_address()?;
 
-        // Step 3: Estimate gas
-        let gas_estimate = self
-            .rpc
-            .best_read()
-            .estimate_gas(executor, Some(operator), calldata.clone())
-            .await
-            .unwrap_or(plan.gas_limit);
+        // Step 3: Price gas using a conservative local limit by default. Remote
+        // estimateGas is optional because reverted candidates are expected in
+        // search and retrying them burns latency/CU before the required eth_call
+        // simulation gate.
+        let static_gas_limit = adjusted_static_gas_limit(plan.gas_limit, plan.capital_source);
+        let gas_estimate = if env_bool("USE_GAS_ESTIMATE_RPC", false) {
+            match self
+                .rpc
+                .best_read()
+                .estimate_gas(executor, Some(operator), calldata.clone())
+                .await
+            {
+                Ok(remote) => remote.max(static_gas_limit),
+                Err(err) => {
+                    warn!(
+                        error = %err,
+                        static_gas_limit,
+                        "estimateGas failed; using conservative static gas limit"
+                    );
+                    static_gas_limit
+                }
+            }
+        } else {
+            static_gas_limit
+        };
 
         let gas_quote = self
             .gas_tracker
-            .quote(&self.rpc.best_read(), gas_estimate)
+            .quote(&self.rpc.best_read(), gas_estimate, calldata.len())
             .await?;
 
         if self.gas_tracker.above_ceiling(&gas_quote) {
@@ -247,9 +266,14 @@ impl Validator {
         let calldata = self.tx_builder.build_calldata(&plan, deadline_unix)?;
 
         // Step 7: Simulation
+        let simulation_started = Instant::now();
         let simulation_ok = self
             .simulate(executor, operator, &calldata, &gas_quote)
             .await?;
+        telemetry::record_simulation_latency(
+            simulation_started.elapsed().as_secs_f64(),
+            simulation_ok,
+        );
 
         if !simulation_ok {
             warn!(
@@ -265,6 +289,8 @@ impl Validator {
         Ok(Some(ExecutablePlan {
             exact: ExactPlan {
                 gas_limit: gas_estimate,
+                gas_l2_execution_cost_wei: gas_quote.l2_execution_cost_wei,
+                gas_l1_data_fee_wei: gas_quote.l1_data_fee_wei,
                 gas_cost_wei: gas_quote.buffered_total_cost_wei,
                 ..plan
             },
@@ -449,6 +475,37 @@ impl Validator {
         let last_byte = data[data.len() - 1];
         Ok(last_byte == 1)
     }
+}
+
+fn adjusted_static_gas_limit(base: u64, capital_source: CapitalSource) -> u64 {
+    let flash_overhead = env_u64("FLASH_LOAN_GAS_OVERHEAD", 180_000);
+    let buffer_bps = env_u64("STATIC_GAS_LIMIT_BUFFER_BPS", 2_000);
+    let with_overhead = match capital_source {
+        CapitalSource::SelfFunded => base,
+        CapitalSource::FlashLoan | CapitalSource::MixedFlashLoan => {
+            base.saturating_add(flash_overhead)
+        }
+    };
+    with_overhead.saturating_mul(10_000u64.saturating_add(buffer_bps)) / 10_000
+}
+
+fn env_bool(key: &str, default: bool) -> bool {
+    std::env::var(key)
+        .ok()
+        .map(|value| {
+            matches!(
+                value.to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(default)
+}
+
+fn env_u64(key: &str, default: u64) -> u64 {
+    std::env::var(key)
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(default)
 }
 
 #[cfg(test)]

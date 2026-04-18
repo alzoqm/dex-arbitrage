@@ -288,15 +288,24 @@ fn detector_can_start_from_non_stable_cycle_anchor() {
 }
 
 #[test]
-fn detector_deduplicates_parallel_pools_by_token_cycle() {
+fn detector_preserves_parallel_pool_route_variants() {
     let (snapshot, changed_edges) = manual_parallel_snapshot(4);
     let distance_cache = DistanceCache::recompute(&snapshot);
-    let detector = Detector::new(settings());
+    let detector = Detector::new(settings_with_search(SearchSettings {
+        max_pair_edges_per_pair: 4,
+        ..SearchSettings::default()
+    }));
 
     let candidates = detector.detect(&snapshot, &changed_edges, &distance_cache);
 
-    assert_eq!(candidates.len(), 1);
-    assert_eq!(candidates[0].path.len(), 4);
+    assert!(candidates.len() > 1);
+    assert!(candidates.iter().all(|candidate| candidate.path.len() == 4));
+    assert!(candidates
+        .iter()
+        .any(|candidate| candidate.cycle_key.contains(&addr(200).to_string())));
+    assert!(candidates
+        .iter()
+        .any(|candidate| candidate.cycle_key.contains(&addr(203).to_string())));
 }
 
 #[test]

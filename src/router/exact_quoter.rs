@@ -4,14 +4,14 @@ use std::{
 };
 
 use alloy::{
-    primitives::{Uint, U160, U256},
+    primitives::{aliases::I24, Uint, U160, U256},
     sol_types::SolCall,
 };
 use anyhow::Result;
 use parking_lot::Mutex;
 
 use crate::{
-    abi::{ICurvePool, IV3QuoterV2},
+    abi::{IAerodromeCLQuoter, ICurvePool, IV3QuoterV2},
     amm,
     graph::GraphSnapshot,
     monitoring::metrics as telemetry,
@@ -40,13 +40,25 @@ struct QuoteKey {
 
 impl ExactQuoter {
     pub fn new(settings: Arc<crate::config::Settings>, rpc: Arc<RpcClients>) -> Self {
+        Self::with_v3_rpc_quoter(
+            settings.clone(),
+            rpc,
+            std::env::var("USE_V3_RPC_QUOTER")
+                .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+                .unwrap_or(false),
+        )
+    }
+
+    pub fn with_v3_rpc_quoter(
+        settings: Arc<crate::config::Settings>,
+        rpc: Arc<RpcClients>,
+        use_v3_rpc_quoter: bool,
+    ) -> Self {
         Self {
             rpc,
             quote_cache: Arc::new(Mutex::new(QuoteCache::from_env())),
             curve_underlying_support: Arc::new(Mutex::new(HashMap::new())),
-            use_v3_rpc_quoter: std::env::var("USE_V3_RPC_QUOTER")
-                .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
-                .unwrap_or(false),
+            use_v3_rpc_quoter,
             use_curve_rpc_quoter: std::env::var("USE_CURVE_RPC_QUOTER")
                 .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
                 .unwrap_or(false),
@@ -104,34 +116,44 @@ impl ExactQuoter {
                 let zero_for_one = i == 0 && j == 1;
                 amm::uniswap_v2::quote_exact_in(state, zero_for_one, amount_in).unwrap_or(0)
             }
+            PoolSpecificState::AerodromeV2Like(state) => {
+                if pool.token_addresses.len() != 2 {
+                    return Ok(0);
+                }
+                let zero_for_one = i == 0 && j == 1;
+                amm::aerodrome_v2::quote_exact_in(state, zero_for_one, amount_in).unwrap_or(0)
+            }
             PoolSpecificState::UniswapV3Like(state) => {
                 if pool.token_addresses.len() != 2 {
                     return Ok(0);
                 }
                 if self.use_v3_rpc_quoter {
                     if let Some(quoter) = pool.quoter {
-                        let raw = self
-                            .rpc
-                            .best_read()
-                            .eth_call(
-                                quoter,
-                                None,
-                                IV3QuoterV2::quoteExactInputSingleCall {
-                                    params: IV3QuoterV2::QuoteExactInputSingleParams {
-                                        tokenIn: token_in,
-                                        tokenOut: token_out,
-                                        amountIn: U256::saturating_from(amount_in),
-                                        fee: Uint::<24, 1>::saturating_from(state.fee),
-                                        sqrtPriceLimitX96: U160::ZERO,
-                                    },
-                                }
-                                .abi_encode()
-                                .into(),
-                                "latest",
-                            )
-                            .await?;
-                        let ret = IV3QuoterV2::quoteExactInputSingleCall::abi_decode_returns(&raw)?;
-                        u256_to_u128(ret.amountOut)
+                        if is_slipstream_pool(pool) {
+                            match self
+                                .quote_slipstream_v3(
+                                    quoter,
+                                    token_in,
+                                    token_out,
+                                    amount_in,
+                                    state.tick_spacing,
+                                )
+                                .await
+                            {
+                                Ok(amount) => amount,
+                                Err(err) if is_expected_quote_revert(&err) => 0,
+                                Err(err) => return Err(err),
+                            }
+                        } else {
+                            match self
+                                .quote_uniswap_v3(quoter, token_in, token_out, amount_in, state.fee)
+                                .await
+                            {
+                                Ok(amount) => amount,
+                                Err(err) if is_expected_quote_revert(&err) => 0,
+                                Err(err) => return Err(err),
+                            }
+                        }
                     } else {
                         let zero_for_one = i == 0 && j == 1;
                         amm::uniswap_v3::fallback_quote(state, zero_for_one, amount_in)
@@ -230,6 +252,73 @@ impl ExactQuoter {
         Ok(out)
     }
 
+    async fn quote_uniswap_v3(
+        &self,
+        quoter: alloy::primitives::Address,
+        token_in: alloy::primitives::Address,
+        token_out: alloy::primitives::Address,
+        amount_in: u128,
+        fee: u32,
+    ) -> Result<u128> {
+        let raw = self
+            .rpc
+            .best_read()
+            .eth_call(
+                quoter,
+                None,
+                IV3QuoterV2::quoteExactInputSingleCall {
+                    params: IV3QuoterV2::QuoteExactInputSingleParams {
+                        tokenIn: token_in,
+                        tokenOut: token_out,
+                        amountIn: U256::saturating_from(amount_in),
+                        fee: Uint::<24, 1>::saturating_from(fee),
+                        sqrtPriceLimitX96: U160::ZERO,
+                    },
+                }
+                .abi_encode()
+                .into(),
+                "latest",
+            )
+            .await?;
+        let ret = IV3QuoterV2::quoteExactInputSingleCall::abi_decode_returns(&raw)?;
+        Ok(u256_to_u128(ret.amountOut))
+    }
+
+    async fn quote_slipstream_v3(
+        &self,
+        quoter: alloy::primitives::Address,
+        token_in: alloy::primitives::Address,
+        token_out: alloy::primitives::Address,
+        amount_in: u128,
+        tick_spacing: i32,
+    ) -> Result<u128> {
+        let Ok(tick_spacing) = I24::try_from(tick_spacing) else {
+            return Ok(0);
+        };
+        let raw = self
+            .rpc
+            .best_read()
+            .eth_call(
+                quoter,
+                None,
+                IAerodromeCLQuoter::quoteExactInputSingleCall {
+                    params: IAerodromeCLQuoter::QuoteExactInputSingleParams {
+                        tokenIn: token_in,
+                        tokenOut: token_out,
+                        amountIn: U256::saturating_from(amount_in),
+                        tickSpacing: tick_spacing,
+                        sqrtPriceLimitX96: U160::ZERO,
+                    },
+                }
+                .abi_encode()
+                .into(),
+                "latest",
+            )
+            .await?;
+        let ret = IAerodromeCLQuoter::quoteExactInputSingleCall::abi_decode_returns(&raw)?;
+        Ok(u256_to_u128(ret.amountOut))
+    }
+
     fn insert_quote(&self, key: QuoteKey, value: u128) {
         self.quote_cache.lock().insert(key, value);
     }
@@ -311,6 +400,18 @@ fn env_usize(key: &str, default: usize) -> usize {
 
 fn u256_to_u128(value: alloy::primitives::U256) -> u128 {
     value.to_string().parse::<u128>().unwrap_or(u128::MAX)
+}
+
+fn is_slipstream_pool(pool: &PoolState) -> bool {
+    pool.dex_name.starts_with("aerodrome_v3")
+}
+
+fn is_expected_quote_revert(err: &anyhow::Error) -> bool {
+    let message = err.to_string().to_ascii_lowercase();
+    message.starts_with("rpc error")
+        && (message.contains("revert")
+            || message.contains("unexpected error")
+            || message.contains("too little received"))
 }
 
 #[cfg(test)]

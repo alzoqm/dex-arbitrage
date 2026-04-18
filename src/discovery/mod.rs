@@ -5,7 +5,7 @@ pub mod multicall;
 pub mod pool_fetcher;
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fs,
     sync::Arc,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -84,16 +84,20 @@ impl DiscoveryManager {
     pub async fn bootstrap(&self) -> Result<DiscoveryOutput> {
         let flash_reserves = self.aave_flash_reserves().await?;
         let discovered = self.scanner.scan_all().await?;
+        let latest_at_bootstrap = self.scanner.latest_block().await.unwrap_or(0);
+        let fetch_block_number = (latest_at_bootstrap > 0).then_some(latest_at_bootstrap);
         let mut pools = HashMap::new();
-        let (mut cached_pools, mut skipped_pool_cache, pool_state_cache_loaded) =
+        let (mut cached_pools, mut skipped_pool_cache, pool_state_cache_loaded, cache_anchor_block) =
             if pool_state_cache_disabled() {
-                (HashMap::new(), HashMap::new(), false)
+                (HashMap::new(), HashMap::new(), false, None)
             } else {
                 match PoolStateCache::load(&self.settings) {
                     Ok(cache) => {
+                        let cache_anchor_block = cache.anchor_block();
                         info!(
                             pools = cache.pools.len(),
                             skipped_pools = cache.skipped_pools.len(),
+                            cache_anchor_block,
                             "pool state cache loaded"
                         );
                         let pools = cache
@@ -107,27 +111,32 @@ impl DiscoveryManager {
                             .filter(skipped_pool_cache_entry_active)
                             .map(|entry| (entry.spec.address, entry))
                             .collect::<HashMap<_, _>>();
-                        (pools, skipped, true)
+                        (pools, skipped, true, cache_anchor_block)
                     }
                     Err(err) => {
                         warn!(
                             error = %err,
                             "pool state cache load failed; falling back to full fetch"
                         );
-                        (HashMap::new(), HashMap::new(), false)
+                        (HashMap::new(), HashMap::new(), false, None)
                     }
                 }
             };
         let fetch_unseen_pools = fetch_unseen_pools_on_bootstrap() || !pool_state_cache_loaded;
         let save_intermediate_checkpoints = fetch_unseen_pools || !pool_state_cache_loaded;
+        let replay_cached_pools = bootstrap_replay_cached_pool_states()
+            && pool_state_cache_loaded
+            && cache_anchor_block.is_some();
         let cached_pool_count = cached_pools.len();
         let active_skipped_pool_count = skipped_pool_cache.len();
 
         let mut v2_to_fetch = Vec::new();
+        let mut aerodrome_v2_to_fetch = Vec::new();
         let mut v3_to_fetch = Vec::new();
         let mut other_to_fetch = Vec::new();
         let mut skipped_cache_hits = 0usize;
         let mut stale_cached_to_refresh = 0usize;
+        let mut stale_cached_to_replay = 0usize;
         let mut unseen_pool_skips = 0usize;
         for spec in discovered {
             let cached = cached_pools
@@ -136,10 +145,17 @@ impl DiscoveryManager {
             if let Some(pool) = cached {
                 if self.admission.admit(&pool) {
                     pools.insert(pool.pool_id, pool);
+                } else if replay_cached_pools
+                    && !pool.health.stale
+                    && self.admission.should_refresh_cached(&pool)
+                {
+                    stale_cached_to_replay += 1;
+                    pools.insert(pool.pool_id, pool);
                 } else if self.admission.should_refresh_cached(&pool) {
                     stale_cached_to_refresh += 1;
                     push_fetch_spec(
                         &mut v2_to_fetch,
+                        &mut aerodrome_v2_to_fetch,
                         &mut v3_to_fetch,
                         &mut other_to_fetch,
                         spec,
@@ -149,20 +165,24 @@ impl DiscoveryManager {
             }
 
             if let Some(entry) = skipped_pool_cache.get(&spec.address) {
-                if skipped_pool_matches_spec(entry, &spec) {
+                if skipped_pool_matches_spec(entry, &spec)
+                    && skipped_pool_cache_applies_to_spec(entry, &spec)
+                {
                     skipped_cache_hits += 1;
                     continue;
                 }
                 skipped_pool_cache.remove(&spec.address);
             }
 
-            if !fetch_unseen_pools && is_high_cardinality_pool_kind(spec.amm_kind) {
+            if !fetch_unseen_pools && is_high_cardinality_pool_kind(spec.amm_kind) && !spec.priority
+            {
                 unseen_pool_skips += 1;
                 continue;
             }
 
             push_fetch_spec(
                 &mut v2_to_fetch,
+                &mut aerodrome_v2_to_fetch,
                 &mut v3_to_fetch,
                 &mut other_to_fetch,
                 spec,
@@ -181,7 +201,10 @@ impl DiscoveryManager {
         info!(
             cached = pools.len(),
             stale_cached_to_refresh,
+            stale_cached_to_replay,
+            cache_anchor_block,
             v2_to_fetch = v2_to_fetch.len(),
+            aerodrome_v2_to_fetch = aerodrome_v2_to_fetch.len(),
             v3_to_fetch = v3_to_fetch.len(),
             other_to_fetch = other_to_fetch.len(),
             skipped_cache_hits,
@@ -190,7 +213,10 @@ impl DiscoveryManager {
             "pool state fetch plan built"
         );
 
-        let v2_batch = self.fetcher.fetch_v2_batch(&v2_to_fetch, None).await?;
+        let v2_batch = self
+            .fetcher
+            .fetch_v2_batch(&v2_to_fetch, fetch_block_number)
+            .await?;
         for skipped in v2_batch.skipped {
             insert_skipped_pool(&mut skipped_pool_cache, skipped);
         }
@@ -204,7 +230,27 @@ impl DiscoveryManager {
             self.save_pool_state_checkpoint(&pools, &skipped_pool_cache, "v2");
         }
 
-        let v3_batch = self.fetcher.fetch_v3_batch(&v3_to_fetch, None).await?;
+        let aerodrome_v2_batch = self
+            .fetcher
+            .fetch_aerodrome_v2_batch(&aerodrome_v2_to_fetch, fetch_block_number)
+            .await?;
+        for skipped in aerodrome_v2_batch.skipped {
+            insert_skipped_pool(&mut skipped_pool_cache, skipped);
+        }
+        for pool in aerodrome_v2_batch.pools {
+            if self.admission.admit(&pool) {
+                skipped_pool_cache.remove(&pool.pool_id);
+                pools.insert(pool.pool_id, pool);
+            }
+        }
+        if !aerodrome_v2_to_fetch.is_empty() && save_intermediate_checkpoints {
+            self.save_pool_state_checkpoint(&pools, &skipped_pool_cache, "aerodrome_v2");
+        }
+
+        let v3_batch = self
+            .fetcher
+            .fetch_v3_batch(&v3_to_fetch, fetch_block_number)
+            .await?;
         for skipped in v3_batch.skipped {
             insert_skipped_pool(&mut skipped_pool_cache, skipped);
         }
@@ -220,7 +266,11 @@ impl DiscoveryManager {
 
         let mut skipped_other = 0usize;
         for (idx, spec) in other_to_fetch.into_iter().enumerate() {
-            match self.fetcher.fetch_pool_with_retries(&spec, None).await {
+            match self
+                .fetcher
+                .fetch_pool_with_retries(&spec, fetch_block_number)
+                .await
+            {
                 Ok(Some(pool)) => {
                     if self.admission.admit(&pool) {
                         skipped_pool_cache.remove(&pool.pool_id);
@@ -265,11 +315,22 @@ impl DiscoveryManager {
             self.save_pool_state_checkpoint(&pools, &skipped_pool_cache, "post_fetch");
         }
 
+        if replay_cached_pools {
+            if let Some(anchor_block) = cache_anchor_block {
+                self.replay_cached_pool_state_events(
+                    &mut pools,
+                    &mut skipped_pool_cache,
+                    anchor_block,
+                    latest_at_bootstrap,
+                )
+                .await?;
+            }
+        }
+
         let mut tokens = self.discover_tokens(&pools, &flash_reserves).await?;
         derive_missing_prices_from_pools(&mut tokens, &pools);
 
-        let latest = self.scanner.latest_block().await.unwrap_or(0);
-        let block_ref = if latest > 0 {
+        let block_ref = if latest_at_bootstrap > 0 {
             self.scanner.current_block_ref().await.ok()
         } else {
             None
@@ -315,6 +376,168 @@ impl DiscoveryManager {
                 "pool state checkpoint save failed"
             ),
         }
+    }
+
+    async fn replay_cached_pool_state_events(
+        &self,
+        pools: &mut HashMap<Address, PoolState>,
+        skipped_pool_cache: &mut HashMap<Address, SkippedPoolCacheEntry>,
+        anchor_block: u64,
+        latest_block: u64,
+    ) -> Result<()> {
+        if latest_block == 0 || latest_block <= anchor_block {
+            mark_replayed_pools_current(pools, latest_block.max(anchor_block));
+            return Ok(());
+        }
+
+        let replay_from = anchor_block.saturating_sub(self.settings.risk.event_backfill_blocks);
+        let temp_snapshot = GraphSnapshot::build(0, None, Vec::new(), pools.clone());
+        let event_stream = EventStream::new(self.settings.clone(), self.rpc.clone());
+        let batch = event_stream
+            .backfill_once(&temp_snapshot, replay_from, latest_block)
+            .await
+            .context("cached pool event replay failed")?;
+
+        let patches = collect_replay_patches(&batch);
+        let full_refresh_specs = collect_replay_full_refresh_specs(pools, &batch);
+        let mut failed_full_refresh = HashSet::new();
+
+        for patch in patches {
+            if let Some(pool) = pools.get_mut(&patch.pool_id()) {
+                apply_pool_patch(pool, patch, Some(latest_block));
+            }
+        }
+
+        if !full_refresh_specs.is_empty() {
+            info!(
+                from_block = replay_from,
+                to_block = latest_block,
+                full_refresh_count = full_refresh_specs.len(),
+                "refreshing pools touched by non-patchable replay logs"
+            );
+            self.fetch_replay_full_refresh_pools(
+                pools,
+                skipped_pool_cache,
+                full_refresh_specs,
+                latest_block,
+                &mut failed_full_refresh,
+            )
+            .await?;
+        }
+
+        mark_replayed_pools_current(pools, latest_block);
+        for pool_id in failed_full_refresh {
+            if let Some(pool) = pools.get_mut(&pool_id) {
+                pool.health.stale = true;
+            }
+        }
+        self.save_pool_state_checkpoint(pools, skipped_pool_cache, "event_replay");
+        Ok(())
+    }
+
+    async fn fetch_replay_full_refresh_pools(
+        &self,
+        pools: &mut HashMap<Address, PoolState>,
+        skipped_pool_cache: &mut HashMap<Address, SkippedPoolCacheEntry>,
+        specs: Vec<DiscoveredPool>,
+        latest_block: u64,
+        failed_full_refresh: &mut HashSet<Address>,
+    ) -> Result<()> {
+        let mut v2_to_fetch = Vec::new();
+        let mut aerodrome_v2_to_fetch = Vec::new();
+        let mut v3_to_fetch = Vec::new();
+        let mut other_to_fetch = Vec::new();
+        for spec in specs {
+            push_fetch_spec(
+                &mut v2_to_fetch,
+                &mut aerodrome_v2_to_fetch,
+                &mut v3_to_fetch,
+                &mut other_to_fetch,
+                spec,
+            );
+        }
+
+        let block_number = Some(latest_block);
+        let v2_batch = self
+            .fetcher
+            .fetch_v2_batch(&v2_to_fetch, block_number)
+            .await?;
+        for skipped in v2_batch.skipped {
+            failed_full_refresh.insert(skipped.spec.address);
+            insert_skipped_pool(skipped_pool_cache, skipped);
+        }
+        for pool in v2_batch.pools {
+            skipped_pool_cache.remove(&pool.pool_id);
+            failed_full_refresh.remove(&pool.pool_id);
+            pools.insert(pool.pool_id, pool);
+        }
+
+        let aerodrome_v2_batch = self
+            .fetcher
+            .fetch_aerodrome_v2_batch(&aerodrome_v2_to_fetch, block_number)
+            .await?;
+        for skipped in aerodrome_v2_batch.skipped {
+            failed_full_refresh.insert(skipped.spec.address);
+            insert_skipped_pool(skipped_pool_cache, skipped);
+        }
+        for pool in aerodrome_v2_batch.pools {
+            skipped_pool_cache.remove(&pool.pool_id);
+            failed_full_refresh.remove(&pool.pool_id);
+            pools.insert(pool.pool_id, pool);
+        }
+
+        let v3_batch = self
+            .fetcher
+            .fetch_v3_batch(&v3_to_fetch, block_number)
+            .await?;
+        for skipped in v3_batch.skipped {
+            failed_full_refresh.insert(skipped.spec.address);
+            insert_skipped_pool(skipped_pool_cache, skipped);
+        }
+        for pool in v3_batch.pools {
+            skipped_pool_cache.remove(&pool.pool_id);
+            failed_full_refresh.remove(&pool.pool_id);
+            pools.insert(pool.pool_id, pool);
+        }
+
+        for spec in other_to_fetch {
+            match self
+                .fetcher
+                .fetch_pool_with_retries(&spec, block_number)
+                .await
+            {
+                Ok(Some(pool)) if self.admission.admit(&pool) => {
+                    skipped_pool_cache.remove(&pool.pool_id);
+                    failed_full_refresh.remove(&pool.pool_id);
+                    pools.insert(pool.pool_id, pool);
+                }
+                Ok(_) => {
+                    failed_full_refresh.insert(spec.address);
+                    insert_skipped_pool_reason(
+                        skipped_pool_cache,
+                        spec,
+                        "replay_full_refresh_returned_none",
+                    );
+                }
+                Err(err) => {
+                    failed_full_refresh.insert(spec.address);
+                    warn!(
+                        pool = %spec.address,
+                        dex = %spec.dex_name,
+                        kind = ?spec.amm_kind,
+                        error = %err,
+                        "skipping replay full refresh pool after retries"
+                    );
+                    insert_skipped_pool_reason(
+                        skipped_pool_cache,
+                        spec,
+                        "replay_full_refresh_failed",
+                    );
+                }
+            }
+        }
+
+        Ok(())
     }
 
     pub async fn refresh_pools(
@@ -753,6 +976,16 @@ fn apply_pool_patch(
             true
         }
         (
+            PoolStatePatch::UniswapV2Sync {
+                reserve0, reserve1, ..
+            },
+            PoolSpecificState::AerodromeV2Like(state),
+        ) => {
+            state.reserve0 = reserve0;
+            state.reserve1 = reserve1;
+            true
+        }
+        (
             PoolStatePatch::UniswapV3Swap {
                 sqrt_price_x96,
                 liquidity,
@@ -849,6 +1082,10 @@ fn patched_health(previous: &PoolHealth, block_number: u64) -> PoolHealth {
 struct PoolStateCache {
     version: u32,
     chain_id: u64,
+    #[serde(default)]
+    saved_at_block: Option<u64>,
+    #[serde(default)]
+    saved_at_unix_secs: Option<u64>,
     pools: Vec<PoolState>,
     #[serde(default)]
     skipped_pools: Vec<SkippedPoolCacheEntry>,
@@ -945,11 +1182,31 @@ impl PoolStateCache {
         pools: Vec<PoolState>,
         skipped_pools: Vec<SkippedPoolCacheEntry>,
     ) -> Self {
+        let saved_at_block = pools
+            .iter()
+            .filter_map(|pool| (pool.last_updated_block > 0).then_some(pool.last_updated_block))
+            .min();
         Self {
             version: 1,
             chain_id: settings.chain_id,
+            saved_at_block,
+            saved_at_unix_secs: Some(now_unix_secs()),
             pools,
             skipped_pools,
+        }
+    }
+
+    fn anchor_block(&self) -> Option<u64> {
+        let pool_anchor = self
+            .pools
+            .iter()
+            .filter_map(|pool| (pool.last_updated_block > 0).then_some(pool.last_updated_block))
+            .min();
+        match (self.saved_at_block, pool_anchor) {
+            (Some(saved), Some(pool_anchor)) => Some(saved.min(pool_anchor)),
+            (Some(saved), None) => Some(saved),
+            (None, Some(pool_anchor)) => Some(pool_anchor),
+            (None, None) => None,
         }
     }
 
@@ -1011,6 +1268,24 @@ fn skipped_pool_matches_spec(entry: &SkippedPoolCacheEntry, spec: &DiscoveredPoo
     discovered_pool_matches_spec(&entry.spec, spec)
 }
 
+fn skipped_pool_cache_applies_to_spec(
+    entry: &SkippedPoolCacheEntry,
+    spec: &DiscoveredPool,
+) -> bool {
+    if !spec.priority {
+        return true;
+    }
+
+    matches!(
+        entry.reason.as_str(),
+        "v2_zero_liquidity"
+            | "aerodrome_v2_zero_liquidity"
+            | "v3_zero_liquidity"
+            | "curve_fetch_returned_none"
+            | "balancer_fetch_returned_none"
+    )
+}
+
 fn discovered_pool_matches_spec(left: &DiscoveredPool, right: &DiscoveredPool) -> bool {
     left.address == right.address
         && left.dex_name == right.dex_name
@@ -1046,19 +1321,87 @@ fn insert_skipped_pool_reason(
 
 fn push_fetch_spec(
     v2_to_fetch: &mut Vec<DiscoveredPool>,
+    aerodrome_v2_to_fetch: &mut Vec<DiscoveredPool>,
     v3_to_fetch: &mut Vec<DiscoveredPool>,
     other_to_fetch: &mut Vec<DiscoveredPool>,
     spec: DiscoveredPool,
 ) {
     match spec.amm_kind {
         AmmKind::UniswapV2Like => v2_to_fetch.push(spec),
+        AmmKind::AerodromeV2Like => aerodrome_v2_to_fetch.push(spec),
         AmmKind::UniswapV3Like => v3_to_fetch.push(spec),
         _ => other_to_fetch.push(spec),
     }
 }
 
+fn collect_replay_patches(batch: &crate::types::RefreshBatch) -> Vec<PoolStatePatch> {
+    batch
+        .triggers
+        .iter()
+        .filter(|trigger| !trigger.full_refresh)
+        .filter_map(|trigger| trigger.patch.clone())
+        .collect()
+}
+
+fn collect_replay_full_refresh_specs(
+    pools: &HashMap<Address, PoolState>,
+    batch: &crate::types::RefreshBatch,
+) -> Vec<DiscoveredPool> {
+    let mut seen = HashSet::<Address>::new();
+    batch
+        .triggers
+        .iter()
+        .filter(|trigger| trigger.full_refresh)
+        .filter_map(|trigger| trigger.pool_id)
+        .filter(|pool_id| seen.insert(*pool_id))
+        .filter_map(|pool_id| pools.get(&pool_id).map(pool_to_discovered_spec))
+        .collect()
+}
+
+fn pool_to_discovered_spec(pool: &PoolState) -> DiscoveredPool {
+    DiscoveredPool {
+        address: pool.pool_id,
+        dex_name: pool.dex_name.clone(),
+        amm_kind: pool.kind,
+        factory: pool.factory,
+        registry: pool.registry,
+        vault: pool.vault,
+        quoter: pool.quoter,
+        balancer_pool_id: match &pool.state {
+            PoolSpecificState::BalancerWeighted(state) => Some(state.pool_id),
+            _ => None,
+        },
+        priority: false,
+    }
+}
+
+fn mark_replayed_pools_current(pools: &mut HashMap<Address, PoolState>, block_number: u64) {
+    for pool in pools.values_mut() {
+        if pool.health.paused || pool.health.quarantined {
+            continue;
+        }
+        pool.health = replayed_health(&pool.health, block_number);
+        pool.last_updated_block = pool.last_updated_block.max(block_number);
+    }
+}
+
+fn replayed_health(previous: &PoolHealth, block_number: u64) -> PoolHealth {
+    PoolHealth {
+        stale: false,
+        paused: previous.paused,
+        quarantined: previous.quarantined,
+        confidence_bps: previous.confidence_bps,
+        last_successful_refresh_block: block_number,
+        last_refresh_at: SystemTime::now(),
+        recent_revert_count: previous.recent_revert_count,
+    }
+}
+
 fn is_high_cardinality_pool_kind(kind: AmmKind) -> bool {
-    matches!(kind, AmmKind::UniswapV2Like | AmmKind::UniswapV3Like)
+    matches!(
+        kind,
+        AmmKind::UniswapV2Like | AmmKind::AerodromeV2Like | AmmKind::UniswapV3Like
+    )
 }
 
 fn skipped_pool_cache_entry_active(entry: &SkippedPoolCacheEntry) -> bool {
@@ -1079,6 +1422,12 @@ fn fetch_unseen_pools_on_bootstrap() -> bool {
     std::env::var("DISCOVERY_FETCH_UNSEEN_POOLS")
         .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
         .unwrap_or(false)
+}
+
+fn bootstrap_replay_cached_pool_states() -> bool {
+    std::env::var("BOOTSTRAP_REPLAY_CACHED_POOL_STATES")
+        .map(|value| !matches!(value.as_str(), "0" | "false" | "FALSE" | "no" | "NO"))
+        .unwrap_or(true)
 }
 
 fn skipped_pool_cache_disabled() -> bool {
@@ -1130,6 +1479,16 @@ fn derive_missing_prices_from_pools(tokens: &mut [TokenInfo], pools: &HashMap<Ad
         for pool in pools.values() {
             match &pool.state {
                 PoolSpecificState::UniswapV2Like(state) if pool.token_addresses.len() == 2 => {
+                    collect_balance_price_estimates(
+                        &pool.token_addresses,
+                        &[state.reserve0, state.reserve1],
+                        None,
+                        &decimals,
+                        &prices,
+                        &mut estimates,
+                    );
+                }
+                PoolSpecificState::AerodromeV2Like(state) if pool.token_addresses.len() == 2 => {
                     collect_balance_price_estimates(
                         &pool.token_addresses,
                         &[state.reserve0, state.reserve1],

@@ -5,6 +5,7 @@ import {IERC20} from "./interfaces/IERC20.sol";
 import {IAavePool} from "./interfaces/IAavePool.sol";
 import {IFlashLoanSimpleReceiver} from "./interfaces/IFlashLoanSimpleReceiver.sol";
 import {IUniswapV2Pair} from "./interfaces/IUniswapV2Pair.sol";
+import {IAerodromeV2Pool} from "./interfaces/IAerodromeV2Pool.sol";
 import {IUniswapV3Pool} from "./interfaces/IUniswapV3Pool.sol";
 import {IUniswapV3SwapCallback} from "./interfaces/IUniswapV3SwapCallback.sol";
 import {ICurvePool} from "./interfaces/ICurvePool.sol";
@@ -16,7 +17,8 @@ contract ArbitrageExecutor is IFlashLoanSimpleReceiver, IUniswapV3SwapCallback {
         UniswapV2Like,
         UniswapV3Like,
         CurvePlain,
-        BalancerWeighted
+        BalancerWeighted,
+        AerodromeV2Like
     }
 
     struct Split {
@@ -168,6 +170,7 @@ contract ArbitrageExecutor is IFlashLoanSimpleReceiver, IUniswapV3SwapCallback {
 
         emit ExecutionStarted(msg.sender, params.snapshotId, params.inputToken, params.inputAmount, false);
         uint256 endingBalance = _execute(params);
+        require(endingBalance >= startBalance, "MIN_PROFIT");
         uint256 realizedProfit = endingBalance - startBalance;
         require(realizedProfit >= params.minProfit, "MIN_PROFIT");
 
@@ -264,6 +267,8 @@ contract ArbitrageExecutor is IFlashLoanSimpleReceiver, IUniswapV3SwapCallback {
 
         if (split.adapterType == AdapterType.UniswapV2Like) {
             amountOut = _swapV2(split);
+        } else if (split.adapterType == AdapterType.AerodromeV2Like) {
+            amountOut = _swapAerodromeV2(split);
         } else if (split.adapterType == AdapterType.UniswapV3Like) {
             amountOut = _swapV3(split);
         } else if (split.adapterType == AdapterType.CurvePlain) {
@@ -329,6 +334,29 @@ contract ArbitrageExecutor is IFlashLoanSimpleReceiver, IUniswapV3SwapCallback {
             abi.encode(V3CallbackData({tokenIn: split.tokenIn}))
         );
         require(zeroForOne ? amount1Delta < 0 : amount0Delta < 0, "V3_NO_OUTPUT");
+        amountOut = IERC20(split.tokenOut).balanceOf(address(this)) - balanceBefore;
+    }
+
+    function _swapAerodromeV2(Split memory split) internal returns (uint256 amountOut) {
+        IAerodromeV2Pool pool = IAerodromeV2Pool(split.target);
+        address token0 = pool.token0();
+        address token1 = pool.token1();
+
+        bool zeroForOne = false;
+        if (split.tokenIn == token0 && split.tokenOut == token1) {
+            zeroForOne = true;
+        } else if (split.tokenIn == token1 && split.tokenOut == token0) {
+            zeroForOne = false;
+        } else {
+            revert("BAD_AERO_V2_TOKEN_PAIR");
+        }
+
+        uint256 quotedOut = pool.getAmountOut(split.amountIn, split.tokenIn);
+        require(quotedOut > 0, "AERO_V2_NO_OUTPUT");
+
+        uint256 balanceBefore = IERC20(split.tokenOut).balanceOf(address(this));
+        _safeTransfer(split.tokenIn, split.target, split.amountIn);
+        pool.swap(zeroForOne ? 0 : quotedOut, zeroForOne ? quotedOut : 0, address(this), "");
         amountOut = IERC20(split.tokenOut).balanceOf(address(this)) - balanceBefore;
     }
 

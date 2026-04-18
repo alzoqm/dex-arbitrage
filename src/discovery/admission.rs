@@ -58,6 +58,7 @@ impl AdmissionEngine {
 fn has_usable_liquidity(pool: &PoolState) -> bool {
     match &pool.state {
         PoolSpecificState::UniswapV2Like(state) => state.reserve0 > 0 && state.reserve1 > 0,
+        PoolSpecificState::AerodromeV2Like(state) => state.reserve0 > 0 && state.reserve1 > 0,
         PoolSpecificState::UniswapV3Like(state) => state.liquidity > 0,
         PoolSpecificState::CurvePlain(state) => state.balances.iter().any(|balance| *balance > 0),
         PoolSpecificState::BalancerWeighted(state) => {

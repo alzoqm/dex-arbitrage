@@ -66,6 +66,7 @@ impl Display for Chain {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum AmmKind {
     UniswapV2Like,
+    AerodromeV2Like,
     UniswapV3Like,
     CurvePlain,
     BalancerWeighted,
@@ -75,6 +76,7 @@ impl AmmKind {
     pub fn from_toml(value: &str) -> anyhow::Result<Self> {
         match value {
             "uniswap_v2_like" => Ok(Self::UniswapV2Like),
+            "aerodrome_v2_like" => Ok(Self::AerodromeV2Like),
             "uniswap_v3_like" => Ok(Self::UniswapV3Like),
             "curve_plain" => Ok(Self::CurvePlain),
             "balancer_weighted" => Ok(Self::BalancerWeighted),
@@ -86,6 +88,8 @@ impl AmmKind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum DiscoveryKind {
     FactoryAllPairs,
+    SolidlyFactoryAllPools,
+    SlipstreamFactoryAllPools,
     PoolCreatedLogs,
     CurveRegistry,
     BalancerVaultLogs,
@@ -96,6 +100,8 @@ impl DiscoveryKind {
     pub fn from_toml(value: &str) -> anyhow::Result<Self> {
         match value {
             "factory_all_pairs" => Ok(Self::FactoryAllPairs),
+            "solidly_factory_all_pools" => Ok(Self::SolidlyFactoryAllPools),
+            "slipstream_factory_all_pools" => Ok(Self::SlipstreamFactoryAllPools),
             "pool_created_logs" => Ok(Self::PoolCreatedLogs),
             "curve_registry" => Ok(Self::CurveRegistry),
             "balancer_vault_logs" => Ok(Self::BalancerVaultLogs),
@@ -141,12 +147,14 @@ pub enum AdapterType {
     UniswapV3Like = 1,
     CurvePlain = 2,
     BalancerWeighted = 3,
+    AerodromeV2Like = 4,
 }
 
 impl From<AmmKind> for AdapterType {
     fn from(value: AmmKind) -> Self {
         match value {
             AmmKind::UniswapV2Like => Self::UniswapV2Like,
+            AmmKind::AerodromeV2Like => Self::AerodromeV2Like,
             AmmKind::UniswapV3Like => Self::UniswapV3Like,
             AmmKind::CurvePlain => Self::CurvePlain,
             AmmKind::BalancerWeighted => Self::BalancerWeighted,
@@ -242,6 +250,16 @@ pub struct V2PoolState {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AerodromeV2PoolState {
+    pub reserve0: u128,
+    pub reserve1: u128,
+    pub decimals0: u128,
+    pub decimals1: u128,
+    pub stable: bool,
+    pub fee_ppm: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct V3PoolState {
     pub sqrt_price_x96: U256,
     pub liquidity: u128,
@@ -269,6 +287,7 @@ pub struct BalancerPoolState {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum PoolSpecificState {
     UniswapV2Like(V2PoolState),
+    AerodromeV2Like(AerodromeV2PoolState),
     UniswapV3Like(V3PoolState),
     CurvePlain(CurvePoolState),
     BalancerWeighted(BalancerPoolState),
@@ -345,6 +364,10 @@ pub enum SplitExtra {
     V2 {
         fee_ppm: u32,
     },
+    AerodromeV2 {
+        stable: bool,
+        fee_ppm: u32,
+    },
     V3 {
         zero_for_one: bool,
         sqrt_price_limit_x96: U256,
@@ -409,6 +432,8 @@ pub struct ExactPlan {
     pub expected_profit: i128,
 
     pub gas_limit: u64,
+    pub gas_l2_execution_cost_wei: U256,
+    pub gas_l1_data_fee_wei: U256,
     pub gas_cost_wei: U256,
     pub capital_source: CapitalSource,
     pub flash_loan_amount: u128,

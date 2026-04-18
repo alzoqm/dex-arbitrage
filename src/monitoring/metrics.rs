@@ -84,6 +84,36 @@ pub fn record_opportunity_found(snapshot_id: u64, profit_usd_e8: i64, chain: &st
         .set(profit_usd_e8 as f64);
 }
 
+pub fn record_opportunity_profitability(
+    chain: &str,
+    net_profit_usd_e8: i64,
+    gross_profit_usd_e8: i64,
+    gas_cost_usd_e8: i64,
+    flash_fee_usd_e8: i64,
+    input_value_usd_e8: u64,
+    profit_margin_bps: i64,
+    gas_to_gross_bps: i64,
+) {
+    metrics::gauge!("opportunity_net_profit_usd_e8", "chain" => chain.to_string())
+        .set(net_profit_usd_e8 as f64);
+    metrics::gauge!("opportunity_gross_profit_usd_e8", "chain" => chain.to_string())
+        .set(gross_profit_usd_e8 as f64);
+    metrics::gauge!("opportunity_gas_cost_usd_e8", "chain" => chain.to_string())
+        .set(gas_cost_usd_e8 as f64);
+    metrics::gauge!("opportunity_flash_fee_usd_e8", "chain" => chain.to_string())
+        .set(flash_fee_usd_e8 as f64);
+    metrics::gauge!("opportunity_input_value_usd_e8", "chain" => chain.to_string())
+        .set(input_value_usd_e8 as f64);
+    metrics::gauge!("opportunity_profit_margin_bps", "chain" => chain.to_string())
+        .set(profit_margin_bps as f64);
+    metrics::gauge!("opportunity_gas_to_gross_bps", "chain" => chain.to_string())
+        .set(gas_to_gross_bps as f64);
+    if net_profit_usd_e8 > 0 {
+        metrics::histogram!("opportunity_positive_net_profit_usd_e8", "chain" => chain.to_string())
+            .record(net_profit_usd_e8 as f64);
+    }
+}
+
 pub fn record_transaction_submitted(tx_hash: &str, channel: &str, chain: &str) {
     metrics::counter!("transactions_submitted_total", "channel" => channel.to_string(), "chain" => chain.to_string()).increment(1);
     metrics::gauge!("latest_tx_hash", "chain" => chain.to_string())

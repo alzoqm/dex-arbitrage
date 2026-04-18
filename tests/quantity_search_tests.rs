@@ -8,7 +8,10 @@ use dex_arbitrage::{
     },
     graph::GraphSnapshot,
     router::quantity_search::QuantitySearcher,
-    types::{CandidatePath, Chain, DiscoveryKind, TokenBehavior, TokenInfo},
+    types::{
+        AmmKind, CandidateHop, CandidatePath, Chain, DiscoveryKind, PoolAdmissionStatus,
+        PoolSpecificState, PoolState, TokenBehavior, TokenInfo, V2PoolState,
+    },
 };
 use smallvec::SmallVec;
 
@@ -83,9 +86,18 @@ fn settings() -> Arc<Settings> {
 }
 
 fn token(price: Option<u64>, max_position_usd_e8: Option<u128>) -> TokenInfo {
+    token_with_address(addr(1), "USDC", price, max_position_usd_e8)
+}
+
+fn token_with_address(
+    address: Address,
+    symbol: &str,
+    price: Option<u64>,
+    max_position_usd_e8: Option<u128>,
+) -> TokenInfo {
     TokenInfo {
-        address: addr(1),
-        symbol: "USDC".to_string(),
+        address,
+        symbol: symbol.to_string(),
         decimals: 6,
         is_stable: true,
         is_cycle_anchor: true,
@@ -98,6 +110,43 @@ fn token(price: Option<u64>, max_position_usd_e8: Option<u128>) -> TokenInfo {
     }
 }
 
+fn pool(
+    pool_id: Address,
+    token0: Address,
+    token1: Address,
+    reserve0: u128,
+    reserve1: u128,
+) -> PoolState {
+    PoolState {
+        pool_id,
+        dex_name: "uniswap_v2".to_string(),
+        kind: AmmKind::UniswapV2Like,
+        token_addresses: vec![token0, token1],
+        token_symbols: vec!["USDC".to_string(), "DAI".to_string()],
+        factory: None,
+        registry: None,
+        vault: None,
+        quoter: None,
+        admission_status: PoolAdmissionStatus::Allowed,
+        health: dex_arbitrage::types::PoolHealth {
+            stale: false,
+            paused: false,
+            quarantined: false,
+            confidence_bps: 10_000,
+            last_successful_refresh_block: 1,
+            last_refresh_at: std::time::SystemTime::now(),
+            recent_revert_count: 0,
+        },
+        state: PoolSpecificState::UniswapV2Like(V2PoolState {
+            reserve0,
+            reserve1,
+            fee_ppm: 3_000,
+        }),
+        last_updated_block: 1,
+        extras: HashMap::new(),
+    }
+}
+
 fn candidate() -> CandidatePath {
     CandidatePath {
         snapshot_id: 1,
@@ -106,6 +155,21 @@ fn candidate() -> CandidatePath {
         screening_score_q32: 0,
         cycle_key: "cycle".to_string(),
         path: SmallVec::new(),
+    }
+}
+
+fn candidate_with_hop(pool_id: Address) -> CandidatePath {
+    let mut path = SmallVec::new();
+    path.push(CandidateHop {
+        from: addr(1),
+        to: addr(2),
+        pool_id,
+        amm_kind: AmmKind::UniswapV2Like,
+        dex_name: "uniswap_v2".to_string(),
+    });
+    CandidatePath {
+        path,
+        ..candidate()
     }
 }
 
@@ -132,6 +196,28 @@ fn search_range_falls_back_to_legacy_raw_cap_when_price_missing() {
     let range = searcher.search_range(&snapshot, &candidate()).unwrap();
 
     assert_eq!(range, (10_000, 1_000_000));
+}
+
+#[test]
+fn search_range_rejects_routes_below_hop_capacity() {
+    let pool_id = addr(10);
+    let snapshot = GraphSnapshot::build(
+        1,
+        None,
+        vec![
+            token(Some(100_000_000), None),
+            token_with_address(addr(2), "DAI", Some(100_000_000), None),
+        ],
+        HashMap::from([(
+            pool_id,
+            pool(pool_id, addr(1), addr(2), 1_000_000, 1_000_000),
+        )]),
+    );
+    let searcher = QuantitySearcher::new(settings());
+
+    let range = searcher.search_range(&snapshot, &candidate_with_hop(pool_id));
+
+    assert!(range.is_none());
 }
 
 #[test]

@@ -14,9 +14,9 @@ use alloy::{
     rpc::types::Filter,
 };
 use anyhow::Result;
-use futures::StreamExt;
+use futures::{stream, StreamExt};
 use parking_lot::Mutex;
-use tokio::sync::mpsc;
+use tokio::{sync::mpsc, time::sleep};
 use tracing::{info, warn};
 
 use crate::{
@@ -33,7 +33,10 @@ pub struct EventStream {
     ws_started: Arc<AtomicBool>,
     ws_rx: Arc<Mutex<Option<mpsc::Receiver<RpcLog>>>>,
     recent_wss_logs: Arc<Mutex<RecentLogKeys>>,
+    wss_filter_stats: Arc<Mutex<WssFilterStats>>,
     last_wss_reconcile_at: Arc<Mutex<Option<Instant>>>,
+    last_wss_reconciled_block: Arc<Mutex<Option<u64>>>,
+    wss_reconcile_burst_until: Arc<Mutex<Option<Instant>>>,
 }
 
 impl EventStream {
@@ -44,8 +47,43 @@ impl EventStream {
             ws_started: Arc::new(AtomicBool::new(false)),
             ws_rx: Arc::new(Mutex::new(None)),
             recent_wss_logs: Arc::new(Mutex::new(RecentLogKeys::default())),
+            wss_filter_stats: Arc::new(Mutex::new(WssFilterStats::new())),
             last_wss_reconcile_at: Arc::new(Mutex::new(None)),
+            last_wss_reconciled_block: Arc::new(Mutex::new(None)),
+            wss_reconcile_burst_until: Arc::new(Mutex::new(None)),
         }
+    }
+
+    pub async fn backfill_once(
+        &self,
+        snapshot: &GraphSnapshot,
+        from_block: u64,
+        to_block: u64,
+    ) -> Result<RefreshBatch> {
+        let addresses = watched_addresses(snapshot);
+        if addresses.is_empty() || from_block > to_block {
+            return Ok(RefreshBatch::default());
+        }
+        let topics = event_topics();
+        let logs = self
+            .poll_wss_reconcile_logs(from_block, to_block, &addresses, &topics)
+            .await?;
+        let log_count = logs.len();
+        let batch = self.build_refresh_batch(snapshot, logs);
+        info!(
+            from_block,
+            to_block,
+            log_count,
+            trigger_count = batch.triggers.len(),
+            mode = wss_reconcile_mode().as_str(),
+            "event backfill complete"
+        );
+        telemetry::record_event_ingestion(
+            "bootstrap-backfill",
+            log_count,
+            self.settings.chain.as_str(),
+        );
+        Ok(batch)
     }
 
     pub async fn poll_once(
@@ -90,6 +128,7 @@ impl EventStream {
         topics: &[B256],
     ) -> Result<(u64, RefreshBatch)> {
         let latest = self.rpc.best_read().block_number().await?;
+        let was_started = self.ws_started.load(Ordering::SeqCst);
         if !self.start_wss(addresses, topics) {
             if latest <= from_block {
                 return Ok((from_block, RefreshBatch::default()));
@@ -107,7 +146,10 @@ impl EventStream {
             return Ok((latest, batch));
         }
 
-        let mut wss_logs = filter_watched_logs(self.drain_wss_logs(), addresses, topics);
+        let raw_wss_logs = self.drain_wss_logs();
+        let raw_wss_log_count = raw_wss_logs.len();
+        let mut wss_logs = filter_watched_logs(raw_wss_logs, addresses, topics);
+        self.record_wss_filter_stats(raw_wss_log_count, wss_logs.len());
         wss_logs.retain(|log| {
             log.block_number
                 .map(|block| block > from_block)
@@ -115,20 +157,34 @@ impl EventStream {
         });
         self.record_wss_log_keys(&wss_logs);
 
-        let should_reconcile = latest > from_block && self.wss_reconcile_due(from_block, latest);
-        let mut next_from_block = from_block;
+        let mut last_reconciled = self.ensure_wss_reconciled_block(from_block);
+        let reconcile_to = latest.saturating_sub(wss_reconcile_confirmation_blocks());
+        let force_reconcile = !was_started;
+        let should_reconcile = reconcile_to > last_reconciled
+            && self.wss_reconcile_due(force_reconcile, last_reconciled, reconcile_to);
+        let next_from_block = latest.max(from_block);
         let mut logs = Vec::new();
         let wss_log_count = wss_logs.len();
         let mut backfill_log_count = 0usize;
+        let mut unique_backfill_log_count = 0usize;
+        let mut reconciled_from_block = None;
+        let mut reconciled_to_block = None;
 
         if should_reconcile {
+            let reconcile_from = last_reconciled + 1;
             let backfill_logs = self
-                .poll_wss_reconcile_logs(from_block + 1, latest, addresses, topics)
+                .poll_wss_reconcile_logs(reconcile_from, reconcile_to, addresses, topics)
                 .await?;
             backfill_log_count = backfill_logs.len();
-            logs.extend(self.filter_seen_wss_logs(backfill_logs));
-            next_from_block = latest;
+            let backfill_logs = self.filter_seen_wss_logs(backfill_logs);
+            unique_backfill_log_count = backfill_logs.len();
+            logs.extend(backfill_logs);
+            reconciled_from_block = Some(reconcile_from);
+            reconciled_to_block = Some(reconcile_to);
+            last_reconciled = reconcile_to;
+            *self.last_wss_reconciled_block.lock() = Some(last_reconciled);
             *self.last_wss_reconcile_at.lock() = Some(Instant::now());
+            self.update_wss_reconcile_burst(unique_backfill_log_count);
         }
 
         logs.extend(wss_logs);
@@ -137,11 +193,15 @@ impl EventStream {
         let batch = self.build_refresh_batch(snapshot, logs);
         if should_reconcile {
             info!(
-                from_block = from_block + 1,
-                to_block = latest,
+                from_block = reconciled_from_block.unwrap_or(from_block + 1),
+                to_block = reconciled_to_block.unwrap_or(latest),
                 wss_logs = wss_log_count,
+                raw_wss_logs = raw_wss_log_count,
+                discarded_wss_logs = raw_wss_log_count.saturating_sub(wss_log_count),
                 backfill_logs = backfill_log_count,
+                unique_backfill_logs = unique_backfill_log_count,
                 accepted_logs = log_count,
+                strategy = wss_reconcile_strategy().as_str(),
                 mode = wss_reconcile_mode().as_str(),
                 "wss reconciliation complete"
             );
@@ -167,29 +227,21 @@ impl EventStream {
                 ))
             }
             EventIngestMode::BlockReceipts => {
-                let max_receipt_blocks = std::env::var("EVENT_RECEIPT_MAX_BLOCKS")
-                    .ok()
-                    .and_then(|value| value.parse::<u64>().ok())
-                    .filter(|value| *value > 0)
-                    .unwrap_or(64);
-                let span = to_block.saturating_sub(from_block).saturating_add(1);
-                if span <= max_receipt_blocks {
-                    match self
-                        .get_block_receipts_range(from_block, to_block, addresses, topics)
-                        .await
-                    {
-                        Ok(logs) => Ok(logs),
-                        Err(err) => {
-                            warn!(error = %err, "eth_getBlockReceipts failed; falling back to topic logs");
-                            self.get_topic_logs_chunked(from_block, to_block, topics)
-                                .await
-                                .map(|logs| filter_watched_logs(logs, addresses, topics))
-                        }
+                match self
+                    .get_block_receipts_range(from_block, to_block, addresses, topics)
+                    .await
+                {
+                    Ok(logs) => Ok(logs),
+                    Err(err) if receipts_topic_fallback_enabled() => {
+                        warn!(error = %err, "eth_getBlockReceipts failed; falling back to topic logs");
+                        self.get_topic_logs_chunked(from_block, to_block, topics)
+                            .await
+                            .map(|logs| filter_watched_logs(logs, addresses, topics))
                     }
-                } else {
-                    self.get_topic_logs_chunked(from_block, to_block, topics)
-                        .await
-                        .map(|logs| filter_watched_logs(logs, addresses, topics))
+                    Err(err) => {
+                        Err(err
+                            .context("eth_getBlockReceipts failed and topic fallback is disabled"))
+                    }
                 }
             }
             EventIngestMode::TopicLogs => self
@@ -212,29 +264,20 @@ impl EventStream {
     ) -> Result<Vec<RpcLog>> {
         match wss_reconcile_mode() {
             EventIngestMode::BlockReceipts => {
-                let max_receipt_blocks = std::env::var("EVENT_RECEIPT_MAX_BLOCKS")
-                    .ok()
-                    .and_then(|value| value.parse::<u64>().ok())
-                    .filter(|value| *value > 0)
-                    .unwrap_or(64);
-                let span = to_block.saturating_sub(from_block).saturating_add(1);
-                if span <= max_receipt_blocks {
-                    match self
-                        .get_block_receipts_range(from_block, to_block, addresses, topics)
-                        .await
-                    {
-                        Ok(logs) => Ok(logs),
-                        Err(err) => {
-                            warn!(error = %err, "wss reconciliation via block receipts failed; falling back to topic logs");
-                            self.get_topic_logs_chunked(from_block, to_block, topics)
-                                .await
-                                .map(|logs| filter_watched_logs(logs, addresses, topics))
-                        }
+                match self
+                    .get_block_receipts_range(from_block, to_block, addresses, topics)
+                    .await
+                {
+                    Ok(logs) => Ok(logs),
+                    Err(err) if receipts_topic_fallback_enabled() => {
+                        warn!(error = %err, "wss reconciliation via block receipts failed; falling back to topic logs");
+                        self.get_topic_logs_chunked(from_block, to_block, topics)
+                            .await
+                            .map(|logs| filter_watched_logs(logs, addresses, topics))
                     }
-                } else {
-                    self.get_topic_logs_chunked(from_block, to_block, topics)
-                        .await
-                        .map(|logs| filter_watched_logs(logs, addresses, topics))
+                    Err(err) => Err(err.context(
+                        "wss reconciliation via block receipts failed and topic fallback is disabled",
+                    )),
                 }
             }
             EventIngestMode::AddressLogs => {
@@ -246,6 +289,210 @@ impl EventStream {
                 .await
                 .map(|logs| filter_watched_logs(logs, addresses, topics)),
         }
+    }
+
+    async fn get_topic_logs_chunked(
+        &self,
+        from_block: u64,
+        to_block: u64,
+        topics: &[B256],
+    ) -> Result<Vec<RpcLog>> {
+        if from_block > to_block {
+            return Ok(Vec::new());
+        }
+        let mut chunk_blocks = std::env::var("EVENT_LOG_CHUNK_BLOCKS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(5_000);
+        let mut logs = Vec::new();
+        let mut start = from_block;
+        let max_retries = event_log_chunk_max_retries();
+        let min_chunk_blocks = event_log_min_chunk_blocks();
+        while start <= to_block {
+            let mut retry_count = 0usize;
+            loop {
+                let end = start.saturating_add(chunk_blocks - 1).min(to_block);
+                match self.rpc.best_read().get_logs(start, end, &[], topics).await {
+                    Ok(mut chunk) => {
+                        logs.append(&mut chunk);
+                        info!(
+                            from_block = start,
+                            to_block = end,
+                            next_block = end.saturating_add(1),
+                            chunk_blocks,
+                            logs_found = logs.len(),
+                            "topic log scan progress"
+                        );
+                        if end == u64::MAX {
+                            return Ok(logs);
+                        }
+                        start = end.saturating_add(1);
+                        break;
+                    }
+                    Err(err) => {
+                        let error_msg = err.to_string();
+                        if should_reduce_chunk_size(&error_msg) && chunk_blocks > 1 {
+                            chunk_blocks = (chunk_blocks / 2).max(1);
+                            warn!(
+                                %error_msg,
+                                chunk_size = chunk_blocks,
+                                retry = retry_count,
+                                block_range = %format!("{}..{}", start, end),
+                                "topic log query failed, reducing chunk size and retrying block range"
+                            );
+                        } else if retry_count < max_retries && is_transient_log_error(&error_msg) {
+                            if chunk_blocks > min_chunk_blocks {
+                                chunk_blocks = (chunk_blocks / 2).max(min_chunk_blocks);
+                            }
+                            warn!(
+                                %error_msg,
+                                chunk_size = chunk_blocks,
+                                retry = retry_count,
+                                block_range = %format!("{}..{}", start, end),
+                                "topic log query failed, retrying block range"
+                            );
+                        } else {
+                            return Err(err.context("failed to get topic logs after retries"));
+                        }
+                        retry_count += 1;
+                        sleep(event_log_retry_delay(retry_count)).await;
+                    }
+                }
+            }
+        }
+        Ok(logs)
+    }
+
+    async fn get_address_logs_chunked(
+        &self,
+        from_block: u64,
+        to_block: u64,
+        addresses: &[Address],
+        topics: &[B256],
+    ) -> Result<Vec<RpcLog>> {
+        if from_block > to_block {
+            return Ok(Vec::new());
+        }
+
+        // Use chain-aware chunk size with adaptive splitting
+        let provider_mode = std::env::var("RPC_PROVIDER_MODE")
+            .ok()
+            .unwrap_or_else(|| "payg".to_string());
+        let mut chunk_blocks = std::env::var("EVENT_LOG_CHUNK_BLOCKS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(5_000);
+
+        // Apply chain-aware limits
+        chunk_blocks = adapt_log_chunk_size(self.settings.chain, &provider_mode, chunk_blocks);
+
+        let address_chunk_size = std::env::var("EVENT_LOG_ADDRESS_CHUNK_SIZE")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(200);
+        let address_concurrency = event_log_address_concurrency();
+
+        let mut logs = Vec::new();
+        let mut start = from_block;
+        let max_retries = event_log_chunk_max_retries();
+        let min_chunk_blocks = event_log_min_chunk_blocks();
+
+        while start <= to_block {
+            let mut retry_count = 0;
+
+            loop {
+                let end = start.saturating_add(chunk_blocks - 1).min(to_block);
+                let mut range_logs = Vec::new();
+                let mut retry_range = false;
+                let address_chunks = addresses
+                    .chunks(address_chunk_size)
+                    .map(|chunk| chunk.to_vec())
+                    .collect::<Vec<_>>();
+                let address_chunk_count = address_chunks.len();
+                let rpc = self.rpc.best_read();
+                let range_start = start;
+                let range_end = end;
+                let mut requests = stream::iter(address_chunks.into_iter())
+                    .map(|address_chunk| {
+                        let rpc = rpc.clone();
+                        async move {
+                            rpc.get_logs(range_start, range_end, &address_chunk, topics)
+                                .await
+                        }
+                    })
+                    .buffer_unordered(address_concurrency);
+
+                while let Some(result) = requests.next().await {
+                    match result {
+                        Ok(mut chunk) => {
+                            range_logs.append(&mut chunk);
+                        }
+                        Err(e) => {
+                            let error_msg = e.to_string();
+                            if should_reduce_chunk_size(&error_msg) && retry_count < max_retries {
+                                tracing::warn!(
+                                    %error_msg,
+                                    chunk_size = chunk_blocks,
+                                    retry = retry_count,
+                                    block_range = %format!("{}..{}", start, end),
+                                    "address log query failed, reducing chunk size and retrying block range"
+                                );
+                                chunk_blocks = (chunk_blocks / 2).max(1);
+                                retry_count += 1;
+                                sleep(event_log_retry_delay(retry_count)).await;
+                                retry_range = true;
+                                break;
+                            } else if retry_count < max_retries
+                                && is_transient_log_error(&error_msg)
+                            {
+                                if chunk_blocks > min_chunk_blocks {
+                                    chunk_blocks = (chunk_blocks / 2).max(min_chunk_blocks);
+                                }
+                                tracing::warn!(
+                                    %error_msg,
+                                    chunk_size = chunk_blocks,
+                                    retry = retry_count,
+                                    block_range = %format!("{}..{}", start, end),
+                                    "address log query failed, retrying block range"
+                                );
+                                retry_count += 1;
+                                sleep(event_log_retry_delay(retry_count)).await;
+                                retry_range = true;
+                                break;
+                            } else {
+                                return Err(e.context("failed to get address logs after retries"));
+                            }
+                        }
+                    }
+                }
+
+                if retry_range {
+                    continue;
+                }
+
+                logs.append(&mut range_logs);
+                info!(
+                    from_block = start,
+                    to_block = end,
+                    next_block = end.saturating_add(1),
+                    chunk_blocks,
+                    address_chunk_size,
+                    address_chunk_count,
+                    address_concurrency,
+                    logs_found = logs.len(),
+                    "address log scan progress"
+                );
+                if end == u64::MAX {
+                    return Ok(logs);
+                }
+                start = end.saturating_add(1);
+                break;
+            }
+        }
+        Ok(logs)
     }
 
     fn start_wss(&self, addresses: &[Address], topics: &[B256]) -> bool {
@@ -306,15 +553,96 @@ impl EventStream {
             .collect()
     }
 
-    fn wss_reconcile_due(&self, from_block: u64, latest: u64) -> bool {
-        let block_gap = latest.saturating_sub(from_block);
-        if block_gap >= wss_reconcile_interval_blocks() {
+    fn record_wss_filter_stats(&self, raw_count: usize, watched_count: usize) {
+        if raw_count == 0 {
+            return;
+        }
+        let interval = wss_filter_stats_interval();
+        let discarded_count = raw_count.saturating_sub(watched_count);
+        let mut stats = self.wss_filter_stats.lock();
+        stats.raw = stats.raw.saturating_add(raw_count as u64);
+        stats.watched = stats.watched.saturating_add(watched_count as u64);
+        stats.discarded = stats.discarded.saturating_add(discarded_count as u64);
+        if interval.is_zero() || stats.last_logged_at.elapsed() < interval {
+            return;
+        }
+        info!(
+            raw_wss_logs = stats.raw,
+            watched_wss_logs = stats.watched,
+            discarded_wss_logs = stats.discarded,
+            interval_ms = interval.as_millis(),
+            "wss filter stats"
+        );
+        stats.raw = 0;
+        stats.watched = 0;
+        stats.discarded = 0;
+        stats.last_logged_at = Instant::now();
+    }
+
+    fn ensure_wss_reconciled_block(&self, from_block: u64) -> u64 {
+        let mut guard = self.last_wss_reconciled_block.lock();
+        let value = guard.get_or_insert(from_block);
+        *value
+    }
+
+    fn wss_reconcile_due(&self, force: bool, from_block: u64, to_block: u64) -> bool {
+        let strategy = wss_reconcile_strategy();
+        if matches!(strategy, WssReconcileStrategy::Off) {
+            return false;
+        }
+        if force {
+            return true;
+        }
+        let block_gap = to_block.saturating_sub(from_block);
+        let now = Instant::now();
+        let burst_active = match *self.wss_reconcile_burst_until.lock() {
+            Some(until) => until > now,
+            None => false,
+        };
+        if burst_active {
+            return self.reconcile_gap_due(
+                block_gap,
+                wss_reconcile_interval_blocks(),
+                wss_reconcile_interval(),
+            );
+        }
+
+        match strategy {
+            WssReconcileStrategy::Off => false,
+            WssReconcileStrategy::Fixed => self.reconcile_gap_due(
+                block_gap,
+                wss_reconcile_interval_blocks(),
+                wss_reconcile_interval(),
+            ),
+            WssReconcileStrategy::Adaptive => {
+                self.reconcile_gap_due(block_gap, wss_audit_interval_blocks(), wss_audit_interval())
+            }
+        }
+    }
+
+    fn reconcile_gap_due(&self, block_gap: u64, interval_blocks: u64, interval: Duration) -> bool {
+        if block_gap >= interval_blocks {
             return true;
         }
         let Some(last) = *self.last_wss_reconcile_at.lock() else {
             return block_gap > 0;
         };
-        last.elapsed() >= wss_reconcile_interval()
+        last.elapsed() >= interval
+    }
+
+    fn update_wss_reconcile_burst(&self, unique_backfill_log_count: usize) {
+        let threshold = wss_reconcile_burst_threshold();
+        if threshold == 0 || unique_backfill_log_count < threshold {
+            return;
+        }
+        let until = Instant::now() + wss_reconcile_burst_duration();
+        *self.wss_reconcile_burst_until.lock() = Some(until);
+        warn!(
+            unique_backfill_log_count,
+            threshold,
+            burst_ms = wss_reconcile_burst_duration().as_millis(),
+            "WSS backfill found missed logs; temporarily increasing reconciliation frequency"
+        );
     }
 
     async fn get_block_receipts_range(
@@ -324,131 +652,58 @@ impl EventStream {
         addresses: &[Address],
         topics: &[B256],
     ) -> Result<Vec<RpcLog>> {
-        let mut logs = Vec::new();
-        for block in from_block..=to_block {
-            let mut block_logs = self.rpc.best_read().get_block_receipts_logs(block).await?;
-            logs.append(&mut block_logs);
-        }
-        Ok(filter_watched_logs(logs, addresses, topics))
-    }
-
-    async fn get_topic_logs_chunked(
-        &self,
-        from_block: u64,
-        to_block: u64,
-        topics: &[B256],
-    ) -> Result<Vec<RpcLog>> {
-        if from_block > to_block {
-            return Ok(Vec::new());
-        }
-        let chunk_blocks = std::env::var("EVENT_LOG_CHUNK_BLOCKS")
-            .ok()
-            .and_then(|value| value.parse::<u64>().ok())
-            .filter(|value| *value > 0)
-            .unwrap_or(5_000);
+        let rpc = self.rpc.best_read();
+        let concurrency = event_receipt_concurrency();
+        let chunk_blocks = event_receipt_max_blocks();
         let mut logs = Vec::new();
         let mut start = from_block;
+        let mut chunk_count = 0_u64;
+
         while start <= to_block {
             let end = start.saturating_add(chunk_blocks - 1).min(to_block);
-            let mut chunk = self
-                .rpc
-                .best_read()
-                .get_logs(start, end, &[], topics)
-                .await?;
-            logs.append(&mut chunk);
+            let mut receipts = stream::iter(start..=end)
+                .map(|block| {
+                    let rpc = rpc.clone();
+                    async move {
+                        rpc.get_block_receipts_logs(block)
+                            .await
+                            .map(|logs| (block, logs))
+                    }
+                })
+                .buffer_unordered(concurrency);
+
+            let mut by_block = Vec::new();
+            while let Some(result) = receipts.next().await {
+                by_block.push(result?);
+            }
+            by_block.sort_by_key(|(block, _)| *block);
+
+            let mut chunk_logs = Vec::new();
+            for (_, mut block_logs) in by_block {
+                chunk_logs.append(&mut block_logs);
+            }
+            let mut watched_logs = filter_watched_logs(chunk_logs, addresses, topics);
+            let logs_found = watched_logs.len();
+            logs.append(&mut watched_logs);
+            chunk_count += 1;
+            if chunk_count % 10 == 0 || end == to_block {
+                info!(
+                    from_block = start,
+                    to_block = end,
+                    next_block = end.saturating_add(1),
+                    chunk_blocks,
+                    concurrency,
+                    logs_found,
+                    total_logs = logs.len(),
+                    "receipt scan progress"
+                );
+            }
             if end == u64::MAX {
                 break;
             }
             start = end.saturating_add(1);
         }
-        Ok(logs)
-    }
 
-    async fn get_address_logs_chunked(
-        &self,
-        from_block: u64,
-        to_block: u64,
-        addresses: &[Address],
-        topics: &[B256],
-    ) -> Result<Vec<RpcLog>> {
-        if from_block > to_block {
-            return Ok(Vec::new());
-        }
-
-        // Use chain-aware chunk size with adaptive splitting
-        let provider_mode = std::env::var("RPC_PROVIDER_MODE")
-            .ok()
-            .unwrap_or_else(|| "payg".to_string());
-        let mut chunk_blocks = std::env::var("EVENT_LOG_CHUNK_BLOCKS")
-            .ok()
-            .and_then(|value| value.parse::<u64>().ok())
-            .filter(|value| *value > 0)
-            .unwrap_or(5_000);
-
-        // Apply chain-aware limits
-        chunk_blocks = adapt_log_chunk_size(self.settings.chain, &provider_mode, chunk_blocks);
-
-        let address_chunk_size = std::env::var("EVENT_LOG_ADDRESS_CHUNK_SIZE")
-            .ok()
-            .and_then(|value| value.parse::<usize>().ok())
-            .filter(|value| *value > 0)
-            .unwrap_or(200);
-
-        let mut logs = Vec::new();
-        let mut start = from_block;
-        const MAX_RETRIES: usize = 3;
-
-        while start <= to_block {
-            let mut retry_count = 0;
-
-            loop {
-                let end = start.saturating_add(chunk_blocks - 1).min(to_block);
-                let mut range_logs = Vec::new();
-                let mut retry_range = false;
-
-                for address_chunk in addresses.chunks(address_chunk_size) {
-                    match self
-                        .rpc
-                        .best_read()
-                        .get_logs(start, end, address_chunk, topics)
-                        .await
-                    {
-                        Ok(mut chunk) => {
-                            range_logs.append(&mut chunk);
-                        }
-                        Err(e) => {
-                            let error_msg = e.to_string();
-                            if should_reduce_chunk_size(&error_msg) && retry_count < MAX_RETRIES {
-                                tracing::warn!(
-                                    %error_msg,
-                                    chunk_size = chunk_blocks,
-                                    retry = retry_count,
-                                    block_range = %format!("{}..{}", start, end),
-                                    "address log query failed, reducing chunk size and retrying block range"
-                                );
-                                chunk_blocks = (chunk_blocks / 2).max(1);
-                                retry_count += 1;
-                                retry_range = true;
-                                break;
-                            } else {
-                                return Err(e.context("failed to get address logs after retries"));
-                            }
-                        }
-                    }
-                }
-
-                if retry_range {
-                    continue;
-                }
-
-                logs.append(&mut range_logs);
-                if end == u64::MAX {
-                    return Ok(logs);
-                }
-                start = end.saturating_add(1);
-                break;
-            }
-        }
         Ok(logs)
     }
 
@@ -526,6 +781,13 @@ enum WssFilterMode {
     AddressLogs,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WssReconcileStrategy {
+    Adaptive,
+    Fixed,
+    Off,
+}
+
 impl EventIngestMode {
     fn as_str(self) -> &'static str {
         match self {
@@ -546,6 +808,16 @@ impl WssFilterMode {
     }
 }
 
+impl WssReconcileStrategy {
+    fn as_str(self) -> &'static str {
+        match self {
+            WssReconcileStrategy::Adaptive => "adaptive",
+            WssReconcileStrategy::Fixed => "fixed",
+            WssReconcileStrategy::Off => "off",
+        }
+    }
+}
+
 fn event_ingest_mode() -> EventIngestMode {
     match std::env::var("EVENT_INGEST_MODE")
         .unwrap_or_else(|_| "address_logs".to_string())
@@ -556,6 +828,18 @@ fn event_ingest_mode() -> EventIngestMode {
         "address_logs" | "address" | "legacy" => EventIngestMode::AddressLogs,
         "topic_logs" | "topic" | "logs" => EventIngestMode::TopicLogs,
         _ => EventIngestMode::BlockReceipts,
+    }
+}
+
+fn wss_reconcile_strategy() -> WssReconcileStrategy {
+    match std::env::var("EVENT_WSS_RECONCILE_STRATEGY")
+        .unwrap_or_else(|_| "adaptive".to_string())
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "fixed" | "fast" | "legacy" => WssReconcileStrategy::Fixed,
+        "off" | "disabled" | "none" => WssReconcileStrategy::Off,
+        _ => WssReconcileStrategy::Adaptive,
     }
 }
 
@@ -597,6 +881,129 @@ fn wss_reconcile_interval() -> Duration {
             .and_then(|value| value.parse::<u64>().ok())
             .filter(|value| *value > 0)
             .unwrap_or(10_000),
+    )
+}
+
+fn wss_audit_interval_blocks() -> u64 {
+    std::env::var("EVENT_WSS_AUDIT_INTERVAL_BLOCKS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(64)
+}
+
+fn wss_audit_interval() -> Duration {
+    Duration::from_millis(
+        std::env::var("EVENT_WSS_AUDIT_INTERVAL_MS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(60_000),
+    )
+}
+
+fn wss_reconcile_confirmation_blocks() -> u64 {
+    std::env::var("EVENT_WSS_RECONCILE_CONFIRMATION_BLOCKS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(1)
+}
+
+fn wss_reconcile_burst_threshold() -> usize {
+    std::env::var("EVENT_WSS_RECONCILE_BURST_THRESHOLD")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(16)
+}
+
+fn wss_reconcile_burst_duration() -> Duration {
+    Duration::from_millis(
+        std::env::var("EVENT_WSS_RECONCILE_BURST_MS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(30_000),
+    )
+}
+
+fn event_receipt_concurrency() -> usize {
+    std::env::var("EVENT_RECEIPT_CONCURRENCY")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(8)
+}
+
+fn event_log_address_concurrency() -> usize {
+    std::env::var("EVENT_LOG_ADDRESS_CONCURRENCY")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(16)
+}
+
+fn event_log_chunk_max_retries() -> usize {
+    std::env::var("EVENT_LOG_CHUNK_MAX_RETRIES")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(5)
+}
+
+fn event_log_min_chunk_blocks() -> u64 {
+    std::env::var("EVENT_LOG_MIN_CHUNK_BLOCKS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(100)
+}
+
+fn event_log_retry_delay(retry_count: usize) -> Duration {
+    let base_ms = std::env::var("EVENT_LOG_RETRY_BASE_DELAY_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(500);
+    let exp = 2_u64.saturating_pow(retry_count.saturating_sub(1) as u32);
+    Duration::from_millis(base_ms.saturating_mul(exp).min(10_000))
+}
+
+fn is_transient_log_error(error: &str) -> bool {
+    let error = error.to_ascii_lowercase();
+    error.contains("503")
+        || error.contains("502")
+        || error.contains("504")
+        || error.contains("429")
+        || error.contains("service unavailable")
+        || error.contains("temporarily unavailable")
+        || error.contains("no backend")
+        || error.contains("currently healthy")
+        || error.contains("rate limit")
+        || error.contains("too many requests")
+        || error.contains("capacity")
+        || error.contains("connection")
+        || error.contains("transport")
+        || error.contains("request failed")
+        || error.contains("timeout")
+        || error.contains("timed out")
+}
+
+fn event_receipt_max_blocks() -> u64 {
+    std::env::var("EVENT_RECEIPT_MAX_BLOCKS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(64)
+}
+
+fn receipts_topic_fallback_enabled() -> bool {
+    env_bool("EVENT_RECEIPTS_FALLBACK_TO_TOPIC_LOGS", false)
+}
+
+fn wss_filter_stats_interval() -> Duration {
+    Duration::from_millis(
+        std::env::var("EVENT_WSS_FILTER_STATS_INTERVAL_MS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(30_000),
     )
 }
 
@@ -661,6 +1068,25 @@ struct RecentLogKeys {
     set: HashSet<LogKey>,
 }
 
+#[derive(Debug)]
+struct WssFilterStats {
+    raw: u64,
+    watched: u64,
+    discarded: u64,
+    last_logged_at: Instant,
+}
+
+impl WssFilterStats {
+    fn new() -> Self {
+        Self {
+            raw: 0,
+            watched: 0,
+            discarded: 0,
+            last_logged_at: Instant::now(),
+        }
+    }
+}
+
 impl RecentLogKeys {
     fn insert(&mut self, key: LogKey, capacity: usize) {
         if self.set.insert(key) {
@@ -701,6 +1127,18 @@ fn hash_log_data(data: &[u8]) -> u64 {
     let mut hasher = DefaultHasher::new();
     data.hash(&mut hasher);
     hasher.finish()
+}
+
+fn env_bool(key: &str, default: bool) -> bool {
+    std::env::var(key)
+        .ok()
+        .map(|value| {
+            matches!(
+                value.to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(default)
 }
 
 fn upsert_trigger(
@@ -749,6 +1187,7 @@ fn watched_addresses(snapshot: &GraphSnapshot) -> Vec<Address> {
 fn event_topics() -> Vec<B256> {
     [
         "Sync(uint112,uint112)",
+        "Sync(uint256,uint256)",
         "Swap(address,address,int256,int256,uint160,uint128,int24)",
         "Mint(address,address,int24,int24,uint128,uint256,uint256)",
         "Burn(address,int24,int24,uint128,uint256,uint256)",
@@ -773,6 +1212,15 @@ fn decode_pool_patch(snapshot: &GraphSnapshot, log: &RpcLog) -> Option<PoolState
     let pool = snapshot.pool(log.address)?;
     let topic0 = *log.topics.first()?;
     if pool.kind == AmmKind::UniswapV2Like && topic0 == signature_hash("Sync(uint112,uint112)") {
+        let data = log.data.as_ref();
+        return Some(PoolStatePatch::UniswapV2Sync {
+            pool_id: log.address,
+            reserve0: word_u128(data, 0)?,
+            reserve1: word_u128(data, 1)?,
+            block_number: log.block_number,
+        });
+    }
+    if pool.kind == AmmKind::AerodromeV2Like && topic0 == signature_hash("Sync(uint256,uint256)") {
         let data = log.data.as_ref();
         return Some(PoolStatePatch::UniswapV2Sync {
             pool_id: log.address,

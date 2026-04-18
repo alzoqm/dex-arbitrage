@@ -12,6 +12,7 @@ use std::{
     time::{Duration, Instant},
 };
 use tokio::time::sleep;
+use tracing::info;
 
 use crate::config::RpcSettings;
 use crate::types::Chain;
@@ -37,6 +38,27 @@ struct RpcCuLimiter {
     refill_rate: u64,
     tokens: AtomicU64,
     last_refill: parking_lot::Mutex<Instant>,
+}
+
+#[derive(Debug)]
+struct RpcUsageAccumulator {
+    since: Instant,
+    by_method_provider: HashMap<String, RpcMethodUsage>,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct RpcMethodUsage {
+    requests: u64,
+    cu: u64,
+}
+
+impl RpcUsageAccumulator {
+    fn new() -> Self {
+        Self {
+            since: Instant::now(),
+            by_method_provider: HashMap::new(),
+        }
+    }
 }
 
 impl RpcCuLimiter {
@@ -101,6 +123,7 @@ impl RpcCuLimiter {
 }
 
 static RPC_CU_LIMITER: OnceLock<RpcCuLimiter> = OnceLock::new();
+static RPC_USAGE_ACCUMULATOR: OnceLock<parking_lot::Mutex<RpcUsageAccumulator>> = OnceLock::new();
 
 #[derive(Debug, Clone)]
 pub struct RpcClients {
@@ -221,7 +244,7 @@ impl RpcClient {
 
         for attempt in 0..=max_retries {
             for endpoint in self.endpoints_for_method(method) {
-                if self.endpoint_is_open(&endpoint) {
+                if self.endpoint_is_open(&endpoint, method) {
                     metrics::counter!(
                         "rpc_provider_skipped_total",
                         "method" => method.to_string(),
@@ -233,18 +256,21 @@ impl RpcClient {
 
                 acquire_rpc_budget(method).await;
                 let started = Instant::now();
+                let provider = provider_label(&endpoint);
+                let cu = rpc_compute_units(method);
                 metrics::counter!(
                     "rpc_requests_total",
                     "method" => method.to_string(),
-                    "provider" => provider_label(&endpoint)
+                    "provider" => provider.clone()
                 )
                 .increment(1);
                 metrics::counter!(
                     "rpc_compute_units_total",
                     "method" => method.to_string(),
-                    "provider" => provider_label(&endpoint)
+                    "provider" => provider.clone()
                 )
-                .increment(rpc_compute_units(method));
+                .increment(cu);
+                record_rpc_usage_attempt(method, &provider, cu);
 
                 match tokio::time::timeout(
                     rpc_timeout(method),
@@ -253,31 +279,37 @@ impl RpcClient {
                 .await
                 {
                     Ok(Ok(value)) => {
-                        self.record_endpoint_success(&endpoint);
+                        self.record_endpoint_success(&endpoint, method);
                         metrics::histogram!(
                             "rpc_request_duration_seconds",
                             "method" => method.to_string(),
-                            "provider" => provider_label(&endpoint)
+                            "provider" => provider.clone()
                         )
                         .record(started.elapsed().as_secs_f64());
                         return Ok(value);
                     }
                     Ok(Err(err)) => {
-                        self.record_endpoint_failure(&endpoint);
+                        let endpoint_failure = should_record_endpoint_failure(method, &err);
+                        if endpoint_failure {
+                            self.record_endpoint_failure(&endpoint, method);
+                        }
                         metrics::counter!(
                             "rpc_errors_total",
                             "method" => method.to_string(),
-                            "provider" => provider_label(&endpoint)
+                            "provider" => provider.clone()
                         )
                         .increment(1);
+                        if !endpoint_failure {
+                            return Err(err);
+                        }
                         last_error = Some(err);
                     }
                     Err(_) => {
-                        self.record_endpoint_failure(&endpoint);
+                        self.record_endpoint_failure(&endpoint, method);
                         metrics::counter!(
                             "rpc_errors_total",
                             "method" => method.to_string(),
-                            "provider" => provider_label(&endpoint)
+                            "provider" => provider.clone()
                         )
                         .increment(1);
                         last_error = Some(anyhow::anyhow!(
@@ -309,9 +341,10 @@ impl RpcClient {
         endpoints
     }
 
-    fn endpoint_is_open(&self, endpoint: &str) -> bool {
+    fn endpoint_is_open(&self, endpoint: &str, method: &str) -> bool {
+        let key = endpoint_status_key(endpoint, method);
         let mut status = self.endpoint_status.lock();
-        let Some(endpoint_status) = status.get_mut(endpoint) else {
+        let Some(endpoint_status) = status.get_mut(&key) else {
             return false;
         };
         match endpoint_status.open_until {
@@ -324,17 +357,20 @@ impl RpcClient {
         }
     }
 
-    fn record_endpoint_success(&self, endpoint: &str) {
-        self.endpoint_status
-            .lock()
-            .insert(endpoint.to_string(), EndpointStatus::default());
+    fn record_endpoint_success(&self, endpoint: &str, method: &str) {
+        self.endpoint_status.lock().insert(
+            endpoint_status_key(endpoint, method),
+            EndpointStatus::default(),
+        );
     }
 
-    fn record_endpoint_failure(&self, endpoint: &str) {
+    fn record_endpoint_failure(&self, endpoint: &str, method: &str) {
         let threshold = env_u64("RPC_PROVIDER_FAILURE_THRESHOLD", 3);
         let open_ms = env_u64("RPC_PROVIDER_CIRCUIT_OPEN_MS", 30_000);
         let mut status = self.endpoint_status.lock();
-        let entry = status.entry(endpoint.to_string()).or_default();
+        let entry = status
+            .entry(endpoint_status_key(endpoint, method))
+            .or_default();
         entry.consecutive_failures = entry.consecutive_failures.saturating_add(1);
         if entry.consecutive_failures >= threshold {
             entry.open_until = Some(Instant::now() + Duration::from_millis(open_ms));
@@ -728,6 +764,60 @@ fn rpc_cu_limiter() -> &'static RpcCuLimiter {
     })
 }
 
+fn record_rpc_usage_attempt(method: &str, provider: &str, cu: u64) {
+    let interval = rpc_usage_log_interval();
+    if interval.is_zero() {
+        return;
+    }
+    let mut usage = RPC_USAGE_ACCUMULATOR
+        .get_or_init(|| parking_lot::Mutex::new(RpcUsageAccumulator::new()))
+        .lock();
+    let key = format!("{method}@{provider}");
+    let entry = usage.by_method_provider.entry(key).or_default();
+    entry.requests = entry.requests.saturating_add(1);
+    entry.cu = entry.cu.saturating_add(cu);
+
+    if usage.since.elapsed() < interval {
+        return;
+    }
+
+    let total_requests = usage
+        .by_method_provider
+        .values()
+        .map(|entry| entry.requests)
+        .sum::<u64>();
+    let total_cu = usage
+        .by_method_provider
+        .values()
+        .map(|entry| entry.cu)
+        .sum::<u64>();
+    let mut methods = usage
+        .by_method_provider
+        .iter()
+        .map(|(key, entry)| format!("{key}:requests={},cu={}", entry.requests, entry.cu))
+        .collect::<Vec<_>>();
+    methods.sort();
+    info!(
+        interval_secs = usage.since.elapsed().as_secs(),
+        total_requests,
+        total_cu,
+        methods = %methods.join(","),
+        "rpc usage summary"
+    );
+
+    usage.by_method_provider.clear();
+    usage.since = Instant::now();
+}
+
+fn rpc_usage_log_interval() -> Duration {
+    Duration::from_secs(
+        std::env::var("RPC_USAGE_LOG_INTERVAL_SECS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(30),
+    )
+}
+
 fn rpc_max_retries(method: &str) -> usize {
     if matches!(
         method,
@@ -769,6 +859,27 @@ fn rpc_backoff(method: &str, attempt: usize) -> Duration {
         acc.wrapping_mul(31) ^ u64::from(byte)
     }) % 50;
     Duration::from_millis(base.saturating_mul(exp).saturating_add(jitter))
+}
+
+fn endpoint_status_key(endpoint: &str, method: &str) -> String {
+    format!("{method} {endpoint}")
+}
+
+fn should_record_endpoint_failure(method: &str, err: &anyhow::Error) -> bool {
+    if !matches!(method, "eth_call" | "eth_estimateGas") {
+        return true;
+    }
+
+    let message = err.to_string().to_ascii_lowercase();
+    if message.starts_with("rpc error") {
+        return message.contains("rate limit")
+            || message.contains("too many")
+            || message.contains("compute unit")
+            || message.contains("capacity")
+            || message.contains("temporarily unavailable");
+    }
+
+    true
 }
 
 fn compact_unique_urls<const N: usize>(urls: [Option<String>; N]) -> Vec<String> {

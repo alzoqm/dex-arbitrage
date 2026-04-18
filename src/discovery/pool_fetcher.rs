@@ -8,12 +8,15 @@ use anyhow::{Context, Result};
 use tracing::{info, warn};
 
 use crate::{
-    abi::{IBalancerPool, IBalancerVault, ICurvePool, IUniswapV2Pair, IUniswapV3Pool},
+    abi::{
+        IAerodromeCLPool, IAerodromeV2Factory, IAerodromeV2Pool, IBalancerPool, IBalancerVault,
+        ICurvePool, IUniswapV2Pair, IUniswapV3Pool,
+    },
     config::{Settings, TokenConfig},
     rpc::RpcClients,
     types::{
-        AmmKind, BalancerPoolState, CurvePoolState, PoolAdmissionStatus, PoolHealth,
-        PoolSpecificState, PoolState, V2PoolState, V3PoolState,
+        AerodromeV2PoolState, AmmKind, BalancerPoolState, CurvePoolState, PoolAdmissionStatus,
+        PoolHealth, PoolSpecificState, PoolState, V2PoolState, V3PoolState,
     },
 };
 
@@ -54,6 +57,7 @@ impl PoolFetcher {
     ) -> Result<Option<PoolState>> {
         match spec.amm_kind {
             AmmKind::UniswapV2Like => self.fetch_v2(spec, block_number).await,
+            AmmKind::AerodromeV2Like => self.fetch_aerodrome_v2(spec, block_number).await,
             AmmKind::UniswapV3Like => self.fetch_v3(spec, block_number).await,
             AmmKind::CurvePlain => self.fetch_curve(spec, block_number).await,
             AmmKind::BalancerWeighted => self.fetch_balancer(spec, block_number).await,
@@ -294,6 +298,252 @@ impl PoolFetcher {
         }
     }
 
+    pub async fn fetch_aerodrome_v2_batch(
+        &self,
+        specs: &[DiscoveredPool],
+        block_number: Option<u64>,
+    ) -> Result<PoolFetchBatch> {
+        if specs.is_empty() {
+            return Ok(PoolFetchBatch {
+                pools: Vec::new(),
+                skipped: Vec::new(),
+            });
+        }
+
+        let chunk_size = pool_fetch_multicall_chunk_size();
+        let mut pools = Vec::new();
+        let mut skipped_pools = Vec::new();
+        let mut scanned = 0_usize;
+        let mut skipped = 0_usize;
+
+        info!(
+            total = specs.len(),
+            chunk_size, "starting aerodrome v2 pool state batch fetch"
+        );
+
+        for (chunk_index, chunk) in specs.chunks(chunk_size).enumerate() {
+            let calls = chunk
+                .iter()
+                .map(|spec| (spec.address, IAerodromeV2Pool::metadataCall {}.abi_encode()))
+                .collect::<Vec<_>>();
+            let metadata = match multicall::aggregate3(&self.rpc, calls).await {
+                Ok(results) => results,
+                Err(err) => {
+                    warn!(
+                        chunk_index,
+                        count = chunk.len(),
+                        error = %err,
+                        "batch aerodrome v2 metadata fetch failed; falling back to per-pool fetch"
+                    );
+                    for spec in chunk {
+                        scanned += 1;
+                        match self.fetch_aerodrome_v2(spec, block_number).await {
+                            Ok(Some(pool)) => {
+                                if aerodrome_v2_pool_has_liquidity(&pool) {
+                                    pools.push(pool);
+                                } else {
+                                    skipped += 1;
+                                    skipped_pools.push(SkippedPoolFetch {
+                                        spec: spec.clone(),
+                                        reason: "aerodrome_v2_zero_liquidity",
+                                    });
+                                }
+                            }
+                            Ok(None) => {
+                                skipped += 1;
+                                skipped_pools.push(SkippedPoolFetch {
+                                    spec: spec.clone(),
+                                    reason: "aerodrome_v2_fetch_returned_none",
+                                });
+                            }
+                            Err(err) => {
+                                skipped += 1;
+                                skipped_pools.push(SkippedPoolFetch {
+                                    spec: spec.clone(),
+                                    reason: "aerodrome_v2_fetch_failed",
+                                });
+                                warn!(
+                                    pool = %spec.address,
+                                    error = %err,
+                                    "skipping aerodrome v2 pool after per-pool fetch failure"
+                                );
+                            }
+                        }
+                    }
+                    continue;
+                }
+            };
+
+            let mut decoded = Vec::new();
+            let mut fee_calls = Vec::new();
+            for (spec, raw) in chunk.iter().zip(metadata.iter()) {
+                scanned += 1;
+                let Some(meta) = raw
+                    .as_ref()
+                    .and_then(|raw| decode_aerodrome_v2_metadata(raw).ok())
+                else {
+                    skipped += 1;
+                    skipped_pools.push(SkippedPoolFetch {
+                        spec: spec.clone(),
+                        reason: "aerodrome_v2_decode_or_call_failed",
+                    });
+                    continue;
+                };
+                if meta.reserve0 == 0 || meta.reserve1 == 0 {
+                    skipped += 1;
+                    skipped_pools.push(SkippedPoolFetch {
+                        spec: spec.clone(),
+                        reason: "aerodrome_v2_zero_liquidity",
+                    });
+                    continue;
+                }
+                if let Some(factory) = spec.factory {
+                    fee_calls.push((
+                        factory,
+                        IAerodromeV2Factory::getFeeCall {
+                            pool: spec.address,
+                            stable: meta.stable,
+                        }
+                        .abi_encode(),
+                    ));
+                }
+                decoded.push((spec, meta));
+            }
+
+            let fee_results = if fee_calls.is_empty() {
+                Vec::new()
+            } else {
+                match multicall::aggregate3(&self.rpc, fee_calls).await {
+                    Ok(results) => results,
+                    Err(err) => {
+                        warn!(
+                            chunk_index,
+                            error = %err,
+                            "batch aerodrome v2 fee fetch failed; using default stable/volatile fees"
+                        );
+                        Vec::new()
+                    }
+                }
+            };
+            let mut fee_iter = fee_results.into_iter();
+            for (spec, meta) in decoded {
+                let fee_ppm = if spec.factory.is_some() {
+                    fee_iter
+                        .next()
+                        .flatten()
+                        .and_then(|raw| decode_aerodrome_fee_ppm(&raw).ok())
+                        .unwrap_or_else(|| default_aerodrome_fee_ppm(meta.stable))
+                } else {
+                    default_aerodrome_fee_ppm(meta.stable)
+                };
+                pools.push(self.build_aerodrome_v2_pool(spec, meta, fee_ppm, block_number));
+            }
+
+            if (chunk_index + 1) % 50 == 0 || scanned == specs.len() {
+                info!(
+                    scanned,
+                    total = specs.len(),
+                    admitted_candidates = pools.len(),
+                    skipped,
+                    "aerodrome v2 pool state batch fetch progress"
+                );
+            }
+        }
+
+        info!(
+            scanned,
+            total = specs.len(),
+            admitted_candidates = pools.len(),
+            skipped,
+            "aerodrome v2 pool state batch fetch complete"
+        );
+        Ok(PoolFetchBatch {
+            pools,
+            skipped: skipped_pools,
+        })
+    }
+
+    async fn fetch_aerodrome_v2(
+        &self,
+        spec: &DiscoveredPool,
+        block_number: Option<u64>,
+    ) -> Result<Option<PoolState>> {
+        let raw = self
+            .rpc
+            .best_read()
+            .eth_call(
+                spec.address,
+                None,
+                IAerodromeV2Pool::metadataCall {}.abi_encode().into(),
+                "latest",
+            )
+            .await?;
+        let meta = decode_aerodrome_v2_metadata(&raw)?;
+        let fee_ppm = match spec.factory {
+            Some(factory) => {
+                let raw = self
+                    .rpc
+                    .best_read()
+                    .eth_call(
+                        factory,
+                        None,
+                        IAerodromeV2Factory::getFeeCall {
+                            pool: spec.address,
+                            stable: meta.stable,
+                        }
+                        .abi_encode()
+                        .into(),
+                        "latest",
+                    )
+                    .await?;
+                decode_aerodrome_fee_ppm(&raw)
+                    .unwrap_or_else(|_| default_aerodrome_fee_ppm(meta.stable))
+            }
+            None => default_aerodrome_fee_ppm(meta.stable),
+        };
+        Ok(Some(self.build_aerodrome_v2_pool(
+            spec,
+            meta,
+            fee_ppm,
+            block_number,
+        )))
+    }
+
+    fn build_aerodrome_v2_pool(
+        &self,
+        spec: &DiscoveredPool,
+        meta: AerodromeV2Metadata,
+        fee_ppm: u32,
+        block_number: Option<u64>,
+    ) -> PoolState {
+        PoolState {
+            pool_id: spec.address,
+            dex_name: spec.dex_name.clone(),
+            kind: spec.amm_kind,
+            token_addresses: vec![meta.token0, meta.token1],
+            token_symbols: vec![
+                self.token_symbol(meta.token0),
+                self.token_symbol(meta.token1),
+            ],
+            factory: spec.factory,
+            registry: spec.registry,
+            vault: spec.vault,
+            quoter: spec.quoter,
+            admission_status: PoolAdmissionStatus::Allowed,
+            health: fresh_health(10_000, false),
+            state: PoolSpecificState::AerodromeV2Like(AerodromeV2PoolState {
+                reserve0: meta.reserve0,
+                reserve1: meta.reserve1,
+                decimals0: meta.decimals0,
+                decimals1: meta.decimals1,
+                stable: meta.stable,
+                fee_ppm,
+            }),
+            last_updated_block: block_number.unwrap_or_default(),
+            extras: HashMap::new(),
+        }
+    }
+
     pub async fn fetch_v3_batch(
         &self,
         specs: &[DiscoveredPool],
@@ -335,7 +585,9 @@ impl PoolFetcher {
                 Ok(results) => {
                     for (spec, raw) in chunk.iter().zip(results.chunks(6)) {
                         scanned += 1;
-                        let Some(decoded) = decode_v3_batch_result(raw) else {
+                        let Some(decoded) =
+                            decode_v3_batch_result(raw, is_slipstream_v3_spec(spec))
+                        else {
                             skipped += 1;
                             skipped_pools.push(SkippedPoolFetch {
                                 spec: spec.clone(),
@@ -440,10 +692,11 @@ impl PoolFetcher {
         spec: &DiscoveredPool,
         block_number: Option<u64>,
     ) -> Result<Option<PoolState>> {
+        let slipstream = is_slipstream_v3_spec(spec);
         let (token0, token1, fee, tick_spacing, liquidity, sqrt_price_x96, tick) =
-            match self.fetch_v3_multicall(spec.address).await {
+            match self.fetch_v3_multicall(spec.address, slipstream).await {
                 Ok(values) => values,
-                Err(_) => self.fetch_v3_sequential(spec.address).await?,
+                Err(_) => self.fetch_v3_sequential(spec.address, slipstream).await?,
             };
 
         Ok(Some(self.build_v3_pool(
@@ -774,6 +1027,7 @@ impl PoolFetcher {
     async fn fetch_v3_multicall(
         &self,
         pool: Address,
+        slipstream: bool,
     ) -> Result<(Address, Address, u32, i32, u128, U256, i32)> {
         let results = multicall::aggregate3(
             &self.rpc,
@@ -817,26 +1071,26 @@ impl PoolFetcher {
                 .and_then(|value| value.as_ref())
                 .context("multicall v3 liquidity failed")?,
         )?;
-        let slot0 = IUniswapV3Pool::slot0Call::abi_decode_returns(
-            results
-                .get(5)
-                .and_then(|value| value.as_ref())
-                .context("multicall v3 slot0 failed")?,
-        )?;
+        let raw_slot0 = results
+            .get(5)
+            .and_then(|value| value.as_ref())
+            .context("multicall v3 slot0 failed")?;
+        let (sqrt_price_x96, tick) = decode_v3_slot0(raw_slot0, slipstream)?;
         Ok((
             token0,
             token1,
             u32::try_from(fee).unwrap_or(u32::MAX),
             i32::try_from(tick_spacing).unwrap_or(0),
             liquidity,
-            U256::saturating_from(slot0.sqrtPriceX96),
-            i32::try_from(slot0.tick).unwrap_or(0),
+            sqrt_price_x96,
+            tick,
         ))
     }
 
     async fn fetch_v3_sequential(
         &self,
         pool: Address,
+        slipstream: bool,
     ) -> Result<(Address, Address, u32, i32, u128, U256, i32)> {
         let token0 = self
             .call_address(pool, IUniswapV3Pool::token0Call {}.abi_encode())
@@ -887,15 +1141,15 @@ impl PoolFetcher {
                 "latest",
             )
             .await?;
-        let slot0 = IUniswapV3Pool::slot0Call::abi_decode_returns(&raw_slot0)?;
+        let (sqrt_price_x96, tick) = decode_v3_slot0(&raw_slot0, slipstream)?;
         Ok((
             token0,
             token1,
             u32::try_from(fee).unwrap_or(u32::MAX),
             i32::try_from(tick_spacing).unwrap_or(0),
             liquidity,
-            U256::saturating_from(slot0.sqrtPriceX96),
-            i32::try_from(slot0.tick).unwrap_or(0),
+            sqrt_price_x96,
+            tick,
         ))
     }
 
@@ -936,6 +1190,44 @@ fn u256_to_u128(value: alloy::primitives::U256) -> u128 {
     value.to_string().parse::<u128>().unwrap_or(u128::MAX)
 }
 
+#[derive(Debug, Clone, Copy)]
+struct AerodromeV2Metadata {
+    decimals0: u128,
+    decimals1: u128,
+    reserve0: u128,
+    reserve1: u128,
+    stable: bool,
+    token0: Address,
+    token1: Address,
+}
+
+fn decode_aerodrome_v2_metadata(raw: &Bytes) -> Result<AerodromeV2Metadata> {
+    let ret = IAerodromeV2Pool::metadataCall::abi_decode_returns(raw)?;
+    Ok(AerodromeV2Metadata {
+        decimals0: u256_to_u128(ret.dec0),
+        decimals1: u256_to_u128(ret.dec1),
+        reserve0: u256_to_u128(ret.r0),
+        reserve1: u256_to_u128(ret.r1),
+        stable: ret.st,
+        token0: ret.t0,
+        token1: ret.t1,
+    })
+}
+
+fn decode_aerodrome_fee_ppm(raw: &Bytes) -> Result<u32> {
+    let fee_bps = IAerodromeV2Factory::getFeeCall::abi_decode_returns(raw)?;
+    let fee_ppm = u256_to_u128(fee_bps).saturating_mul(100);
+    Ok(u32::try_from(fee_ppm).unwrap_or(u32::MAX))
+}
+
+fn default_aerodrome_fee_ppm(stable: bool) -> u32 {
+    if stable {
+        500
+    } else {
+        3_000
+    }
+}
+
 fn decode_v2_batch_result(raw: &[Option<Bytes>]) -> Option<(Address, Address, u128, u128)> {
     let token0 = IUniswapV2Pair::token0Call::abi_decode_returns(raw.first()?.as_ref()?).ok()?;
     let token1 = IUniswapV2Pair::token1Call::abi_decode_returns(raw.get(1)?.as_ref()?).ok()?;
@@ -951,6 +1243,7 @@ fn decode_v2_batch_result(raw: &[Option<Bytes>]) -> Option<(Address, Address, u1
 
 fn decode_v3_batch_result(
     raw: &[Option<Bytes>],
+    slipstream: bool,
 ) -> Option<(Address, Address, u32, i32, u128, U256, i32)> {
     let token0 = IUniswapV3Pool::token0Call::abi_decode_returns(raw.first()?.as_ref()?).ok()?;
     let token1 = IUniswapV3Pool::token1Call::abi_decode_returns(raw.get(1)?.as_ref()?).ok()?;
@@ -959,21 +1252,48 @@ fn decode_v3_batch_result(
         IUniswapV3Pool::tickSpacingCall::abi_decode_returns(raw.get(3)?.as_ref()?).ok()?;
     let liquidity =
         IUniswapV3Pool::liquidityCall::abi_decode_returns(raw.get(4)?.as_ref()?).ok()?;
-    let slot0 = IUniswapV3Pool::slot0Call::abi_decode_returns(raw.get(5)?.as_ref()?).ok()?;
+    let (sqrt_price_x96, tick) = decode_v3_slot0(raw.get(5)?.as_ref()?, slipstream).ok()?;
     Some((
         token0,
         token1,
         u32::try_from(fee).unwrap_or(u32::MAX),
         i32::try_from(tick_spacing).unwrap_or(0),
         liquidity,
-        U256::saturating_from(slot0.sqrtPriceX96),
-        i32::try_from(slot0.tick).unwrap_or(0),
+        sqrt_price_x96,
+        tick,
     ))
+}
+
+fn decode_v3_slot0(raw: &Bytes, slipstream: bool) -> Result<(U256, i32)> {
+    if slipstream {
+        let slot0 = IAerodromeCLPool::slot0Call::abi_decode_returns(raw)?;
+        Ok((
+            U256::saturating_from(slot0.sqrtPriceX96),
+            i32::try_from(slot0.tick).unwrap_or(0),
+        ))
+    } else {
+        let slot0 = IUniswapV3Pool::slot0Call::abi_decode_returns(raw)?;
+        Ok((
+            U256::saturating_from(slot0.sqrtPriceX96),
+            i32::try_from(slot0.tick).unwrap_or(0),
+        ))
+    }
+}
+
+fn is_slipstream_v3_spec(spec: &DiscoveredPool) -> bool {
+    spec.dex_name.starts_with("aerodrome_v3")
 }
 
 fn v2_pool_has_liquidity(pool: &PoolState) -> bool {
     match &pool.state {
         PoolSpecificState::UniswapV2Like(state) => state.reserve0 > 0 && state.reserve1 > 0,
+        _ => true,
+    }
+}
+
+fn aerodrome_v2_pool_has_liquidity(pool: &PoolState) -> bool {
+    match &pool.state {
+        PoolSpecificState::AerodromeV2Like(state) => state.reserve0 > 0 && state.reserve1 > 0,
         _ => true,
     }
 }
@@ -1001,7 +1321,10 @@ fn pool_fetch_max_retries() -> usize {
 }
 
 fn pool_fetch_max_retries_for_kind(kind: AmmKind) -> usize {
-    if matches!(kind, AmmKind::UniswapV2Like | AmmKind::UniswapV3Like) {
+    if matches!(
+        kind,
+        AmmKind::UniswapV2Like | AmmKind::AerodromeV2Like | AmmKind::UniswapV3Like
+    ) {
         return pool_fetch_max_retries();
     }
     std::env::var("POOL_FETCH_OTHER_MAX_RETRIES")

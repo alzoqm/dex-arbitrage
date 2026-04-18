@@ -1,4 +1,8 @@
-use std::{collections::HashSet, sync::Arc, time::Duration};
+use std::{
+    collections::HashSet,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use alloy::primitives::Address;
 use anyhow::{Context, Result};
@@ -17,12 +21,12 @@ use crate::{
     graph::{DistanceCache, GraphSnapshot, GraphStore},
     monitoring::metrics as telemetry,
     reorg::{ReorgDetector, ReorgEvent},
-    risk::{depeg_guard::DepegGuard, limits::RiskManager},
-    router::Router,
+    risk::{depeg_guard::DepegGuard, limits::RiskManager, valuation::amount_to_usd_e8},
+    router::{RouteSearchStats, Router},
     rpc::RpcClients,
     types::{
-        BlockRef, CandidatePath, EdgeRef, FinalityLevel, PoolSpecificState, RefreshBatch,
-        SubmissionResult,
+        BlockRef, CandidatePath, EdgeRef, ExactPlan, FinalityLevel, PoolSpecificState,
+        RefreshBatch, SubmissionResult,
     },
 };
 
@@ -73,7 +77,9 @@ pub async fn run_chain(
     if let Some(block_ref) = initial_snapshot.block_ref.clone() {
         reorg_detector.update_chain(block_ref).ok();
     }
-    let initial_changed_edges = initial_edge_refs(initial_snapshot.as_ref());
+    let initial_distance_cache = DistanceCache::recompute(initial_snapshot.as_ref());
+    let initial_changed_edges =
+        initial_edge_refs(initial_snapshot.as_ref(), &initial_distance_cache);
     info!(
         selected_edges = initial_changed_edges.len(),
         total_edges = total_edge_count(initial_snapshot.as_ref()),
@@ -247,12 +253,20 @@ async fn process_refresh(
     }
 
     let distance_cache = DistanceCache::recompute(snapshot.as_ref());
+    let detect_started = Instant::now();
     let mut candidates = detector.detect(snapshot.as_ref(), &changed_edges, &distance_cache);
+    let detect_ms = detect_started.elapsed().as_millis();
     for _ in &candidates {
         telemetry::record_candidate_detected(snapshot.snapshot_id, settings.chain.as_str());
     }
+    info!(
+        snapshot_id = snapshot.snapshot_id,
+        changed_edge_count = changed_edges.len(),
+        candidate_count = candidates.len(),
+        detect_ms,
+        "candidate detection complete"
+    );
     if candidates.is_empty() {
-        debug!(snapshot_id = snapshot.snapshot_id, "no candidates detected");
         return Ok(());
     }
     candidates.sort_by_key(|candidate| candidate.screening_score_q32);
@@ -265,8 +279,11 @@ async fn process_refresh(
         "processing candidate set"
     );
 
+    let refresh_started = Instant::now();
+    let mut profitability = ProfitabilityRefreshStats::new(candidates.len());
+
     for candidate in candidates {
-        if let Some(result) = process_candidate(
+        let result = process_candidate(
             settings.clone(),
             snapshot.as_ref(),
             candidate,
@@ -278,11 +295,18 @@ async fn process_refresh(
             nonce_manager,
             simulate_only,
         )
-        .await?
-        {
+        .await?;
+        profitability.record(&result);
+        if let Some(result) = result.submission {
             info!(tx_hash = %result.tx_hash, channel = %result.channel, "submission accepted");
         }
     }
+    profitability.log(
+        &settings,
+        snapshot.snapshot_id,
+        changed_edges.len(),
+        refresh_started.elapsed(),
+    );
 
     Ok(())
 }
@@ -299,20 +323,119 @@ async fn process_candidate(
     depeg_guard: &DepegGuard,
     nonce_manager: &NonceManager,
     simulate_only: bool,
-) -> Result<Option<SubmissionResult>> {
-    let Some(plan) = router.search_best_plan(snapshot, &candidate).await? else {
-        return Ok(None);
+) -> Result<CandidateProcessResult> {
+    let total_started = Instant::now();
+    let router_started = Instant::now();
+    let route_result = match router
+        .search_best_plan_with_stats(snapshot, &candidate)
+        .await
+    {
+        Ok(result) => result,
+        Err(err) => {
+            let router_ms = router_started.elapsed().as_millis();
+            warn!(
+                error = %err,
+                snapshot_id = snapshot.snapshot_id,
+                cycle_key = %candidate.cycle_key,
+                router_ms,
+                "route search failed; rejecting candidate without stopping engine"
+            );
+            telemetry::record_candidate_rejected("router_error", settings.chain.as_str());
+            return Ok(CandidateProcessResult::new(
+                CandidateVerdict::NoRoute,
+                None,
+                None,
+                RouteSearchStats::default(),
+                router_ms,
+                0,
+                total_started.elapsed().as_millis(),
+            ));
+        }
     };
+    let route_stats = route_result.stats;
+    let Some(plan) = route_result.plan else {
+        let router_ms = router_started.elapsed().as_millis();
+        return Ok(CandidateProcessResult::new(
+            CandidateVerdict::NoRoute,
+            None,
+            None,
+            route_stats,
+            router_ms,
+            0,
+            total_started.elapsed().as_millis(),
+        ));
+    };
+    let router_ms = router_started.elapsed().as_millis();
 
-    let Some(mut executable) = validator.prepare(plan, snapshot).await? else {
-        telemetry::record_candidate_rejected("validation", settings.chain.as_str());
-        return Ok(None);
+    let validator_started = Instant::now();
+    let prepared = match validator.prepare(plan, snapshot).await {
+        Ok(prepared) => prepared,
+        Err(err) => {
+            let validator_ms = validator_started.elapsed().as_millis();
+            warn!(
+                error = %err,
+                snapshot_id = snapshot.snapshot_id,
+                cycle_key = %candidate.cycle_key,
+                router_ms,
+                validator_ms,
+                "candidate validation failed; rejecting candidate without stopping engine"
+            );
+            telemetry::record_candidate_rejected("validation_error", settings.chain.as_str());
+            return Ok(CandidateProcessResult::new(
+                CandidateVerdict::ValidationRejected,
+                None,
+                None,
+                route_stats,
+                router_ms,
+                validator_ms,
+                total_started.elapsed().as_millis(),
+            ));
+        }
     };
+    let Some(mut executable) = prepared else {
+        telemetry::record_candidate_rejected("validation", settings.chain.as_str());
+        return Ok(CandidateProcessResult::new(
+            CandidateVerdict::ValidationRejected,
+            None,
+            None,
+            route_stats,
+            router_ms,
+            validator_started.elapsed().as_millis(),
+            total_started.elapsed().as_millis(),
+        ));
+    };
+    let validator_ms = validator_started.elapsed().as_millis();
     telemetry::record_candidate_validated(executable.exact.snapshot_id, settings.chain.as_str());
     telemetry::record_opportunity_found(
         executable.exact.snapshot_id,
         i128_to_i64_saturating(executable.exact.net_profit_usd_e8),
         settings.chain.as_str(),
+    );
+    telemetry::record_pnl_expected(
+        i128_to_i64_saturating(executable.exact.net_profit_usd_e8),
+        settings.chain.as_str(),
+    );
+    telemetry::record_opportunity_profitability(
+        settings.chain.as_str(),
+        i128_to_i64_saturating(executable.exact.net_profit_usd_e8),
+        i128_to_i64_saturating(executable.exact.gross_profit_usd_e8),
+        i128_to_i64_saturating(executable.exact.gas_cost_usd_e8),
+        i128_to_i64_saturating(executable.exact.actual_flash_fee_usd_e8),
+        u128_to_u64_saturating(executable.exact.input_value_usd_e8),
+        ratio_bps(
+            executable.exact.net_profit_usd_e8,
+            executable.exact.input_value_usd_e8,
+        ),
+        ratio_bps(
+            executable.exact.gas_cost_usd_e8,
+            executable.exact.gross_profit_usd_e8.max(0) as u128,
+        ),
+    );
+    telemetry::record_route_latency_seconds("router", millis_to_secs(router_ms));
+    telemetry::record_route_latency_seconds("validator", millis_to_secs(validator_ms));
+    telemetry::record_route_latency_seconds(
+        "candidate_total",
+        millis_to_secs(total_started.elapsed().as_millis()),
     );
 
     // Check depeg status for all stable tokens in the route
@@ -324,7 +447,15 @@ async fn process_candidate(
                     "token is unhealthy (depegged), rejecting candidate"
                 );
                 telemetry::record_candidate_rejected("depeg", settings.chain.as_str());
-                return Ok(None);
+                return Ok(CandidateProcessResult::new(
+                    CandidateVerdict::DepegRejected,
+                    None,
+                    Some(executable.exact.clone()),
+                    route_stats,
+                    router_ms,
+                    validator_ms,
+                    total_started.elapsed().as_millis(),
+                ));
             }
         }
     }
@@ -332,14 +463,25 @@ async fn process_candidate(
     if let Err(err) = risk.pre_trade_check(&executable) {
         debug!(error = %err, path_len = candidate.path.len(), "risk pre-trade check rejected plan");
         telemetry::record_candidate_rejected("risk", settings.chain.as_str());
-        return Ok(None);
+        return Ok(CandidateProcessResult::new(
+            CandidateVerdict::RiskRejected,
+            None,
+            Some(executable.exact),
+            route_stats,
+            router_ms,
+            validator_ms,
+            total_started.elapsed().as_millis(),
+        ));
     }
 
     if simulate_only {
+        let total_ms = total_started.elapsed().as_millis();
         info!(
             chain = %settings.chain,
             snapshot_id = executable.exact.snapshot_id,
             anchor_symbol = %candidate.start_symbol,
+            route = %format_candidate_route(&candidate),
+            dex_route = %format_candidate_dex_route(&candidate),
             input_token = %candidate.start_token,
             path_len = candidate.path.len(),
             input_amount = executable.exact.input_amount,
@@ -353,12 +495,31 @@ async fn process_candidate(
             actual_flash_fee_raw = executable.exact.actual_flash_fee_raw,
             actual_flash_fee_usd_e8 = executable.exact.actual_flash_fee_usd_e8,
             gas_cost_usd_e8 = executable.exact.gas_cost_usd_e8,
+            gas_l2_execution_cost_wei = %executable.exact.gas_l2_execution_cost_wei,
+            gas_l1_data_fee_wei = %executable.exact.gas_l1_data_fee_wei,
+            gas_total_cost_wei = %executable.exact.gas_cost_wei,
             net_profit_usd_e8 = executable.exact.net_profit_usd_e8,
+            profit_margin_bps = ratio_bps(executable.exact.net_profit_usd_e8, executable.exact.input_value_usd_e8),
+            gas_to_gross_bps = ratio_bps(
+                executable.exact.gas_cost_usd_e8,
+                executable.exact.gross_profit_usd_e8.max(0) as u128,
+            ),
             contract_min_profit_raw = executable.exact.contract_min_profit_raw,
             capital_source = ?executable.exact.capital_source,
+            router_ms,
+            validator_ms,
+            candidate_total_ms = total_ms,
             "validated opportunity (simulation only)"
         );
-        return Ok(None);
+        return Ok(CandidateProcessResult::new(
+            CandidateVerdict::Simulated,
+            None,
+            Some(executable.exact),
+            route_stats,
+            router_ms,
+            validator_ms,
+            total_ms,
+        ));
     }
 
     executable.nonce = nonce_manager.reserve();
@@ -389,7 +550,15 @@ async fn process_candidate(
                         executable.exact.gas_limit,
                     );
                     telemetry::record_pnl_realized(realized, settings.chain.as_str());
-                    Ok(Some(result))
+                    Ok(CandidateProcessResult::new(
+                        CandidateVerdict::Submitted,
+                        Some(result),
+                        Some(executable.exact),
+                        route_stats,
+                        router_ms,
+                        validator_ms,
+                        total_started.elapsed().as_millis(),
+                    ))
                 }
                 Ok(ReceiptOutcome::Reverted) => {
                     nonce_manager.mark_included(executable.nonce);
@@ -404,7 +573,15 @@ async fn process_candidate(
                         settings.chain.as_str(),
                     );
                     warn!(tx_hash = %result.tx_hash, nonce = executable.nonce, "submitted transaction reverted");
-                    Ok(None)
+                    Ok(CandidateProcessResult::new(
+                        CandidateVerdict::SubmissionRejected,
+                        None,
+                        Some(executable.exact),
+                        route_stats,
+                        router_ms,
+                        validator_ms,
+                        total_started.elapsed().as_millis(),
+                    ))
                 }
                 Ok(ReceiptOutcome::TimedOut) => {
                     risk.mark_failed_submission();
@@ -414,7 +591,15 @@ async fn process_candidate(
                         "receipt_timeout",
                     );
                     warn!(tx_hash = %result.tx_hash, nonce = executable.nonce, "submitted transaction receipt wait timed out");
-                    Ok(None)
+                    Ok(CandidateProcessResult::new(
+                        CandidateVerdict::SubmissionRejected,
+                        None,
+                        Some(executable.exact),
+                        route_stats,
+                        router_ms,
+                        validator_ms,
+                        total_started.elapsed().as_millis(),
+                    ))
                 }
                 Err(err) => {
                     risk.mark_failed_submission();
@@ -424,7 +609,15 @@ async fn process_candidate(
                         "receipt_error",
                     );
                     warn!(error = %err, tx_hash = %result.tx_hash, nonce = executable.nonce, "failed while waiting for transaction receipt");
-                    Ok(None)
+                    Ok(CandidateProcessResult::new(
+                        CandidateVerdict::SubmissionRejected,
+                        None,
+                        Some(executable.exact),
+                        route_stats,
+                        router_ms,
+                        validator_ms,
+                        total_started.elapsed().as_millis(),
+                    ))
                 }
             }
         }
@@ -433,9 +626,372 @@ async fn process_candidate(
             risk.mark_failed_submission();
             telemetry::record_candidate_rejected("submission", settings.chain.as_str());
             warn!(error = %err, nonce = executable.nonce, "submission failed");
-            Ok(None)
+            Ok(CandidateProcessResult::new(
+                CandidateVerdict::SubmissionRejected,
+                None,
+                Some(executable.exact),
+                route_stats,
+                router_ms,
+                validator_ms,
+                total_started.elapsed().as_millis(),
+            ))
         }
     }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum CandidateVerdict {
+    NoRoute,
+    ValidationRejected,
+    DepegRejected,
+    RiskRejected,
+    Simulated,
+    Submitted,
+    SubmissionRejected,
+}
+
+#[derive(Debug)]
+struct CandidateProcessResult {
+    verdict: CandidateVerdict,
+    submission: Option<SubmissionResult>,
+    exact: Option<ExactPlan>,
+    route_stats: RouteSearchStats,
+    router_ms: u128,
+    validator_ms: u128,
+    total_ms: u128,
+}
+
+impl CandidateProcessResult {
+    fn new(
+        verdict: CandidateVerdict,
+        submission: Option<SubmissionResult>,
+        exact: Option<ExactPlan>,
+        route_stats: RouteSearchStats,
+        router_ms: u128,
+        validator_ms: u128,
+        total_ms: u128,
+    ) -> Self {
+        Self {
+            verdict,
+            submission,
+            exact,
+            route_stats,
+            router_ms,
+            validator_ms,
+            total_ms,
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct ProfitabilityRefreshStats {
+    candidate_count: usize,
+    no_route: usize,
+    validation_rejected: usize,
+    depeg_rejected: usize,
+    risk_rejected: usize,
+    simulated: usize,
+    submitted: usize,
+    submission_rejected: usize,
+    total_router_ms: u128,
+    total_validator_ms: u128,
+    total_candidate_ms: u128,
+    max_candidate_ms: u128,
+    route_amount_range_missing: usize,
+    route_evaluated_amounts: usize,
+    route_no_output_quotes: usize,
+    route_no_output_hop0: usize,
+    route_no_output_hop1: usize,
+    route_no_output_hop2: usize,
+    route_no_output_hop3_plus: usize,
+    route_no_output_v2: usize,
+    route_no_output_aerodrome_v2: usize,
+    route_no_output_v3: usize,
+    route_no_output_curve: usize,
+    route_no_output_balancer: usize,
+    route_gross_nonpositive: usize,
+    route_flash_fee_nonpositive: usize,
+    route_profitable_plans: usize,
+    route_fast_sizer_points: usize,
+    route_used_fast_sizer: usize,
+    route_used_wide_fallback: usize,
+    best: Option<BestProfit>,
+}
+
+#[derive(Debug, Clone)]
+struct BestProfit {
+    net_profit_usd_e8: i128,
+    gross_profit_usd_e8: i128,
+    gas_cost_usd_e8: i128,
+    gas_l2_execution_cost_wei: String,
+    gas_l1_data_fee_wei: String,
+    gas_total_cost_wei: String,
+    actual_flash_fee_usd_e8: i128,
+    input_value_usd_e8: u128,
+    flash_loan_value_usd_e8: u128,
+    profit_margin_bps: i64,
+    gas_to_gross_bps: i64,
+    path_len: usize,
+    capital_source: String,
+}
+
+impl ProfitabilityRefreshStats {
+    fn new(candidate_count: usize) -> Self {
+        Self {
+            candidate_count,
+            ..Self::default()
+        }
+    }
+
+    fn record(&mut self, result: &CandidateProcessResult) {
+        match result.verdict {
+            CandidateVerdict::NoRoute => self.no_route += 1,
+            CandidateVerdict::ValidationRejected => self.validation_rejected += 1,
+            CandidateVerdict::DepegRejected => self.depeg_rejected += 1,
+            CandidateVerdict::RiskRejected => self.risk_rejected += 1,
+            CandidateVerdict::Simulated => self.simulated += 1,
+            CandidateVerdict::Submitted => self.submitted += 1,
+            CandidateVerdict::SubmissionRejected => self.submission_rejected += 1,
+        }
+        self.total_router_ms = self.total_router_ms.saturating_add(result.router_ms);
+        self.total_validator_ms = self.total_validator_ms.saturating_add(result.validator_ms);
+        self.total_candidate_ms = self.total_candidate_ms.saturating_add(result.total_ms);
+        self.max_candidate_ms = self.max_candidate_ms.max(result.total_ms);
+        let route = &result.route_stats;
+        if route.amount_range_missing {
+            self.route_amount_range_missing += 1;
+        }
+        self.route_evaluated_amounts = self
+            .route_evaluated_amounts
+            .saturating_add(route.evaluated_amounts);
+        self.route_no_output_quotes = self
+            .route_no_output_quotes
+            .saturating_add(route.no_output_quotes);
+        self.route_no_output_hop0 = self
+            .route_no_output_hop0
+            .saturating_add(route.no_output_hop0);
+        self.route_no_output_hop1 = self
+            .route_no_output_hop1
+            .saturating_add(route.no_output_hop1);
+        self.route_no_output_hop2 = self
+            .route_no_output_hop2
+            .saturating_add(route.no_output_hop2);
+        self.route_no_output_hop3_plus = self
+            .route_no_output_hop3_plus
+            .saturating_add(route.no_output_hop3_plus);
+        self.route_no_output_v2 = self.route_no_output_v2.saturating_add(route.no_output_v2);
+        self.route_no_output_aerodrome_v2 = self
+            .route_no_output_aerodrome_v2
+            .saturating_add(route.no_output_aerodrome_v2);
+        self.route_no_output_v3 = self.route_no_output_v3.saturating_add(route.no_output_v3);
+        self.route_no_output_curve = self
+            .route_no_output_curve
+            .saturating_add(route.no_output_curve);
+        self.route_no_output_balancer = self
+            .route_no_output_balancer
+            .saturating_add(route.no_output_balancer);
+        self.route_gross_nonpositive = self
+            .route_gross_nonpositive
+            .saturating_add(route.gross_nonpositive);
+        self.route_flash_fee_nonpositive = self
+            .route_flash_fee_nonpositive
+            .saturating_add(route.flash_fee_nonpositive);
+        self.route_profitable_plans = self
+            .route_profitable_plans
+            .saturating_add(route.profitable_plans);
+        self.route_fast_sizer_points = self
+            .route_fast_sizer_points
+            .saturating_add(route.fast_sizer_points);
+        if route.used_fast_sizer {
+            self.route_used_fast_sizer += 1;
+        }
+        if route.used_wide_fallback {
+            self.route_used_wide_fallback += 1;
+        }
+
+        if matches!(
+            result.verdict,
+            CandidateVerdict::Simulated | CandidateVerdict::Submitted
+        ) {
+            if let Some(exact) = &result.exact {
+                self.record_best(exact);
+            }
+        }
+    }
+
+    fn record_best(&mut self, exact: &ExactPlan) {
+        let next = BestProfit {
+            net_profit_usd_e8: exact.net_profit_usd_e8,
+            gross_profit_usd_e8: exact.gross_profit_usd_e8,
+            gas_cost_usd_e8: exact.gas_cost_usd_e8,
+            gas_l2_execution_cost_wei: exact.gas_l2_execution_cost_wei.to_string(),
+            gas_l1_data_fee_wei: exact.gas_l1_data_fee_wei.to_string(),
+            gas_total_cost_wei: exact.gas_cost_wei.to_string(),
+            actual_flash_fee_usd_e8: exact.actual_flash_fee_usd_e8,
+            input_value_usd_e8: exact.input_value_usd_e8,
+            flash_loan_value_usd_e8: exact.flash_loan_value_usd_e8,
+            profit_margin_bps: ratio_bps(exact.net_profit_usd_e8, exact.input_value_usd_e8),
+            gas_to_gross_bps: ratio_bps(
+                exact.gas_cost_usd_e8,
+                exact.gross_profit_usd_e8.max(0) as u128,
+            ),
+            path_len: exact.hops.len(),
+            capital_source: format!("{:?}", exact.capital_source),
+        };
+        if self
+            .best
+            .as_ref()
+            .map(|best| next.net_profit_usd_e8 > best.net_profit_usd_e8)
+            .unwrap_or(true)
+        {
+            self.best = Some(next);
+        }
+    }
+
+    fn log(
+        &self,
+        settings: &Settings,
+        snapshot_id: u64,
+        changed_edge_count: usize,
+        refresh_duration: Duration,
+    ) {
+        let avg_candidate_ms = avg_ms(self.total_candidate_ms, self.candidate_count);
+        let avg_router_ms = avg_ms(self.total_router_ms, self.candidate_count);
+        let avg_validator_ms = avg_ms(self.total_validator_ms, self.candidate_count);
+        if let Some(best) = &self.best {
+            info!(
+                chain = %settings.chain,
+                snapshot_id,
+                candidate_count = self.candidate_count,
+                changed_edge_count,
+                no_route = self.no_route,
+                validation_rejected = self.validation_rejected,
+                depeg_rejected = self.depeg_rejected,
+                risk_rejected = self.risk_rejected,
+                simulated = self.simulated,
+                submitted = self.submitted,
+                submission_rejected = self.submission_rejected,
+                best_net_profit_usd_e8 = best.net_profit_usd_e8,
+                best_gross_profit_usd_e8 = best.gross_profit_usd_e8,
+                best_gas_cost_usd_e8 = best.gas_cost_usd_e8,
+                best_gas_l2_execution_cost_wei = %best.gas_l2_execution_cost_wei,
+                best_gas_l1_data_fee_wei = %best.gas_l1_data_fee_wei,
+                best_gas_total_cost_wei = %best.gas_total_cost_wei,
+                best_actual_flash_fee_usd_e8 = best.actual_flash_fee_usd_e8,
+                best_input_value_usd_e8 = best.input_value_usd_e8,
+                best_flash_loan_value_usd_e8 = best.flash_loan_value_usd_e8,
+                best_profit_margin_bps = best.profit_margin_bps,
+                best_gas_to_gross_bps = best.gas_to_gross_bps,
+                best_path_len = best.path_len,
+                best_capital_source = %best.capital_source,
+                avg_candidate_ms,
+                avg_router_ms,
+                avg_validator_ms,
+                max_candidate_ms = self.max_candidate_ms,
+                route_amount_range_missing = self.route_amount_range_missing,
+                route_evaluated_amounts = self.route_evaluated_amounts,
+                route_no_output_quotes = self.route_no_output_quotes,
+                route_no_output_hop0 = self.route_no_output_hop0,
+                route_no_output_hop1 = self.route_no_output_hop1,
+                route_no_output_hop2 = self.route_no_output_hop2,
+                route_no_output_hop3_plus = self.route_no_output_hop3_plus,
+                route_no_output_v2 = self.route_no_output_v2,
+                route_no_output_aerodrome_v2 = self.route_no_output_aerodrome_v2,
+                route_no_output_v3 = self.route_no_output_v3,
+                route_no_output_curve = self.route_no_output_curve,
+                route_no_output_balancer = self.route_no_output_balancer,
+                route_gross_nonpositive = self.route_gross_nonpositive,
+                route_flash_fee_nonpositive = self.route_flash_fee_nonpositive,
+                route_profitable_plans = self.route_profitable_plans,
+                route_fast_sizer_points = self.route_fast_sizer_points,
+                route_used_fast_sizer = self.route_used_fast_sizer,
+                route_used_wide_fallback = self.route_used_wide_fallback,
+                refresh_total_ms = refresh_duration.as_millis(),
+                "profitability refresh summary"
+            );
+        } else {
+            info!(
+                chain = %settings.chain,
+                snapshot_id,
+                candidate_count = self.candidate_count,
+                changed_edge_count,
+                no_route = self.no_route,
+                validation_rejected = self.validation_rejected,
+                depeg_rejected = self.depeg_rejected,
+                risk_rejected = self.risk_rejected,
+                simulated = self.simulated,
+                submitted = self.submitted,
+                submission_rejected = self.submission_rejected,
+                avg_candidate_ms,
+                avg_router_ms,
+                avg_validator_ms,
+                max_candidate_ms = self.max_candidate_ms,
+                route_amount_range_missing = self.route_amount_range_missing,
+                route_evaluated_amounts = self.route_evaluated_amounts,
+                route_no_output_quotes = self.route_no_output_quotes,
+                route_no_output_hop0 = self.route_no_output_hop0,
+                route_no_output_hop1 = self.route_no_output_hop1,
+                route_no_output_hop2 = self.route_no_output_hop2,
+                route_no_output_hop3_plus = self.route_no_output_hop3_plus,
+                route_no_output_v2 = self.route_no_output_v2,
+                route_no_output_aerodrome_v2 = self.route_no_output_aerodrome_v2,
+                route_no_output_v3 = self.route_no_output_v3,
+                route_no_output_curve = self.route_no_output_curve,
+                route_no_output_balancer = self.route_no_output_balancer,
+                route_gross_nonpositive = self.route_gross_nonpositive,
+                route_flash_fee_nonpositive = self.route_flash_fee_nonpositive,
+                route_profitable_plans = self.route_profitable_plans,
+                route_fast_sizer_points = self.route_fast_sizer_points,
+                route_used_fast_sizer = self.route_used_fast_sizer,
+                route_used_wide_fallback = self.route_used_wide_fallback,
+                refresh_total_ms = refresh_duration.as_millis(),
+                "profitability refresh summary"
+            );
+        }
+    }
+}
+
+fn avg_ms(total: u128, count: usize) -> u128 {
+    if count == 0 {
+        0
+    } else {
+        total / count as u128
+    }
+}
+
+fn millis_to_secs(ms: u128) -> f64 {
+    ms as f64 / 1_000.0
+}
+
+fn ratio_bps(numerator: i128, denominator: u128) -> i64 {
+    if denominator == 0 {
+        return 0;
+    }
+    let scaled = numerator.saturating_mul(10_000);
+    let ratio = scaled / denominator as i128;
+    i128_to_i64_saturating(ratio)
+}
+
+fn u128_to_u64_saturating(value: u128) -> u64 {
+    u64::try_from(value).unwrap_or(u64::MAX)
+}
+
+fn format_candidate_route(candidate: &CandidatePath) -> String {
+    let mut parts = Vec::with_capacity(candidate.path.len() + 1);
+    parts.push(candidate.start_symbol.clone());
+    for hop in &candidate.path {
+        parts.push(format!("{}", hop.to));
+    }
+    parts.join(" -> ")
+}
+
+fn format_candidate_dex_route(candidate: &CandidatePath) -> String {
+    candidate
+        .path
+        .iter()
+        .map(|hop| format!("{}:{:?}", hop.dex_name, hop.amm_kind))
+        .collect::<Vec<_>>()
+        .join(" -> ")
 }
 
 fn validate_runtime_prerequisites(settings: &Settings, simulate_only: bool) -> Result<()> {
@@ -465,45 +1021,53 @@ fn validate_runtime_prerequisites(settings: &Settings, simulate_only: bool) -> R
     Ok(())
 }
 
-fn all_edge_refs(snapshot: &GraphSnapshot) -> Vec<EdgeRef> {
-    snapshot
-        .adjacency
-        .iter()
-        .enumerate()
-        .flat_map(|(from, edges)| (0..edges.len()).map(move |edge_idx| EdgeRef { from, edge_idx }))
-        .collect()
-}
+fn initial_edge_refs(snapshot: &GraphSnapshot, distance_cache: &DistanceCache) -> Vec<EdgeRef> {
+    let mut by_pair = std::collections::HashMap::<(usize, usize), InitialEdgeCandidate>::new();
 
-fn initial_edge_refs(snapshot: &GraphSnapshot) -> Vec<EdgeRef> {
-    let mut refs = all_edge_refs(snapshot);
-    refs.sort_by(|left, right| {
-        let left_edge = snapshot.edge(*left);
-        let right_edge = snapshot.edge(*right);
-        match (left_edge, right_edge) {
-            (Some(left_edge), Some(right_edge)) => left_edge
-                .weight_log_q32
-                .cmp(&right_edge.weight_log_q32)
-                .then_with(|| {
-                    right_edge
-                        .pool_health
-                        .confidence_bps
-                        .cmp(&left_edge.pool_health.confidence_bps)
-                })
-                .then_with(|| {
-                    right_edge
-                        .liquidity
-                        .safe_capacity_in
-                        .cmp(&left_edge.liquidity.safe_capacity_in)
-                }),
-            (Some(_), None) => std::cmp::Ordering::Less,
-            (None, Some(_)) => std::cmp::Ordering::Greater,
-            (None, None) => std::cmp::Ordering::Equal,
+    for (from, edges) in snapshot.adjacency.iter().enumerate() {
+        if !distance_cache
+            .reachable_from_anchor
+            .get(from)
+            .copied()
+            .unwrap_or(false)
+        {
+            continue;
         }
-    });
+
+        for (edge_idx, edge) in edges.iter().enumerate() {
+            if !distance_cache
+                .reachable_to_anchor
+                .get(edge.to)
+                .copied()
+                .unwrap_or(false)
+            {
+                continue;
+            }
+            if edge.spot_rate_q128.is_zero() || edge.liquidity.safe_capacity_in == 0 {
+                continue;
+            }
+
+            let edge_ref = EdgeRef { from, edge_idx };
+            let candidate = InitialEdgeCandidate::from_edge(snapshot, edge_ref, edge);
+            by_pair
+                .entry((edge.from, edge.to))
+                .and_modify(|current| {
+                    if compare_initial_edge_candidate(&candidate, current).is_lt() {
+                        *current = candidate.clone();
+                    }
+                })
+                .or_insert(candidate);
+        }
+    }
+
+    let mut refs = by_pair.into_values().collect::<Vec<_>>();
+    refs.sort_by(compare_initial_edge_candidate);
     if let Some(limit) = initial_refresh_max_edges() {
         refs.truncate(limit);
     }
-    refs
+    refs.into_iter()
+        .map(|candidate| candidate.edge_ref)
+        .collect()
 }
 
 fn total_edge_count(snapshot: &GraphSnapshot) -> usize {
@@ -511,10 +1075,69 @@ fn total_edge_count(snapshot: &GraphSnapshot) -> usize {
 }
 
 fn initial_refresh_max_edges() -> Option<usize> {
-    std::env::var("INITIAL_REFRESH_MAX_EDGES")
+    match std::env::var("INITIAL_REFRESH_MAX_EDGES")
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
-        .and_then(|value| (value > 0).then_some(value))
+    {
+        Some(0) => None,
+        Some(value) => Some(value),
+        None => Some(4096),
+    }
+}
+
+#[derive(Debug, Clone)]
+struct InitialEdgeCandidate {
+    edge_ref: EdgeRef,
+    priority: u8,
+    capacity_usd_e8: u128,
+    capacity_raw: u128,
+    confidence_bps: u16,
+    weight_log_q32: i64,
+    pool_id: Address,
+}
+
+impl InitialEdgeCandidate {
+    fn from_edge(snapshot: &GraphSnapshot, edge_ref: EdgeRef, edge: &crate::types::Edge) -> Self {
+        let from_token = &snapshot.tokens[edge.from];
+        let to_token = &snapshot.tokens[edge.to];
+        let priority = if from_token.is_cycle_anchor || to_token.is_cycle_anchor {
+            0
+        } else if from_token.manual_price_usd_e8.is_some() && to_token.manual_price_usd_e8.is_some()
+        {
+            1
+        } else if from_token.manual_price_usd_e8.is_some() || to_token.manual_price_usd_e8.is_some()
+        {
+            2
+        } else {
+            3
+        };
+        let capacity_usd_e8 =
+            amount_to_usd_e8(edge.liquidity.safe_capacity_in, from_token).unwrap_or(0);
+        let capacity_usd_e8 = capacity_usd_e8.max(u128::from(edge.liquidity.estimated_usd_e8));
+
+        Self {
+            edge_ref,
+            priority,
+            capacity_usd_e8,
+            capacity_raw: edge.liquidity.safe_capacity_in,
+            confidence_bps: edge.pool_health.confidence_bps,
+            weight_log_q32: edge.weight_log_q32,
+            pool_id: edge.pool_id,
+        }
+    }
+}
+
+fn compare_initial_edge_candidate(
+    left: &InitialEdgeCandidate,
+    right: &InitialEdgeCandidate,
+) -> std::cmp::Ordering {
+    left.priority
+        .cmp(&right.priority)
+        .then_with(|| right.capacity_usd_e8.cmp(&left.capacity_usd_e8))
+        .then_with(|| right.confidence_bps.cmp(&left.confidence_bps))
+        .then_with(|| left.weight_log_q32.cmp(&right.weight_log_q32))
+        .then_with(|| right.capacity_raw.cmp(&left.capacity_raw))
+        .then_with(|| left.pool_id.cmp(&right.pool_id))
 }
 
 fn collect_changed_specs(snapshot: &GraphSnapshot, batch: &RefreshBatch) -> Vec<DiscoveredPool> {
@@ -571,6 +1194,7 @@ fn pool_to_spec(pool: &crate::types::PoolState) -> DiscoveredPool {
             PoolSpecificState::BalancerWeighted(state) => Some(state.pool_id),
             _ => None,
         },
+        priority: false,
     }
 }
 

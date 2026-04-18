@@ -1,6 +1,6 @@
 use dex_arbitrage::{
-    amm::{balancer, curve, uniswap_v2, uniswap_v3},
-    types::{BalancerPoolState, CurvePoolState, V2PoolState, V3PoolState},
+    amm::{aerodrome_v2, balancer, curve, uniswap_v2, uniswap_v3},
+    types::{AerodromeV2PoolState, BalancerPoolState, CurvePoolState, V2PoolState, V3PoolState},
 };
 
 #[test]
@@ -52,6 +52,40 @@ fn uniswap_v2_quote_decreases_when_fee_increases() {
 }
 
 #[test]
+fn aerodrome_volatile_quote_matches_v2_style_constant_product() {
+    let state = AerodromeV2PoolState {
+        reserve0: 1_000_000_000,
+        reserve1: 500_000_000,
+        decimals0: 1_000_000,
+        decimals1: 1_000_000,
+        stable: false,
+        fee_ppm: 3_000,
+    };
+
+    let out = aerodrome_v2::quote_exact_in(&state, true, 10_000_000).unwrap();
+
+    assert!(out > 0);
+    assert!(out < state.reserve1);
+}
+
+#[test]
+fn aerodrome_stable_quote_uses_stable_invariant() {
+    let state = AerodromeV2PoolState {
+        reserve0: 1_000_000_000,
+        reserve1: 1_000_000_000_000_000_000_000,
+        decimals0: 1_000_000,
+        decimals1: 1_000_000_000_000_000_000,
+        stable: true,
+        fee_ppm: 500,
+    };
+
+    let out = aerodrome_v2::quote_exact_in(&state, true, 1_000_000).unwrap();
+
+    assert!(out > 0);
+    assert!(out < 1_100_000_000_000_000_000);
+}
+
+#[test]
 fn uniswap_v3_fallback_quote_is_conservative() {
     let state = V3PoolState {
         sqrt_price_x96: alloy::primitives::U256::from(1u128 << 96),
@@ -64,6 +98,27 @@ fn uniswap_v3_fallback_quote_is_conservative() {
     let out = uniswap_v3::fallback_quote(&state, true, 1_000_000);
     assert!(out > 0);
     assert!(out <= 1_000_000);
+}
+
+#[test]
+fn uniswap_v3_safe_capacity_respects_sqrt_price_limit() {
+    let state = V3PoolState {
+        sqrt_price_x96: alloy::primitives::U256::from(1u128 << 96),
+        liquidity: 1_000_000_000_000,
+        tick: 0,
+        fee: 500,
+        tick_spacing: 10,
+    };
+
+    let (_, _, liquidity) = uniswap_v3::spot_rate(&state, true);
+
+    assert!(liquidity.safe_capacity_in > 0);
+    assert!(liquidity.safe_capacity_in < state.liquidity / 50);
+    assert!(uniswap_v3::fallback_quote(&state, true, liquidity.safe_capacity_in) > 0);
+    assert_eq!(
+        uniswap_v3::fallback_quote(&state, true, liquidity.safe_capacity_in.saturating_mul(2)),
+        0
+    );
 }
 
 #[test]

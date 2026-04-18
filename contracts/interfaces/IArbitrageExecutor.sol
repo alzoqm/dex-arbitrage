@@ -6,7 +6,8 @@ interface IArbitrageExecutor {
         UniswapV2Like,
         UniswapV3Like,
         CurvePlain,
-        BalancerWeighted
+        BalancerWeighted,
+        AerodromeV2Like
     }
 
     struct Split {

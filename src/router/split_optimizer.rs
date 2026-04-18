@@ -17,6 +17,13 @@ pub struct SplitOptimizer {
 
 impl SplitOptimizer {
     pub fn new(settings: Arc<crate::config::Settings>, exact_quoter: ExactQuoter) -> Self {
+        Self::with_exact_quoter(settings, exact_quoter)
+    }
+
+    pub fn with_exact_quoter(
+        settings: Arc<crate::config::Settings>,
+        exact_quoter: ExactQuoter,
+    ) -> Self {
         Self {
             exact_quoter,
             max_parallel_pools: settings.search.max_split_parallel_pools,
@@ -130,6 +137,9 @@ impl SplitOptimizer {
                 Some(edge) => edge,
                 None => continue,
             };
+            if edge.liquidity.safe_capacity_in > 0 && total_in > edge.liquidity.safe_capacity_in {
+                continue;
+            }
             let Some(pool) = snapshot.pool(edge.pool_id) else {
                 continue;
             };
@@ -183,6 +193,12 @@ impl SplitOptimizer {
                 crate::types::PoolSpecificState::UniswapV2Like(state) => SplitExtra::V2 {
                     fee_ppm: state.fee_ppm,
                 },
+                crate::types::PoolSpecificState::AerodromeV2Like(state) => {
+                    SplitExtra::AerodromeV2 {
+                        stable: state.stable,
+                        fee_ppm: state.fee_ppm,
+                    }
+                }
                 crate::types::PoolSpecificState::UniswapV3Like(state) => {
                     let zero_for_one = pool.token_addresses.first().copied() == Some(token_in);
                     SplitExtra::V3 {
@@ -242,6 +258,21 @@ impl SplitOptimizer {
         });
 
         Ok((plans, total_out))
+    }
+
+    pub async fn quote_split(&self, snapshot: &GraphSnapshot, split: &SplitPlan) -> Result<u128> {
+        let Some(pool) = snapshot.pool(split.pool_id) else {
+            return Ok(0);
+        };
+        self.exact_quoter
+            .quote_pool(
+                snapshot,
+                pool,
+                split.token_in,
+                split.token_out,
+                split.amount_in,
+            )
+            .await
     }
 }
 

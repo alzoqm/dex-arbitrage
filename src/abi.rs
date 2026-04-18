@@ -27,6 +27,32 @@ sol! {
             returns (uint112 reserve0, uint112 reserve1, uint32 blockTimestampLast);
     }
 
+    interface IAerodromeV2Factory {
+        event PoolCreated(address indexed token0, address indexed token1, bool indexed stable, address pool, uint256 index);
+
+        function allPoolsLength() external view returns (uint256);
+        function allPools(uint256 index) external view returns (address);
+        function getPool(address tokenA, address tokenB, bool stable) external view returns (address);
+        function getFee(address pool, bool stable) external view returns (uint256);
+    }
+
+    interface IAerodromeV2Pool {
+        event Sync(uint256 reserve0, uint256 reserve1);
+
+        function metadata()
+            external
+            view
+            returns (uint256 dec0, uint256 dec1, uint256 r0, uint256 r1, bool st, address t0, address t1);
+        function token0() external view returns (address);
+        function token1() external view returns (address);
+        function stable() external view returns (bool);
+        function getReserves()
+            external
+            view
+            returns (uint256 reserve0, uint256 reserve1, uint256 blockTimestampLast);
+        function getAmountOut(uint256 amountIn, address tokenIn) external view returns (uint256);
+    }
+
     interface IUniswapV3Factory {
         event PoolCreated(
             address indexed token0,
@@ -35,6 +61,17 @@ sol! {
             int24 tickSpacing,
             address pool
         );
+
+        function getPool(address tokenA, address tokenB, uint24 fee) external view returns (address);
+    }
+
+    interface IAerodromeCLFactory {
+        event PoolCreated(address indexed token0, address indexed token1, int24 indexed tickSpacing, address pool);
+
+        function allPoolsLength() external view returns (uint256);
+        function allPools(uint256 index) external view returns (address);
+        function tickSpacings() external view returns (int24[] memory);
+        function getPool(address tokenA, address tokenB, int24 tickSpacing) external view returns (address);
     }
 
     interface IUniswapV3Pool {
@@ -57,12 +94,50 @@ sol! {
             );
     }
 
+    interface IAerodromeCLPool {
+        function token0() external view returns (address);
+        function token1() external view returns (address);
+        function fee() external view returns (uint24);
+        function tickSpacing() external view returns (int24);
+        function liquidity() external view returns (uint128);
+        function slot0()
+            external
+            view
+            returns (
+                uint160 sqrtPriceX96,
+                int24 tick,
+                uint16 observationIndex,
+                uint16 observationCardinality,
+                uint16 observationCardinalityNext,
+                bool unlocked
+            );
+    }
+
     interface IV3QuoterV2 {
         struct QuoteExactInputSingleParams {
             address tokenIn;
             address tokenOut;
             uint256 amountIn;
             uint24 fee;
+            uint160 sqrtPriceLimitX96;
+        }
+
+        function quoteExactInputSingle(
+            QuoteExactInputSingleParams memory params
+        ) external returns (
+            uint256 amountOut,
+            uint160 sqrtPriceX96After,
+            uint32 initializedTicksCrossed,
+            uint256 gasEstimate
+        );
+    }
+
+    interface IAerodromeCLQuoter {
+        struct QuoteExactInputSingleParams {
+            address tokenIn;
+            address tokenOut;
+            uint256 amountIn;
+            int24 tickSpacing;
             uint160 sqrtPriceLimitX96;
         }
 
@@ -140,6 +215,10 @@ sol! {
         function getConfiguration(address asset) external view returns (ReserveConfigurationMap memory);
     }
 
+    interface IBaseGasPriceOracle {
+        function getL1FeeUpperBound(uint256 txSize) external view returns (uint256);
+    }
+
     interface IMulticall3 {
         struct Call3 {
             address target;
@@ -163,7 +242,8 @@ sol! {
             UniswapV2Like,
             UniswapV3Like,
             CurvePlain,
-            BalancerWeighted
+            BalancerWeighted,
+            AerodromeV2Like
         }
 
         struct Split {

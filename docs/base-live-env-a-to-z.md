@@ -8,7 +8,9 @@ Base + Aave V3 flash loan
 + Uniswap V2
 + SushiSwap V2
 + BaseSwap V2
++ Aerodrome Classic V2
 + Uniswap V3
++ Aerodrome Slipstream/V3
 + Curve MetaRegistry
 + Balancer Vault
 ```
@@ -16,13 +18,15 @@ Base + Aave V3 flash loan
 아래는 아직 현재 코드에서 실매매 범위에 넣지 않는 것이 맞다.
 
 ```text
-Aerodrome V2 = Solidly/ve(3,3) 계열이라 stable pool 수학과 router/adapter 검증이 별도로 필요
-Aerodrome Slipstream/V3 = Uniswap V3와 비슷하지만 factory/quoter/콜백 호환성을 별도 검증해야 함
 Base 전체 DEX = 각 DEX adapter와 quote/execute 검증이 필요
 Base 전체 토큰 = 가격/디페그/flash-loan 가능 여부/토큰 동작 리스크 검증이 필요
 ```
 
 따라서 지금 세팅은 “Base 체인 기준으로 현재 코드가 지원하고 온체인 검증한 주요 venue 전체”다. 특정 심볼만 제한하지는 않는다. `config/base.toml`의 `symbols = []`라서 심볼 필터는 풀려 있고, Aave reserve와 발견된 pool 토큰은 discovery 단계에서 확장될 수 있다. 다만 venue는 현재 코드가 지원하는 DEX adapter 범위로 제한된다.
+
+운영 비용 보호를 위해 현재 기본값은 `DISCOVERY_FETCH_UNSEEN_POOLS=false`다. 즉 discovery cache에는 Base factory의 전체 pool 목록을 유지하지만, 매 재시작마다 아직 상태 검증을 통과하지 않은 수백만 pool을 전부 eth_call로 읽지는 않는다. 실매매 후보 범위는 현재 `pool_state_cache`에 들어온 검증 완료 pool과 새 이벤트로 갱신되는 watched pool 중심이다. 이 값을 true로 바꾸면 범위는 넓어지지만 Alchemy 비용과 bootstrap 시간이 크게 증가한다.
+
+주의: Aerodrome Classic V2를 실제 실행 경로에 포함하려면 새 `ArbitrageExecutor`를 재배포하고 Safe에서 새 executor에 operator 권한을 다시 허용해야 한다. 기존 배포본은 Aerodrome V2 adapter enum/function이 없는 이전 바이트코드다.
 
 진입/종료 anchor는 Aave에서 active, unpaused, flash-loan-enabled인 reserve가 되도록 맞춘다. stable이라는 이유만으로 anchor가 되지 않게 `USDC`, `USDT`의 `is_cycle_anchor = false`를 명시했고, Aave reserve 확인 단계에서 flash loan 가능한 자산만 다시 anchor로 승격된다. 또한 `allow_self_funded = false`로 맞춰 진입 자산은 executor 잔고 우선 사용이 아니라 전액 flash loan 기준으로 선택된다.
 
@@ -106,13 +110,16 @@ BASE_UNISWAP_V2_FACTORY=0x8909Dc15e40173Ff4699343b6eB8132c65e18eC6
 BASE_SUSHISWAP_V2_FACTORY=0x71524B4f93c58fcbF659783284E38825f0622859
 BASE_BASESWAP_FACTORY=0xFDa619b6d20975be80A10332cD39b9a4b0FAa8BB
 
-# 현재 코드에서는 Aerodrome을 production venue로 켜지 않는다.
-BASE_AERODROME_V2_FACTORY="추가 세팅 필요"
-BASE_AERODROME_V3_FACTORY="추가 세팅 필요"
-BASE_AERODROME_V3_QUOTER="추가 세팅 필요"
+BASE_AERODROME_V2_FACTORY=0x420DD381b31aEf6683db6B902084cB0FFECe40Da
+BASE_AERODROME_V3_LEGACY_FACTORY=0x5e7BB104d84c7CB9B682AaC2F3d509f5F406809A
+BASE_AERODROME_V3_CAPS_FACTORY=0xaDe65c38CD4849aDBA595a4323a8C7DdfE89716a
+BASE_AERODROME_V3_FACTORY=0xf8f2eB4940CFE7d13603DDDD87f123820Fc061Ef
 
 BASE_UNISWAP_V3_FACTORY=0x33128a8fC17869897dcE68Ed026d694621f6FDfD
 BASE_UNISWAP_V3_QUOTER=0x3d4e44Eb1374240CE5F1B871ab261CD16335B76a
+BASE_AERODROME_V3_LEGACY_QUOTER=0x254cF9E1E6e233aa1AC962CB9B05b2cfeAaE15b0
+BASE_AERODROME_V3_CAPS_QUOTER=0x3d4C22254F86f64B7eC90ab8F7aeC1FBFD271c6C
+BASE_AERODROME_V3_QUOTER=0x514c8B5f54112481E28028F1166Bd78501089259
 BASE_CURVE_REGISTRY=0x87DD13Dd25a1DBde0E1EdcF5B8Fa6cfff7eABCaD
 BASE_BALANCER_VAULT=0xBA12222222228d8Ba445958a75a0704d566BF2C8
 
@@ -137,17 +144,41 @@ TOKEN_METADATA_MULTICALL_CHUNK_SIZE=250
 DISABLE_POOL_STATE_CACHE=false
 DISCOVERY_FETCH_UNSEEN_POOLS=false
 DISABLE_SKIPPED_POOL_CACHE=false
-SKIPPED_POOL_CACHE_TTL_SECS=86400
+SKIPPED_POOL_CACHE_TTL_SECS=2592000
 USE_V3_RPC_QUOTER=false
-SEARCH_MAX_CANDIDATES_PER_REFRESH=64
-INITIAL_REFRESH_MAX_EDGES=1024
+VERIFY_V3_WITH_RPC_QUOTER=true
+VERIFY_V3_REFINEMENT_POINTS=5
+USE_GAS_ESTIMATE_RPC=false
+STATIC_GAS_LIMIT_BUFFER_BPS=2000
+FLASH_LOAN_GAS_OVERHEAD=180000
+DISCOVERY_SAVE_AFTER_EACH_DEX=false
+DISCOVERY_REFRESH_CONFIGURED_SEEDS=false
+SEARCH_MAX_CANDIDATES_PER_REFRESH=32
+SEARCH_CANDIDATE_SELECTION_BUFFER_MULTIPLIER=4
+INITIAL_REFRESH_MAX_EDGES=4096
+BOOTSTRAP_REPLAY_CACHED_POOL_STATES=true
 EVENT_INGEST_MODE=wss
-EVENT_WSS_FILTER_MODE=topic_logs
+EVENT_WSS_FILTER_MODE=address_logs
 EVENT_WSS_RECONCILE_MODE=topic_logs
+EVENT_WSS_RECONCILE_STRATEGY=adaptive
 EVENT_WSS_RECONCILE_INTERVAL_BLOCKS=2
 EVENT_WSS_RECONCILE_INTERVAL_MS=10000
+EVENT_WSS_AUDIT_INTERVAL_BLOCKS=64
+EVENT_WSS_AUDIT_INTERVAL_MS=120000
+EVENT_WSS_RECONCILE_CONFIRMATION_BLOCKS=1
+EVENT_WSS_RECONCILE_BURST_THRESHOLD=16
+EVENT_WSS_RECONCILE_BURST_MS=30000
 EVENT_WSS_RECENT_LOG_CACHE=100000
+EVENT_WSS_FILTER_STATS_INTERVAL_MS=30000
+EVENT_LOG_ADDRESS_CONCURRENCY=16
+EVENT_RECEIPT_MAX_BLOCKS=64
+EVENT_RECEIPT_CONCURRENCY=8
+EVENT_RECEIPTS_FALLBACK_TO_TOPIC_LOGS=false
+RPC_USAGE_LOG_INTERVAL_SECS=30
+BASE_L1_FEE_TX_SIZE_OVERHEAD_BYTES=160
 ```
+
+`BASE_L1_FEE_TX_SIZE_OVERHEAD_BYTES`는 Base L1 데이터비 추정용이다. Base는 L2 실행비 외에 L1 데이터비가 따로 붙으므로, 실매매 순이익 계산에서는 Base GasPriceOracle의 `getL1FeeUpperBound(txSize)` 값을 gas cost에 포함한다. 서명 전에는 완전한 RLP transaction 크기를 모르기 때문에 calldata 길이에 이 overhead를 더한 값으로 보수적으로 추정한다.
 
 **3. 아직 네가 직접 채워야 하는 값**
 현재 자동으로 채울 수 없거나, 네 지갑 서명이 필요한 값은 이것들이다.

@@ -106,6 +106,7 @@ pub struct SearchSettings {
     pub max_virtual_branches_per_node: usize,
     pub path_beam_width: usize,
     pub max_candidates_per_refresh: usize,
+    pub candidate_selection_buffer_multiplier: usize,
     pub max_pair_edges_per_pair: usize,
     pub max_split_parallel_pools: usize,
 }
@@ -117,6 +118,7 @@ impl Default for SearchSettings {
             max_virtual_branches_per_node: 16,
             path_beam_width: 96,
             max_candidates_per_refresh: 512,
+            candidate_selection_buffer_multiplier: 1,
             max_pair_edges_per_pair: 1,
             max_split_parallel_pools: 3,
         }
@@ -218,6 +220,7 @@ struct FileSearchConfig {
     max_virtual_branches_per_node: Option<usize>,
     path_beam_width: Option<usize>,
     max_candidates_per_refresh: Option<usize>,
+    candidate_selection_buffer_multiplier: Option<usize>,
     max_pair_edges_per_pair: Option<usize>,
     max_split_parallel_pools: Option<usize>,
 }
@@ -418,6 +421,11 @@ impl Settings {
                 "SEARCH_MAX_CANDIDATES_PER_REFRESH",
                 file_cfg.search.max_candidates_per_refresh,
                 512,
+            ),
+            candidate_selection_buffer_multiplier: configured_usize(
+                "SEARCH_CANDIDATE_SELECTION_BUFFER_MULTIPLIER",
+                file_cfg.search.candidate_selection_buffer_multiplier,
+                1,
             ),
             max_pair_edges_per_pair: configured_usize(
                 "SEARCH_MAX_PAIR_EDGES_PER_PAIR",

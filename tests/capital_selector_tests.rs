@@ -46,6 +46,8 @@ fn plan(input_amount: u128, output_amount: u128) -> ExactPlan {
         net_profit_usd_e8: 0,
         expected_profit: gross_profit_raw,
         gas_limit: 0,
+        gas_l2_execution_cost_wei: U256::ZERO,
+        gas_l1_data_fee_wei: U256::ZERO,
         gas_cost_wei: U256::ZERO,
         capital_source: CapitalSource::SelfFunded,
         flash_loan_amount: 0,

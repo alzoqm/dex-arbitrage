@@ -1,7 +1,7 @@
 use std::{collections::HashMap, fs, sync::Arc, time::Duration};
 
 use alloy::{
-    primitives::{keccak256, Address, B256, U256},
+    primitives::{aliases::I24, keccak256, Address, Uint, B256, U256},
     sol_types::SolCall,
 };
 use anyhow::{Context, Result};
@@ -9,7 +9,10 @@ use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
 use crate::{
-    abi::{ICurveRegistry, IUniswapV2Factory},
+    abi::{
+        IAerodromeCLFactory, IAerodromeV2Factory, ICurveRegistry, IUniswapV2Factory,
+        IUniswapV3Factory,
+    },
     cache::{load_cache, load_legacy_cache, repair_cache, AtomicCacheWriter, CacheLoadResult},
     config::{DexConfig, Settings},
     monitoring::metrics as telemetry,
@@ -29,6 +32,8 @@ pub struct DiscoveredPool {
     pub vault: Option<Address>,
     pub quoter: Option<Address>,
     pub balancer_pool_id: Option<B256>,
+    #[serde(default)]
+    pub priority: bool,
 }
 
 #[derive(Debug)]
@@ -46,6 +51,7 @@ impl FactoryScanner {
         let latest = self.latest_block().await?;
         let mut cache = DiscoveryCache::load(&self.settings)
             .unwrap_or_else(|_| DiscoveryCache::new(self.settings.chain_id));
+        let save_after_each_dex = env_bool("DISCOVERY_SAVE_AFTER_EACH_DEX", false);
         let mut pools = Vec::new();
         for dex in self.settings.dexes.iter().filter(|dex| dex.enabled) {
             info!(
@@ -58,6 +64,14 @@ impl FactoryScanner {
             let (mut part, next_cursor) = match dex.discovery_kind {
                 DiscoveryKind::FactoryAllPairs => {
                     self.scan_v2_factory(dex, cached.as_ref(), latest).await?
+                }
+                DiscoveryKind::SolidlyFactoryAllPools => {
+                    self.scan_solidly_factory(dex, cached.as_ref(), latest)
+                        .await?
+                }
+                DiscoveryKind::SlipstreamFactoryAllPools => {
+                    self.scan_slipstream_factory(dex, cached.as_ref(), latest)
+                        .await?
                 }
                 DiscoveryKind::PoolCreatedLogs => {
                     self.scan_v3_factory_logs(dex, cached.as_ref(), latest)
@@ -77,13 +91,18 @@ impl FactoryScanner {
                 dex.name.clone(),
                 CachedDexScan::from_scan(dex, latest, next_cursor, &part),
             );
-            cache.save(&self.settings).ok();
+            if save_after_each_dex {
+                cache.save(&self.settings).ok();
+            }
             info!(
                 dex = %dex.name,
                 pools = part.len(),
                 "dex discovery complete"
             );
             pools.append(&mut part);
+        }
+        if !save_after_each_dex {
+            cache.save(&self.settings).ok();
         }
         Ok(pools)
     }
@@ -121,6 +140,7 @@ impl FactoryScanner {
                 crate::types::PoolSpecificState::BalancerWeighted(state) => Some(state.pool_id),
                 _ => None,
             },
+            priority: false,
         })
     }
 
@@ -149,6 +169,24 @@ impl FactoryScanner {
             "v2 factory pair count loaded"
         );
 
+        if let Some(cached) = cached.filter(|cached| cached.matches(dex, latest)) {
+            if cached.cursor.count >= len {
+                info!(
+                    dex = %dex.name,
+                    cached_pairs = cached.pools.len(),
+                    total_pairs = len,
+                    "v2 discovery cache is complete"
+                );
+                return Ok((
+                    cached.pools.clone(),
+                    ScanCursor {
+                        block: latest,
+                        count: len,
+                    },
+                ));
+            }
+        }
+
         let mut pools = cached_pools(cached, dex);
         let start = cached
             .filter(|cached| cached.matches(dex, latest))
@@ -171,6 +209,7 @@ impl FactoryScanner {
                 vault: dex.vault,
                 quoter: dex.quoter,
                 balancer_pool_id: None,
+                priority: false,
             });
         }
         dedup_pools(&mut pools);
@@ -181,6 +220,338 @@ impl FactoryScanner {
                 count: len,
             },
         ))
+    }
+
+    async fn scan_solidly_factory(
+        &self,
+        dex: &DexConfig,
+        cached: Option<&CachedDexScan>,
+        latest: u64,
+    ) -> Result<(Vec<DiscoveredPool>, ScanCursor)> {
+        let Some(factory) = dex.factory else {
+            return Ok((Vec::new(), ScanCursor::default()));
+        };
+        let raw = self
+            .rpc
+            .best_read()
+            .eth_call(
+                factory,
+                None,
+                IAerodromeV2Factory::allPoolsLengthCall {}
+                    .abi_encode()
+                    .into(),
+                "latest",
+            )
+            .await?;
+        let ret = IAerodromeV2Factory::allPoolsLengthCall::abi_decode_returns(&raw)
+            .context("decode allPoolsLength failed")?;
+        let len = u256_to_u64(ret);
+        info!(
+            dex = %dex.name,
+            factory = %factory,
+            total_pools = len,
+            "solidly factory pool count loaded"
+        );
+
+        if let Some(cached) = cached.filter(|cached| cached.matches(dex, latest)) {
+            if cached.cursor.count >= len {
+                info!(
+                    dex = %dex.name,
+                    cached_pools = cached.pools.len(),
+                    total_pools = len,
+                    "solidly discovery cache is complete"
+                );
+                return Ok((
+                    cached.pools.clone(),
+                    ScanCursor {
+                        block: latest,
+                        count: len,
+                    },
+                ));
+            }
+        }
+
+        let mut pools = cached_pools(cached, dex);
+        let start = cached
+            .filter(|cached| cached.matches(dex, latest))
+            .map(|cached| cached.cursor.count.min(len))
+            .unwrap_or(0);
+        let new_pools = match self.scan_solidly_pools_multicall(factory, start, len).await {
+            Ok(pools) => pools,
+            Err(err) => {
+                warn!(dex = %dex.name, error = %err, "multicall allPools scan failed; falling back to sequential eth_call");
+                self.scan_solidly_pools_sequential(factory, start, len)
+                    .await?
+            }
+        };
+        for address in new_pools {
+            pools.push(DiscoveredPool {
+                address,
+                dex_name: dex.name.clone(),
+                amm_kind: dex.amm_kind,
+                factory: dex.factory,
+                registry: dex.registry,
+                vault: dex.vault,
+                quoter: dex.quoter,
+                balancer_pool_id: None,
+                priority: false,
+            });
+        }
+        if should_refresh_configured_seeds(cached) {
+            let mut seeded = self.seed_configured_solidly_pools(dex).await?;
+            pools.append(&mut seeded);
+        }
+        dedup_pools(&mut pools);
+        Ok((
+            pools,
+            ScanCursor {
+                block: latest,
+                count: len,
+            },
+        ))
+    }
+
+    async fn seed_configured_solidly_pools(&self, dex: &DexConfig) -> Result<Vec<DiscoveredPool>> {
+        let Some(factory) = dex.factory else {
+            return Ok(Vec::new());
+        };
+        let tokens = self
+            .settings
+            .tokens
+            .iter()
+            .map(|token| token.address)
+            .collect::<Vec<_>>();
+        if tokens.len() < 2 {
+            return Ok(Vec::new());
+        }
+
+        let mut pools = Vec::new();
+        for i in 0..tokens.len() {
+            for j in (i + 1)..tokens.len() {
+                for stable in [false, true] {
+                    let raw = self
+                        .rpc
+                        .best_read()
+                        .eth_call(
+                            factory,
+                            None,
+                            IAerodromeV2Factory::getPoolCall {
+                                tokenA: tokens[i],
+                                tokenB: tokens[j],
+                                stable,
+                            }
+                            .abi_encode()
+                            .into(),
+                            "latest",
+                        )
+                        .await?;
+                    let pool = IAerodromeV2Factory::getPoolCall::abi_decode_returns(&raw)?;
+                    if pool == Address::ZERO {
+                        continue;
+                    }
+                    pools.push(DiscoveredPool {
+                        address: pool,
+                        dex_name: dex.name.clone(),
+                        amm_kind: dex.amm_kind,
+                        factory: dex.factory,
+                        registry: dex.registry,
+                        vault: dex.vault,
+                        quoter: dex.quoter,
+                        balancer_pool_id: None,
+                        priority: true,
+                    });
+                }
+            }
+        }
+        if !pools.is_empty() {
+            info!(
+                dex = %dex.name,
+                seeded_pool_count = pools.len(),
+                "seeded configured-token solidly pools from factory"
+            );
+        }
+        Ok(pools)
+    }
+
+    async fn scan_slipstream_factory(
+        &self,
+        dex: &DexConfig,
+        cached: Option<&CachedDexScan>,
+        latest: u64,
+    ) -> Result<(Vec<DiscoveredPool>, ScanCursor)> {
+        let Some(factory) = dex.factory else {
+            return Ok((Vec::new(), ScanCursor::default()));
+        };
+        let raw = self
+            .rpc
+            .best_read()
+            .eth_call(
+                factory,
+                None,
+                IAerodromeCLFactory::allPoolsLengthCall {}
+                    .abi_encode()
+                    .into(),
+                "latest",
+            )
+            .await?;
+        let ret = IAerodromeCLFactory::allPoolsLengthCall::abi_decode_returns(&raw)
+            .context("decode slipstream allPoolsLength failed")?;
+        let len = u256_to_u64(ret);
+        info!(
+            dex = %dex.name,
+            factory = %factory,
+            total_pools = len,
+            "slipstream factory pool count loaded"
+        );
+
+        if let Some(cached) = cached.filter(|cached| cached.matches(dex, latest)) {
+            if cached.cursor.count >= len {
+                info!(
+                    dex = %dex.name,
+                    cached_pools = cached.pools.len(),
+                    total_pools = len,
+                    "slipstream discovery cache is complete"
+                );
+                return Ok((
+                    cached.pools.clone(),
+                    ScanCursor {
+                        block: latest,
+                        count: len,
+                    },
+                ));
+            }
+        }
+
+        let mut pools = cached_pools(cached, dex);
+        let start = cached
+            .filter(|cached| cached.matches(dex, latest))
+            .map(|cached| cached.cursor.count.min(len))
+            .unwrap_or(0);
+        let new_pools = match self
+            .scan_slipstream_pools_multicall(factory, start, len)
+            .await
+        {
+            Ok(pools) => pools,
+            Err(err) => {
+                warn!(dex = %dex.name, error = %err, "multicall slipstream allPools scan failed; falling back to sequential eth_call");
+                self.scan_slipstream_pools_sequential(factory, start, len)
+                    .await?
+            }
+        };
+        for address in new_pools {
+            pools.push(DiscoveredPool {
+                address,
+                dex_name: dex.name.clone(),
+                amm_kind: dex.amm_kind,
+                factory: dex.factory,
+                registry: dex.registry,
+                vault: dex.vault,
+                quoter: dex.quoter,
+                balancer_pool_id: None,
+                priority: true,
+            });
+        }
+        if should_refresh_configured_seeds(cached) {
+            let mut seeded = self.seed_configured_slipstream_pools(dex).await?;
+            pools.append(&mut seeded);
+        }
+        dedup_pools(&mut pools);
+        Ok((
+            pools,
+            ScanCursor {
+                block: latest,
+                count: len,
+            },
+        ))
+    }
+
+    async fn seed_configured_slipstream_pools(
+        &self,
+        dex: &DexConfig,
+    ) -> Result<Vec<DiscoveredPool>> {
+        let Some(factory) = dex.factory else {
+            return Ok(Vec::new());
+        };
+        let tokens = self
+            .settings
+            .tokens
+            .iter()
+            .map(|token| token.address)
+            .collect::<Vec<_>>();
+        if tokens.len() < 2 {
+            return Ok(Vec::new());
+        }
+
+        let tick_spacings = self.slipstream_tick_spacings(factory).await?;
+        if tick_spacings.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut pools = Vec::new();
+        for i in 0..tokens.len() {
+            for j in (i + 1)..tokens.len() {
+                for &tick_spacing in &tick_spacings {
+                    let raw = self
+                        .rpc
+                        .best_read()
+                        .eth_call(
+                            factory,
+                            None,
+                            IAerodromeCLFactory::getPoolCall {
+                                tokenA: tokens[i],
+                                tokenB: tokens[j],
+                                tickSpacing: tick_spacing,
+                            }
+                            .abi_encode()
+                            .into(),
+                            "latest",
+                        )
+                        .await?;
+                    let pool = IAerodromeCLFactory::getPoolCall::abi_decode_returns(&raw)?;
+                    if pool == Address::ZERO {
+                        continue;
+                    }
+                    pools.push(DiscoveredPool {
+                        address: pool,
+                        dex_name: dex.name.clone(),
+                        amm_kind: dex.amm_kind,
+                        factory: dex.factory,
+                        registry: dex.registry,
+                        vault: dex.vault,
+                        quoter: dex.quoter,
+                        balancer_pool_id: None,
+                        priority: true,
+                    });
+                }
+            }
+        }
+        if !pools.is_empty() {
+            info!(
+                dex = %dex.name,
+                seeded_pool_count = pools.len(),
+                "seeded configured-token slipstream pools from factory"
+            );
+        }
+        Ok(pools)
+    }
+
+    async fn slipstream_tick_spacings(&self, factory: Address) -> Result<Vec<I24>> {
+        let raw = self
+            .rpc
+            .best_read()
+            .eth_call(
+                factory,
+                None,
+                IAerodromeCLFactory::tickSpacingsCall {}.abi_encode().into(),
+                "latest",
+            )
+            .await?;
+        let tick_spacings = IAerodromeCLFactory::tickSpacingsCall::abi_decode_returns(&raw)?;
+        if tick_spacings.is_empty() {
+            Ok(default_slipstream_tick_spacings())
+        } else {
+            Ok(tick_spacings)
+        }
     }
 
     async fn scan_v3_factory_logs(
@@ -217,7 +588,12 @@ impl FactoryScanner {
                 vault: dex.vault,
                 quoter: dex.quoter,
                 balancer_pool_id: None,
+                priority: false,
             });
+        }
+        if should_refresh_configured_seeds(cached) {
+            let mut seeded = self.seed_configured_v3_pools(dex).await?;
+            pools.append(&mut seeded);
         }
         dedup_pools(&mut pools);
         Ok((
@@ -227,6 +603,69 @@ impl FactoryScanner {
                 count: 0,
             },
         ))
+    }
+
+    async fn seed_configured_v3_pools(&self, dex: &DexConfig) -> Result<Vec<DiscoveredPool>> {
+        let Some(factory) = dex.factory else {
+            return Ok(Vec::new());
+        };
+        let tokens = self
+            .settings
+            .tokens
+            .iter()
+            .map(|token| token.address)
+            .collect::<Vec<_>>();
+        if tokens.len() < 2 {
+            return Ok(Vec::new());
+        }
+
+        let fees = configured_v3_seed_fees();
+        let mut pools = Vec::new();
+        for i in 0..tokens.len() {
+            for j in (i + 1)..tokens.len() {
+                for fee in &fees {
+                    let raw = self
+                        .rpc
+                        .best_read()
+                        .eth_call(
+                            factory,
+                            None,
+                            IUniswapV3Factory::getPoolCall {
+                                tokenA: tokens[i],
+                                tokenB: tokens[j],
+                                fee: Uint::<24, 1>::from(*fee),
+                            }
+                            .abi_encode()
+                            .into(),
+                            "latest",
+                        )
+                        .await?;
+                    let pool = IUniswapV3Factory::getPoolCall::abi_decode_returns(&raw)?;
+                    if pool == Address::ZERO {
+                        continue;
+                    }
+                    pools.push(DiscoveredPool {
+                        address: pool,
+                        dex_name: dex.name.clone(),
+                        amm_kind: dex.amm_kind,
+                        factory: dex.factory,
+                        registry: dex.registry,
+                        vault: dex.vault,
+                        quoter: dex.quoter,
+                        balancer_pool_id: None,
+                        priority: true,
+                    });
+                }
+            }
+        }
+        if !pools.is_empty() {
+            info!(
+                dex = %dex.name,
+                seeded_pool_count = pools.len(),
+                "seeded configured-token v3 pools from factory"
+            );
+        }
+        Ok(pools)
     }
 
     async fn scan_curve_registry(
@@ -247,6 +686,24 @@ impl FactoryScanner {
         let ret = ICurveRegistry::pool_countCall::abi_decode_returns(&raw)
             .context("decode curve pool_count failed")?;
         let len = u256_to_u64(ret);
+        if let Some(cached) = cached.filter(|cached| cached.matches(dex, latest)) {
+            if cached.cursor.count >= len {
+                info!(
+                    dex = %dex.name,
+                    cached_pools = cached.pools.len(),
+                    total_pools = len,
+                    "curve discovery cache is complete"
+                );
+                return Ok((
+                    cached.pools.clone(),
+                    ScanCursor {
+                        block: latest,
+                        count: len,
+                    },
+                ));
+            }
+        }
+
         let mut pools = cached_pools(cached, dex);
         let start = cached
             .filter(|cached| cached.matches(dex, latest))
@@ -270,6 +727,7 @@ impl FactoryScanner {
                 vault: dex.vault,
                 quoter: dex.quoter,
                 balancer_pool_id: None,
+                priority: false,
             });
         }
         dedup_pools(&mut pools);
@@ -315,6 +773,7 @@ impl FactoryScanner {
                 vault: dex.vault,
                 quoter: dex.quoter,
                 balancer_pool_id: Some(pool_id),
+                priority: false,
             });
         }
         dedup_pools(&mut pools);
@@ -494,6 +953,162 @@ impl FactoryScanner {
             out.push(
                 IUniswapV2Factory::allPairsCall::abi_decode_returns(&raw)
                     .context("decode allPairs failed")?,
+            );
+        }
+        Ok(out)
+    }
+
+    async fn scan_solidly_pools_multicall(
+        &self,
+        factory: Address,
+        start: u64,
+        len: u64,
+    ) -> Result<Vec<Address>> {
+        if multicall_disabled() {
+            anyhow::bail!("multicall disabled");
+        }
+        let mut out = Vec::new();
+        let chunk_size = multicall_chunk_size();
+        let mut idx = start;
+        let mut chunk_count = 0_u64;
+        while idx < len {
+            let end = idx.saturating_add(chunk_size).min(len);
+            let calls = (idx..end)
+                .map(|index| {
+                    (
+                        factory,
+                        IAerodromeV2Factory::allPoolsCall {
+                            index: U256::saturating_from(index),
+                        }
+                        .abi_encode(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            let results = multicall::aggregate3(&self.rpc, calls).await?;
+            for raw in results.into_iter().flatten() {
+                out.push(
+                    IAerodromeV2Factory::allPoolsCall::abi_decode_returns(&raw)
+                        .context("decode multicall allPools failed")?,
+                );
+            }
+            idx = end;
+            chunk_count += 1;
+            if chunk_count % 100 == 0 || idx == len {
+                info!(
+                    factory = %factory,
+                    scanned = idx,
+                    total = len,
+                    discovered = out.len(),
+                    "solidly allPools scan progress"
+                );
+            }
+        }
+        Ok(out)
+    }
+
+    async fn scan_solidly_pools_sequential(
+        &self,
+        factory: Address,
+        start: u64,
+        len: u64,
+    ) -> Result<Vec<Address>> {
+        let mut out = Vec::new();
+        for idx in start..len {
+            let raw = self
+                .rpc
+                .best_read()
+                .eth_call(
+                    factory,
+                    None,
+                    IAerodromeV2Factory::allPoolsCall {
+                        index: U256::saturating_from(idx),
+                    }
+                    .abi_encode()
+                    .into(),
+                    "latest",
+                )
+                .await?;
+            out.push(
+                IAerodromeV2Factory::allPoolsCall::abi_decode_returns(&raw)
+                    .context("decode allPools failed")?,
+            );
+        }
+        Ok(out)
+    }
+
+    async fn scan_slipstream_pools_multicall(
+        &self,
+        factory: Address,
+        start: u64,
+        len: u64,
+    ) -> Result<Vec<Address>> {
+        if multicall_disabled() {
+            anyhow::bail!("multicall disabled");
+        }
+        let mut out = Vec::new();
+        let chunk_size = multicall_chunk_size();
+        let mut idx = start;
+        let mut chunk_count = 0_u64;
+        while idx < len {
+            let end = idx.saturating_add(chunk_size).min(len);
+            let calls = (idx..end)
+                .map(|index| {
+                    (
+                        factory,
+                        IAerodromeCLFactory::allPoolsCall {
+                            index: U256::saturating_from(index),
+                        }
+                        .abi_encode(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            let results = multicall::aggregate3(&self.rpc, calls).await?;
+            for raw in results.into_iter().flatten() {
+                out.push(
+                    IAerodromeCLFactory::allPoolsCall::abi_decode_returns(&raw)
+                        .context("decode multicall slipstream allPools failed")?,
+                );
+            }
+            idx = end;
+            chunk_count += 1;
+            if chunk_count % 100 == 0 || idx == len {
+                info!(
+                    factory = %factory,
+                    scanned = idx,
+                    total = len,
+                    discovered = out.len(),
+                    "slipstream allPools scan progress"
+                );
+            }
+        }
+        Ok(out)
+    }
+
+    async fn scan_slipstream_pools_sequential(
+        &self,
+        factory: Address,
+        start: u64,
+        len: u64,
+    ) -> Result<Vec<Address>> {
+        let mut out = Vec::new();
+        for idx in start..len {
+            let raw = self
+                .rpc
+                .best_read()
+                .eth_call(
+                    factory,
+                    None,
+                    IAerodromeCLFactory::allPoolsCall {
+                        index: U256::saturating_from(idx),
+                    }
+                    .abi_encode()
+                    .into(),
+                    "latest",
+                )
+                .await?;
+            out.push(
+                IAerodromeCLFactory::allPoolsCall::abi_decode_returns(&raw)
+                    .context("decode slipstream allPools failed")?,
             );
         }
         Ok(out)
@@ -684,8 +1299,49 @@ fn cached_pools(cached: Option<&CachedDexScan>, dex: &DexConfig) -> Vec<Discover
 }
 
 fn dedup_pools(pools: &mut Vec<DiscoveredPool>) {
+    pools.sort_by(|a, b| b.priority.cmp(&a.priority));
     let mut seen = std::collections::HashSet::<(String, Address)>::new();
     pools.retain(|pool| seen.insert((pool.dex_name.clone(), pool.address)));
+}
+
+fn should_refresh_configured_seeds(cached: Option<&CachedDexScan>) -> bool {
+    cached.is_none() || env_bool("DISCOVERY_REFRESH_CONFIGURED_SEEDS", false)
+}
+
+fn env_bool(key: &str, default: bool) -> bool {
+    std::env::var(key)
+        .ok()
+        .map(|value| {
+            matches!(
+                value.to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(default)
+}
+
+fn configured_v3_seed_fees() -> Vec<u32> {
+    let mut fees = std::env::var("V3_FACTORY_SEED_FEES")
+        .ok()
+        .map(|value| {
+            value
+                .split(',')
+                .filter_map(|part| part.trim().parse::<u32>().ok())
+                .filter(|fee| *fee > 0 && *fee < 1_000_000)
+                .collect::<Vec<_>>()
+        })
+        .filter(|fees| !fees.is_empty())
+        .unwrap_or_else(|| vec![100, 500, 3_000, 10_000]);
+    fees.sort_unstable();
+    fees.dedup();
+    fees
+}
+
+fn default_slipstream_tick_spacings() -> Vec<I24> {
+    [1_i32, 10, 50, 100, 200, 500, 2000]
+        .into_iter()
+        .filter_map(|value| I24::try_from(value).ok())
+        .collect()
 }
 
 fn signature_hash(signature: &str) -> B256 {

@@ -126,6 +126,13 @@ fn build_edges_for_pool(pool: &PoolState, token_to_index: &HashMap<Address, usiz
             state.fee_ppm,
             |zero_for_one| amm::uniswap_v2::spot_rate(state, zero_for_one),
         ),
+        PoolSpecificState::AerodromeV2Like(state) => build_two_token_edges(
+            pool,
+            token_to_index,
+            pool.kind,
+            state.fee_ppm,
+            |zero_for_one| amm::aerodrome_v2::spot_rate(state, zero_for_one),
+        ),
         PoolSpecificState::UniswapV3Like(state) => {
             build_two_token_edges(pool, token_to_index, pool.kind, state.fee, |zero_for_one| {
                 amm::uniswap_v3::spot_rate(state, zero_for_one)
