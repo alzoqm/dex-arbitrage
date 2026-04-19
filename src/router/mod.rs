@@ -4,9 +4,11 @@ pub mod quantity_search;
 pub mod split_decision;
 pub mod split_optimizer;
 pub mod v2_split;
+pub mod v3_limits;
 
 use std::sync::Arc;
 
+use alloy::primitives::Address;
 use anyhow::Result;
 
 use crate::{
@@ -43,11 +45,25 @@ pub struct RouteSearchStats {
     pub used_wide_fallback: bool,
     pub min_amount: u128,
     pub max_amount: u128,
+    pub first_no_output_hop: Option<usize>,
+    pub first_no_output_pool: Option<Address>,
+    pub first_no_output_amount_in: u128,
 }
 
 impl RouteSearchStats {
-    fn record_no_output(&mut self, hop_index: usize, amm_kind: AmmKind) {
+    fn record_no_output(
+        &mut self,
+        hop_index: usize,
+        amm_kind: AmmKind,
+        pool_id: Option<Address>,
+        amount_in: u128,
+    ) {
         self.no_output_quotes += 1;
+        if self.first_no_output_hop.is_none() {
+            self.first_no_output_hop = Some(hop_index);
+            self.first_no_output_pool = pool_id;
+            self.first_no_output_amount_in = amount_in;
+        }
         match hop_index {
             0 => self.no_output_hop0 += 1,
             1 => self.no_output_hop1 += 1,
@@ -79,6 +95,7 @@ pub struct Router {
     flash: FlashLoanEngine,
     verify_v3_refinement_points: usize,
     verify_v3_early_exit: bool,
+    verify_v3_early_reoptimize: bool,
     verify_v3_early_probe_points: usize,
 }
 
@@ -99,6 +116,7 @@ impl Router {
         let fast_sizer = FastSizer::new();
         let verify_v3_refinement_points = env_usize("VERIFY_V3_REFINEMENT_POINTS", 5);
         let verify_v3_early_exit = env_bool("VERIFY_V3_EARLY_EXIT", true);
+        let verify_v3_early_reoptimize = env_bool("VERIFY_V3_EARLY_REOPTIMIZE", true);
         let verify_v3_early_probe_points = env_usize("VERIFY_V3_EARLY_PROBE_POINTS", 1);
         let flash = FlashLoanEngine::new(settings, rpc);
         Self {
@@ -109,6 +127,7 @@ impl Router {
             flash,
             verify_v3_refinement_points,
             verify_v3_early_exit,
+            verify_v3_early_reoptimize,
             verify_v3_early_probe_points,
         }
     }
@@ -196,7 +215,7 @@ impl Router {
 
         if self.verify_v3_early_exit
             && self.verify_split_optimizer.is_some()
-            && candidate_uses_v3(candidate)
+            && plan_uses_v3(best.as_ref().expect("best checked above"))
         {
             let Some(verified_probe) = self
                 .verify_probe_plan(
@@ -505,7 +524,7 @@ impl Router {
                 .optimize_pair(snapshot, hop.from, hop.to, next_amount)
                 .await?;
             if out == 0 || splits.is_empty() {
-                stats.record_no_output(hop_index, hop.amm_kind);
+                stats.record_no_output(hop_index, hop.amm_kind, Some(hop.pool_id), next_amount);
                 return Ok(None);
             }
             hops.push(HopPlan {
@@ -518,7 +537,7 @@ impl Router {
             next_amount = out;
         }
 
-        let rough_gas_limit = estimate_gas_limit(candidate, &hops);
+        let rough_gas_limit = estimate_gas_limit(&hops);
         let gross_profit_raw = next_amount as i128 - input_amount as i128;
         if gross_profit_raw <= 0 {
             stats.gross_nonpositive += 1;
@@ -579,7 +598,7 @@ impl Router {
         let Some(split_optimizer) = &self.verify_split_optimizer else {
             return Ok(Some(plan));
         };
-        if !candidate_uses_v3(candidate) {
+        if !plan_uses_v3(&plan) {
             return Ok(Some(plan));
         }
 
@@ -628,8 +647,18 @@ impl Router {
             max_amount,
             self.verify_v3_early_probe_points,
         ) {
-            if let Some(verified) = self
-                .quote_existing_plan_splits(
+            let verified = if self.verify_v3_early_reoptimize {
+                self.quote_candidate_with_optimizer(
+                    split_optimizer,
+                    snapshot,
+                    candidate,
+                    amount,
+                    premium_ppm,
+                    stats,
+                )
+                .await?
+            } else {
+                self.quote_existing_plan_splits(
                     split_optimizer,
                     snapshot,
                     candidate,
@@ -639,7 +668,8 @@ impl Router {
                     stats,
                 )
                 .await?
-            {
+            };
+            if let Some(verified) = verified {
                 best = better_plan(best, verified);
             }
         }
@@ -670,7 +700,12 @@ impl Router {
                         .pool(split.pool_id)
                         .map(|pool| pool.kind)
                         .unwrap_or(hop_amm_kind(candidate, hop_index));
-                    stats.record_no_output(hop_index, amm_kind);
+                    stats.record_no_output(
+                        hop_index,
+                        amm_kind,
+                        Some(split.pool_id),
+                        split.amount_in,
+                    );
                     return Ok(None);
                 }
                 split.expected_amount_out = amount_out;
@@ -678,7 +713,12 @@ impl Router {
                 total_out = total_out.saturating_add(amount_out);
             }
             if splits.is_empty() || total_out == 0 {
-                stats.record_no_output(hop_index, hop_amm_kind(candidate, hop_index));
+                stats.record_no_output(
+                    hop_index,
+                    hop_amm_kind(candidate, hop_index),
+                    candidate.path.get(hop_index).map(|hop| hop.pool_id),
+                    next_amount,
+                );
                 return Ok(None);
             }
             verified_hops.push(HopPlan {
@@ -691,7 +731,7 @@ impl Router {
             next_amount = total_out;
         }
 
-        let rough_gas_limit = estimate_gas_limit(candidate, &verified_hops);
+        let rough_gas_limit = estimate_gas_limit(&verified_hops);
         let gross_profit_raw = next_amount as i128 - input_amount as i128;
         if gross_profit_raw <= 0 {
             stats.gross_nonpositive += 1;
@@ -831,29 +871,29 @@ fn dense_points(low: u128, high: u128, target_count: u128) -> Vec<u128> {
     out
 }
 
-fn estimate_gas_limit(candidate: &CandidatePath, hops: &[HopPlan]) -> u64 {
-    let mut gas = 80_000u64;
-    for (idx, hop) in candidate.path.iter().enumerate() {
-        let split_count = hops.get(idx).map(|h| h.splits.len()).unwrap_or(1) as u64;
-        let base = match hop.amm_kind {
-            crate::types::AmmKind::UniswapV2Like => 70_000,
-            crate::types::AmmKind::AerodromeV2Like => 95_000,
-            crate::types::AmmKind::UniswapV3Like => 140_000,
-            crate::types::AmmKind::CurvePlain => 220_000,
-            crate::types::AmmKind::BalancerWeighted => 130_000,
-        };
-        gas = gas
-            .saturating_add(base)
-            .saturating_add(split_count.saturating_sub(1) * 30_000);
+fn estimate_gas_limit(hops: &[HopPlan]) -> u64 {
+    let mut gas = 90_000u64;
+    for hop in hops {
+        gas = gas.saturating_add(20_000);
+        for split in &hop.splits {
+            gas = gas.saturating_add(match split.adapter_type {
+                crate::types::AdapterType::UniswapV2Like => 75_000,
+                crate::types::AdapterType::AerodromeV2Like => 100_000,
+                crate::types::AdapterType::UniswapV3Like => 155_000,
+                crate::types::AdapterType::CurvePlain => 240_000,
+                crate::types::AdapterType::BalancerWeighted => 150_000,
+            });
+        }
     }
     gas
 }
 
-fn candidate_uses_v3(candidate: &CandidatePath) -> bool {
-    candidate
-        .path
-        .iter()
-        .any(|hop| hop.amm_kind == AmmKind::UniswapV3Like)
+fn plan_uses_v3(plan: &ExactPlan) -> bool {
+    plan.hops.iter().any(|hop| {
+        hop.splits
+            .iter()
+            .any(|split| split.adapter_type == crate::types::AdapterType::UniswapV3Like)
+    })
 }
 
 fn verification_amounts(
@@ -916,10 +956,12 @@ mod tests {
 
     use crate::{
         graph::GraphSnapshot,
-        types::{AdapterType, CandidatePath, SplitExtra, SplitPlan, TokenBehavior, TokenInfo},
+        types::{
+            AdapterType, CandidatePath, HopPlan, SplitExtra, SplitPlan, TokenBehavior, TokenInfo,
+        },
     };
 
-    use super::{estimated_full_flash_fee_raw, scale_splits_for_input};
+    use super::{estimate_gas_limit, estimated_full_flash_fee_raw, scale_splits_for_input};
 
     fn addr(byte: u8) -> Address {
         Address::from_slice(&[byte; 20])
@@ -991,6 +1033,36 @@ mod tests {
         assert_eq!(
             scaled.iter().map(|split| split.amount_in).sum::<u128>(),
             101
+        );
+    }
+
+    #[test]
+    fn gas_estimate_uses_materialized_split_adapter_types() {
+        let split = |adapter_type, pool_id| SplitPlan {
+            dex_name: "dex".to_string(),
+            pool_id,
+            adapter_type,
+            token_in: addr(1),
+            token_out: addr(2),
+            amount_in: 1,
+            min_amount_out: 1,
+            expected_amount_out: 1,
+            extra: SplitExtra::None,
+        };
+        let hops = vec![HopPlan {
+            token_in: addr(1),
+            token_out: addr(2),
+            total_in: 2,
+            total_out: 2,
+            splits: vec![
+                split(AdapterType::UniswapV3Like, addr(11)),
+                split(AdapterType::BalancerWeighted, addr(12)),
+            ],
+        }];
+
+        assert_eq!(
+            estimate_gas_limit(&hops),
+            90_000 + 20_000 + 155_000 + 150_000
         );
     }
 }

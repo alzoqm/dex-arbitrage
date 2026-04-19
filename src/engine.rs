@@ -6,6 +6,7 @@ use std::{
 
 use alloy::primitives::Address;
 use anyhow::{Context, Result};
+use futures::stream::{self, StreamExt};
 use tokio::time::sleep;
 use tracing::{debug, info, warn};
 
@@ -283,59 +284,71 @@ async fn process_refresh(
     let mut profitability = ProfitabilityRefreshStats::new(candidates.len());
     let no_route_sample_limit = env_usize("NO_ROUTE_SAMPLE_LOG_LIMIT", 0);
     let mut no_route_samples = 0usize;
+    let candidate_concurrency = candidate_processing_concurrency(simulate_only);
 
-    for candidate in candidates {
-        let result = process_candidate(
-            settings.clone(),
-            snapshot.as_ref(),
-            candidate.clone(),
-            router,
-            validator,
-            submitter,
-            risk,
-            depeg_guard,
-            nonce_manager,
-            simulate_only,
-        )
-        .await?;
-        if matches!(result.verdict, CandidateVerdict::NoRoute)
-            && no_route_samples < no_route_sample_limit
-        {
-            no_route_samples += 1;
-            info!(
-                snapshot_id = snapshot.snapshot_id,
-                sample_index = no_route_samples,
-                cycle_key = %candidate.cycle_key,
-                anchor_symbol = %candidate.start_symbol,
-                screening_score_q32 = candidate.screening_score_q32,
-                route = %format_candidate_route(&candidate),
-                dex_route = %format_candidate_dex_route(&candidate),
-                path_len = candidate.path.len(),
-                router_ms = result.router_ms,
-                candidate_total_ms = result.total_ms,
-                route_amount_range_missing = result.route_stats.amount_range_missing,
-                route_evaluated_amounts = result.route_stats.evaluated_amounts,
-                route_no_output_quotes = result.route_stats.no_output_quotes,
-                route_no_output_hop0 = result.route_stats.no_output_hop0,
-                route_no_output_hop1 = result.route_stats.no_output_hop1,
-                route_no_output_hop2 = result.route_stats.no_output_hop2,
-                route_no_output_hop3_plus = result.route_stats.no_output_hop3_plus,
-                route_no_output_v2 = result.route_stats.no_output_v2,
-                route_no_output_aerodrome_v2 = result.route_stats.no_output_aerodrome_v2,
-                route_no_output_v3 = result.route_stats.no_output_v3,
-                route_no_output_curve = result.route_stats.no_output_curve,
-                route_no_output_balancer = result.route_stats.no_output_balancer,
-                route_gross_nonpositive = result.route_stats.gross_nonpositive,
-                route_flash_fee_nonpositive = result.route_stats.flash_fee_nonpositive,
-                route_profitable_plans = result.route_stats.profitable_plans,
-                min_amount = result.route_stats.min_amount,
-                max_amount = result.route_stats.max_amount,
-                "no-route candidate sample"
+    if candidate_concurrency <= 1 {
+        for candidate in candidates {
+            let result = process_candidate(
+                settings.clone(),
+                snapshot.as_ref(),
+                candidate.clone(),
+                router,
+                validator,
+                submitter,
+                risk,
+                depeg_guard,
+                nonce_manager,
+                simulate_only,
+            )
+            .await?;
+            maybe_log_no_route_sample(
+                snapshot.snapshot_id,
+                &candidate,
+                &result,
+                no_route_sample_limit,
+                &mut no_route_samples,
             );
+            profitability.record(&result);
+            if let Some(result) = result.submission {
+                info!(tx_hash = %result.tx_hash, channel = %result.channel, "submission accepted");
+            }
         }
-        profitability.record(&result);
-        if let Some(result) = result.submission {
-            info!(tx_hash = %result.tx_hash, channel = %result.channel, "submission accepted");
+    } else {
+        let mut results = stream::iter(candidates.into_iter().map(|candidate| {
+            let settings = settings.clone();
+            let snapshot = snapshot.clone();
+            async move {
+                let result = process_candidate(
+                    settings,
+                    snapshot.as_ref(),
+                    candidate.clone(),
+                    router,
+                    validator,
+                    submitter,
+                    risk,
+                    depeg_guard,
+                    nonce_manager,
+                    simulate_only,
+                )
+                .await;
+                result.map(|result| (candidate, result))
+            }
+        }))
+        .buffer_unordered(candidate_concurrency);
+
+        while let Some(item) = results.next().await {
+            let (candidate, result) = item?;
+            maybe_log_no_route_sample(
+                snapshot.snapshot_id,
+                &candidate,
+                &result,
+                no_route_sample_limit,
+                &mut no_route_samples,
+            );
+            profitability.record(&result);
+            if let Some(result) = result.submission {
+                info!(tx_hash = %result.tx_hash, channel = %result.channel, "submission accepted");
+            }
         }
     }
     profitability.log(
@@ -346,6 +359,66 @@ async fn process_refresh(
     );
 
     Ok(())
+}
+
+fn candidate_processing_concurrency(simulate_only: bool) -> usize {
+    if !simulate_only {
+        return 1;
+    }
+    env_usize("ROUTE_CANDIDATE_CONCURRENCY", 16).clamp(1, 64)
+}
+
+fn maybe_log_no_route_sample(
+    snapshot_id: u64,
+    candidate: &CandidatePath,
+    result: &CandidateProcessResult,
+    no_route_sample_limit: usize,
+    no_route_samples: &mut usize,
+) {
+    if !matches!(result.verdict, CandidateVerdict::NoRoute)
+        || *no_route_samples >= no_route_sample_limit
+    {
+        return;
+    }
+    *no_route_samples += 1;
+    info!(
+        snapshot_id,
+        sample_index = *no_route_samples,
+        cycle_key = %candidate.cycle_key,
+        anchor_symbol = %candidate.start_symbol,
+        screening_score_q32 = candidate.screening_score_q32,
+        route = %format_candidate_route(candidate),
+        dex_route = %format_candidate_dex_route(candidate),
+        path_len = candidate.path.len(),
+        router_ms = result.router_ms,
+        candidate_total_ms = result.total_ms,
+        router_timed_out = result.router_timed_out,
+        route_amount_range_missing = result.route_stats.amount_range_missing,
+        route_evaluated_amounts = result.route_stats.evaluated_amounts,
+        route_no_output_quotes = result.route_stats.no_output_quotes,
+        route_no_output_hop0 = result.route_stats.no_output_hop0,
+        route_no_output_hop1 = result.route_stats.no_output_hop1,
+        route_no_output_hop2 = result.route_stats.no_output_hop2,
+        route_no_output_hop3_plus = result.route_stats.no_output_hop3_plus,
+        route_no_output_v2 = result.route_stats.no_output_v2,
+        route_no_output_aerodrome_v2 = result.route_stats.no_output_aerodrome_v2,
+        route_no_output_v3 = result.route_stats.no_output_v3,
+        route_no_output_curve = result.route_stats.no_output_curve,
+        route_no_output_balancer = result.route_stats.no_output_balancer,
+        route_gross_nonpositive = result.route_stats.gross_nonpositive,
+        route_flash_fee_nonpositive = result.route_stats.flash_fee_nonpositive,
+        route_profitable_plans = result.route_stats.profitable_plans,
+        first_no_output_hop = result.route_stats.first_no_output_hop,
+        first_no_output_pool = result
+            .route_stats
+            .first_no_output_pool
+            .map(|pool| pool.to_string())
+            .unwrap_or_else(|| "none".to_string()),
+        first_no_output_amount_in = result.route_stats.first_no_output_amount_in,
+        min_amount = result.route_stats.min_amount,
+        max_amount = result.route_stats.max_amount,
+        "no-route candidate sample"
+    );
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -363,22 +436,24 @@ async fn process_candidate(
 ) -> Result<CandidateProcessResult> {
     let total_started = Instant::now();
     let router_started = Instant::now();
-    let route_result = match router
-        .search_best_plan_with_stats(snapshot, &candidate)
-        .await
+    let route_timeout = Duration::from_millis(env_usize("ROUTE_SEARCH_TIMEOUT_MS", 3_000) as u64);
+    let route_result = match tokio::time::timeout(
+        route_timeout,
+        router.search_best_plan_with_stats(snapshot, &candidate),
+    )
+    .await
     {
-        Ok(result) => result,
-        Err(err) => {
+        Err(_) => {
             let router_ms = router_started.elapsed().as_millis();
-            warn!(
-                error = %err,
+            debug!(
                 snapshot_id = snapshot.snapshot_id,
                 cycle_key = %candidate.cycle_key,
                 router_ms,
-                "route search failed; rejecting candidate without stopping engine"
+                route_timeout_ms = route_timeout.as_millis(),
+                "route search timed out; rejecting stale candidate"
             );
-            telemetry::record_candidate_rejected("router_error", settings.chain.as_str());
-            return Ok(CandidateProcessResult::new(
+            telemetry::record_candidate_rejected("router_timeout", settings.chain.as_str());
+            return Ok(CandidateProcessResult::router_timeout(
                 CandidateVerdict::NoRoute,
                 None,
                 None,
@@ -388,6 +463,29 @@ async fn process_candidate(
                 total_started.elapsed().as_millis(),
             ));
         }
+        Ok(result) => match result {
+            Ok(result) => result,
+            Err(err) => {
+                let router_ms = router_started.elapsed().as_millis();
+                warn!(
+                    error = %err,
+                    snapshot_id = snapshot.snapshot_id,
+                    cycle_key = %candidate.cycle_key,
+                    router_ms,
+                    "route search failed; rejecting candidate without stopping engine"
+                );
+                telemetry::record_candidate_rejected("router_error", settings.chain.as_str());
+                return Ok(CandidateProcessResult::new(
+                    CandidateVerdict::NoRoute,
+                    None,
+                    None,
+                    RouteSearchStats::default(),
+                    router_ms,
+                    0,
+                    total_started.elapsed().as_millis(),
+                ));
+            }
+        },
     };
     let route_stats = route_result.stats;
     let Some(plan) = route_result.plan else {
@@ -696,6 +794,7 @@ struct CandidateProcessResult {
     router_ms: u128,
     validator_ms: u128,
     total_ms: u128,
+    router_timed_out: bool,
 }
 
 impl CandidateProcessResult {
@@ -716,6 +815,28 @@ impl CandidateProcessResult {
             router_ms,
             validator_ms,
             total_ms,
+            router_timed_out: false,
+        }
+    }
+
+    fn router_timeout(
+        verdict: CandidateVerdict,
+        submission: Option<SubmissionResult>,
+        exact: Option<ExactPlan>,
+        route_stats: RouteSearchStats,
+        router_ms: u128,
+        validator_ms: u128,
+        total_ms: u128,
+    ) -> Self {
+        Self {
+            verdict,
+            submission,
+            exact,
+            route_stats,
+            router_ms,
+            validator_ms,
+            total_ms,
+            router_timed_out: true,
         }
     }
 }
@@ -734,6 +855,7 @@ struct ProfitabilityRefreshStats {
     total_validator_ms: u128,
     total_candidate_ms: u128,
     max_candidate_ms: u128,
+    router_timeouts: usize,
     route_amount_range_missing: usize,
     route_evaluated_amounts: usize,
     route_no_output_quotes: usize,
@@ -794,6 +916,9 @@ impl ProfitabilityRefreshStats {
         self.total_validator_ms = self.total_validator_ms.saturating_add(result.validator_ms);
         self.total_candidate_ms = self.total_candidate_ms.saturating_add(result.total_ms);
         self.max_candidate_ms = self.max_candidate_ms.max(result.total_ms);
+        if result.router_timed_out {
+            self.router_timeouts += 1;
+        }
         let route = &result.route_stats;
         if route.amount_range_missing {
             self.route_amount_range_missing += 1;
@@ -925,6 +1050,7 @@ impl ProfitabilityRefreshStats {
                 avg_router_ms,
                 avg_validator_ms,
                 max_candidate_ms = self.max_candidate_ms,
+                router_timeouts = self.router_timeouts,
                 route_amount_range_missing = self.route_amount_range_missing,
                 route_evaluated_amounts = self.route_evaluated_amounts,
                 route_no_output_quotes = self.route_no_output_quotes,
@@ -963,6 +1089,7 @@ impl ProfitabilityRefreshStats {
                 avg_router_ms,
                 avg_validator_ms,
                 max_candidate_ms = self.max_candidate_ms,
+                router_timeouts = self.router_timeouts,
                 route_amount_range_missing = self.route_amount_range_missing,
                 route_evaluated_amounts = self.route_evaluated_amounts,
                 route_no_output_quotes = self.route_no_output_quotes,

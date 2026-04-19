@@ -87,9 +87,19 @@ impl PathFinder {
         let mut top_path_cache = HashMap::<(usize, usize, usize), Vec<SearchPath>>::new();
         let mut outgoing_cache = HashMap::<usize, Vec<EdgeRef>>::new();
         let mut pair_edges_cache = HashMap::<(usize, usize), Vec<EdgeRef>>::new();
+        let min_trade_raw_by_token = min_trade_raw_by_token(snapshot, self.min_trade_usd_e8);
+        let use_route_capacity_filter =
+            changed_edges.len() <= env_usize("ROUTE_CAPACITY_PREFILTER_MAX_CHANGED_EDGES", 8_192);
+        let selection_multiplier = if changed_edges.len()
+            > env_usize("CANDIDATE_SELECTION_LARGE_REFRESH_THRESHOLD", 8_192)
+        {
+            env_usize("CANDIDATE_SELECTION_LARGE_REFRESH_MULTIPLIER", 1)
+        } else {
+            self.tuning.candidate_selection_buffer_multiplier
+        };
         let selection_budget = candidate_selection_budget(
             self.tuning.max_candidates_per_refresh,
-            self.tuning.candidate_selection_buffer_multiplier,
+            selection_multiplier,
         );
 
         for ((from, to), changed_edge_ref) in changed_pairs {
@@ -106,7 +116,7 @@ impl PathFinder {
                 self.tuning.max_pair_edges_per_pair,
                 self.min_pool_confidence_bps,
                 self.staleness_timeout,
-                self.min_trade_usd_e8,
+                &min_trade_raw_by_token,
             );
             if changed_candidate_edges.is_empty() {
                 continue;
@@ -125,6 +135,7 @@ impl PathFinder {
                     anchor_idx,
                     from,
                     max_side_hops,
+                    &min_trade_raw_by_token,
                 );
                 if prefixes.is_empty() {
                     continue;
@@ -136,6 +147,7 @@ impl PathFinder {
                     to,
                     anchor_idx,
                     max_side_hops,
+                    &min_trade_raw_by_token,
                 );
                 if suffixes.is_empty() {
                     continue;
@@ -179,6 +191,8 @@ impl PathFinder {
                                 score_q32,
                                 &edge_refs,
                                 changed_edge_ref,
+                                &min_trade_raw_by_token,
+                                use_route_capacity_filter,
                             ) {
                                 if self.tuning.dedup_token_paths {
                                     let token_key = candidate_token_cycle_key(&candidate);
@@ -233,12 +247,20 @@ impl PathFinder {
         start: usize,
         target: usize,
         max_hops: usize,
+        min_trade_raw_by_token: &[Option<u128>],
     ) -> Vec<SearchPath> {
         let key = (start, target, max_hops);
         if let Some(paths) = cache.get(&key) {
             return paths.clone();
         }
-        let paths = self.find_top_paths(snapshot, outgoing_cache, start, target, max_hops);
+        let paths = self.find_top_paths(
+            snapshot,
+            outgoing_cache,
+            start,
+            target,
+            max_hops,
+            min_trade_raw_by_token,
+        );
         cache.insert(key, paths.clone());
         paths
     }
@@ -288,6 +310,7 @@ impl PathFinder {
         start: usize,
         target: usize,
         max_hops: usize,
+        min_trade_raw_by_token: &[Option<u128>],
     ) -> Vec<SearchPath> {
         if start == target {
             return vec![SearchPath {
@@ -318,7 +341,7 @@ impl PathFinder {
                     self.tuning.max_pair_edges_per_pair,
                     self.min_pool_confidence_bps,
                     self.staleness_timeout,
-                    self.min_trade_usd_e8,
+                    min_trade_raw_by_token,
                 )
                 .into_iter()
                 .take(self.tuning.max_virtual_branches_per_node)
@@ -327,11 +350,10 @@ impl PathFinder {
                         continue;
                     };
                     if !edge_is_usable(
-                        snapshot,
                         edge,
                         self.min_pool_confidence_bps,
                         self.staleness_timeout,
-                        self.min_trade_usd_e8,
+                        min_trade_raw_by_token,
                     ) {
                         continue;
                     }
@@ -379,6 +401,8 @@ impl PathFinder {
         score_q32: i64,
         edge_refs: &[EdgeRef],
         changed_edge_ref: EdgeRef,
+        min_trade_raw_by_token: &[Option<u128>],
+        use_route_capacity_filter: bool,
     ) -> Option<CandidatePath> {
         let mut path = SmallVec::<[CandidateHop; 8]>::new();
         let mut contains_changed_pair = false;
@@ -402,6 +426,17 @@ impl PathFinder {
             return None;
         }
 
+        if use_route_capacity_filter
+            && !route_has_min_start_capacity(
+                snapshot,
+                anchor_idx,
+                edge_refs,
+                min_trade_raw_by_token,
+            )
+        {
+            return None;
+        }
+
         Some(CandidatePath {
             snapshot_id: snapshot.snapshot_id,
             start_token: snapshot.tokens[anchor_idx].address,
@@ -418,8 +453,35 @@ fn finalize_candidates(
     max_candidates_per_refresh: usize,
 ) -> Vec<CandidatePath> {
     candidates.sort_by(|a, b| a.screening_score_q32.cmp(&b.screening_score_q32));
-    candidates.truncate(max_candidates_per_refresh);
-    candidates
+    if candidates.len() <= max_candidates_per_refresh {
+        return candidates;
+    }
+
+    let mut selected = Vec::with_capacity(max_candidates_per_refresh);
+    let mut selected_canonical_cycles = HashSet::<String>::new();
+    for candidate in &candidates {
+        let key = canonical_token_cycle_key(candidate);
+        if selected_canonical_cycles.insert(key) {
+            selected.push(candidate.clone());
+            if selected.len() >= max_candidates_per_refresh {
+                return selected;
+            }
+        }
+    }
+
+    let mut selected_token_paths = selected
+        .iter()
+        .map(candidate_token_cycle_key)
+        .collect::<HashSet<_>>();
+    for candidate in candidates {
+        if selected.len() >= max_candidates_per_refresh {
+            break;
+        }
+        if selected_token_paths.insert(candidate_token_cycle_key(&candidate)) {
+            selected.push(candidate);
+        }
+    }
+    selected
 }
 
 fn candidate_token_cycle_key(candidate: &CandidatePath) -> String {
@@ -427,6 +489,47 @@ fn candidate_token_cycle_key(candidate: &CandidatePath) -> String {
     parts.push(candidate.start_token.to_string());
     parts.extend(candidate.path.iter().map(|hop| hop.to.to_string()));
     parts.join(">")
+}
+
+fn canonical_token_cycle_key(candidate: &CandidatePath) -> String {
+    let mut tokens = Vec::with_capacity(candidate.path.len());
+    tokens.push(candidate.start_token);
+    tokens.extend(
+        candidate
+            .path
+            .iter()
+            .take(candidate.path.len().saturating_sub(1))
+            .map(|hop| hop.to),
+    );
+    if tokens.is_empty() {
+        return candidate.start_token.to_string();
+    }
+
+    let best_start = (0..tokens.len())
+        .min_by(|left, right| compare_cycle_rotation(&tokens, *left, *right))
+        .unwrap_or(0);
+    let mut parts = Vec::with_capacity(tokens.len() + 1);
+    for offset in 0..tokens.len() {
+        parts.push(tokens[(best_start + offset) % tokens.len()].to_string());
+    }
+    parts.push(tokens[best_start].to_string());
+    parts.join(">")
+}
+
+fn compare_cycle_rotation(
+    tokens: &[alloy::primitives::Address],
+    left: usize,
+    right: usize,
+) -> std::cmp::Ordering {
+    for offset in 0..tokens.len() {
+        let lhs = tokens[(left + offset) % tokens.len()];
+        let rhs = tokens[(right + offset) % tokens.len()];
+        let cmp = lhs.cmp(&rhs);
+        if cmp != std::cmp::Ordering::Equal {
+            return cmp;
+        }
+    }
+    std::cmp::Ordering::Equal
 }
 
 fn candidate_precedes(candidate: &CandidatePath, existing: &CandidatePath) -> bool {
@@ -441,14 +544,70 @@ fn candidate_selection_budget(max_candidates_per_refresh: usize, multiplier: usi
     max_candidates_per_refresh.saturating_mul(multiplier.max(1))
 }
 
+fn env_usize(key: &str, default: usize) -> usize {
+    std::env::var(key)
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(default)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::candidate_selection_budget;
+    use smallvec::smallvec;
+
+    use alloy::primitives::Address;
+
+    use crate::types::{AmmKind, CandidateHop, CandidatePath};
+
+    use super::{candidate_selection_budget, canonical_token_cycle_key, q128_to_f64};
+
+    fn addr(byte: u8) -> Address {
+        Address::from_slice(&[byte; 20])
+    }
 
     #[test]
     fn selection_budget_uses_at_least_one_multiplier() {
         assert_eq!(candidate_selection_budget(32, 0), 32);
         assert_eq!(candidate_selection_budget(32, 4), 128);
+    }
+
+    #[test]
+    fn canonical_token_cycle_key_deduplicates_rotated_cycles() {
+        let candidate = |start, path| CandidatePath {
+            snapshot_id: 1,
+            start_token: start,
+            start_symbol: "A".to_string(),
+            screening_score_q32: 0,
+            cycle_key: "cycle".to_string(),
+            path,
+        };
+        let hop = |from, to| CandidateHop {
+            from,
+            to,
+            pool_id: from,
+            amm_kind: AmmKind::UniswapV2Like,
+            dex_name: "dex".to_string(),
+        };
+
+        let a = addr(1);
+        let b = addr(2);
+        let c = addr(3);
+        let first = candidate(a, smallvec![hop(a, b), hop(b, c), hop(c, a)]);
+        let rotated = candidate(b, smallvec![hop(b, c), hop(c, a), hop(a, b)]);
+
+        assert_eq!(
+            canonical_token_cycle_key(&first),
+            canonical_token_cycle_key(&rotated)
+        );
+    }
+
+    #[test]
+    fn q128_to_f64_uses_limb_math_without_decimal_parse() {
+        let one = alloy::primitives::U256::from(1u8) << 128;
+        let one_and_half = one + (alloy::primitives::U256::from(1u8) << 127);
+        assert!((q128_to_f64(one) - 1.0).abs() < f64::EPSILON);
+        assert!((q128_to_f64(one_and_half) - 1.5).abs() < f64::EPSILON);
     }
 }
 
@@ -487,7 +646,7 @@ fn virtual_outgoing(
     max_pair_edges_per_pair: usize,
     min_confidence_bps: u16,
     staleness_timeout: Duration,
-    min_trade_usd_e8: u128,
+    min_trade_raw_by_token: &[Option<u128>],
 ) -> Vec<EdgeRef> {
     let mut by_to = HashMap::<usize, Vec<EdgeRef>>::new();
     for edge_ref in pruning::ranked_outgoing(snapshot, vertex) {
@@ -495,11 +654,10 @@ fn virtual_outgoing(
             continue;
         };
         if !edge_is_usable(
-            snapshot,
             edge,
             min_confidence_bps,
             staleness_timeout,
-            min_trade_usd_e8,
+            min_trade_raw_by_token,
         ) {
             continue;
         }
@@ -523,7 +681,7 @@ fn virtual_outgoing_cached(
     max_pair_edges_per_pair: usize,
     min_confidence_bps: u16,
     staleness_timeout: Duration,
-    min_trade_usd_e8: u128,
+    min_trade_raw_by_token: &[Option<u128>],
 ) -> Vec<EdgeRef> {
     if let Some(edge_refs) = cache.get(&vertex) {
         return edge_refs.clone();
@@ -535,7 +693,7 @@ fn virtual_outgoing_cached(
         max_pair_edges_per_pair,
         min_confidence_bps,
         staleness_timeout,
-        min_trade_usd_e8,
+        min_trade_raw_by_token,
     );
     cache.insert(vertex, edge_refs.clone());
     edge_refs
@@ -548,7 +706,7 @@ fn candidate_pair_edges(
     max_pair_edges_per_pair: usize,
     min_confidence_bps: u16,
     staleness_timeout: Duration,
-    min_trade_usd_e8: u128,
+    min_trade_raw_by_token: &[Option<u128>],
 ) -> Vec<EdgeRef> {
     let Some(edges) = snapshot.pair_to_edges.get(&(from, to)) else {
         return Vec::new();
@@ -561,11 +719,10 @@ fn candidate_pair_edges(
                 .edge(*edge_ref)
                 .map(|edge| {
                     edge_is_usable(
-                        snapshot,
                         edge,
                         min_confidence_bps,
                         staleness_timeout,
-                        min_trade_usd_e8,
+                        min_trade_raw_by_token,
                     )
                 })
                 .unwrap_or(false)
@@ -584,7 +741,7 @@ fn candidate_pair_edges_cached(
     max_pair_edges_per_pair: usize,
     min_confidence_bps: u16,
     staleness_timeout: Duration,
-    min_trade_usd_e8: u128,
+    min_trade_raw_by_token: &[Option<u128>],
 ) -> Vec<EdgeRef> {
     let key = (from, to);
     if let Some(edge_refs) = cache.get(&key) {
@@ -598,7 +755,7 @@ fn candidate_pair_edges_cached(
         max_pair_edges_per_pair,
         min_confidence_bps,
         staleness_timeout,
-        min_trade_usd_e8,
+        min_trade_raw_by_token,
     );
     cache.insert(key, edge_refs.clone());
     edge_refs
@@ -636,11 +793,10 @@ fn compare_edge_refs(
 }
 
 fn edge_is_usable(
-    snapshot: &GraphSnapshot,
     edge: &Edge,
     min_confidence_bps: u16,
     staleness_timeout: Duration,
-    min_trade_usd_e8: u128,
+    min_trade_raw_by_token: &[Option<u128>],
 ) -> bool {
     if edge.spot_rate_q128.is_zero() || edge.liquidity.safe_capacity_in == 0 {
         return false;
@@ -651,16 +807,84 @@ fn edge_is_usable(
     {
         return false;
     }
-    if let Some(min_trade_raw) = snapshot
-        .tokens
+    if let Some(min_trade_raw) = min_trade_raw_by_token
         .get(edge.from)
-        .and_then(|token| usd_e8_to_amount(min_trade_usd_e8, token))
+        .and_then(|value| *value)
     {
         if edge.liquidity.safe_capacity_in < min_trade_raw {
             return false;
         }
     }
     true
+}
+
+fn route_has_min_start_capacity(
+    snapshot: &GraphSnapshot,
+    anchor_idx: usize,
+    edge_refs: &[EdgeRef],
+    min_trade_raw_by_token: &[Option<u128>],
+) -> bool {
+    let Some(min_trade_raw) = min_trade_raw_by_token
+        .get(anchor_idx)
+        .and_then(|value| *value)
+    else {
+        return true;
+    };
+    route_start_capacity_raw(snapshot, edge_refs)
+        .map(|capacity| capacity >= min_trade_raw.max(1))
+        .unwrap_or(false)
+}
+
+fn route_start_capacity_raw(snapshot: &GraphSnapshot, edge_refs: &[EdgeRef]) -> Option<u128> {
+    if edge_refs.is_empty() {
+        return None;
+    }
+
+    let mut cumulative_rate = 1.0f64;
+    let mut max_start = f64::INFINITY;
+    for &edge_ref in edge_refs {
+        let edge = snapshot.edge(edge_ref)?;
+        if edge.liquidity.safe_capacity_in == 0 || cumulative_rate <= 0.0 {
+            return Some(0);
+        }
+        max_start = max_start.min(edge.liquidity.safe_capacity_in as f64 / cumulative_rate);
+        let rate = q128_to_f64(edge.spot_rate_q128);
+        if !rate.is_finite() || rate <= 0.0 {
+            return Some(0);
+        }
+        cumulative_rate *= rate;
+        if !cumulative_rate.is_finite() {
+            return Some(0);
+        }
+    }
+
+    Some(f64_to_u128(max_start))
+}
+
+fn min_trade_raw_by_token(snapshot: &GraphSnapshot, min_trade_usd_e8: u128) -> Vec<Option<u128>> {
+    snapshot
+        .tokens
+        .iter()
+        .map(|token| usd_e8_to_amount(min_trade_usd_e8, token))
+        .collect()
+}
+
+fn q128_to_f64(value: alloy::primitives::U256) -> f64 {
+    let limbs = value.as_limbs();
+    limbs[0] as f64 * 2f64.powi(-128)
+        + limbs[1] as f64 * 2f64.powi(-64)
+        + limbs[2] as f64
+        + limbs[3] as f64 * 2f64.powi(64)
+}
+
+fn f64_to_u128(value: f64) -> u128 {
+    if !value.is_finite() || value <= 0.0 {
+        0
+    } else if value >= u128::MAX as f64 {
+        u128::MAX
+    } else {
+        value as u128
+    }
 }
 
 fn forms_simple_cycle(prefix: &SearchPath, changed_to: usize, suffix: &SearchPath) -> bool {

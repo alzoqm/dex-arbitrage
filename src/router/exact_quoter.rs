@@ -4,14 +4,14 @@ use std::{
 };
 
 use alloy::{
-    primitives::{aliases::I24, Uint, U160, U256},
+    primitives::{aliases::I24, Address, Bytes, Uint, U256},
     sol_types::SolCall,
 };
 use anyhow::Result;
 use parking_lot::Mutex;
 
 use crate::{
-    abi::{IAerodromeCLQuoter, ICurvePool, IV3QuoterV2},
+    abi::{IAerodromeCLQuoter, IBalancerVault, ICurvePool, IV3QuoterV2},
     amm,
     graph::GraphSnapshot,
     monitoring::metrics as telemetry,
@@ -19,13 +19,17 @@ use crate::{
     types::{PoolSpecificState, PoolState},
 };
 
+use super::v3_limits::sqrt_price_limit_u160;
+
 #[derive(Debug, Clone)]
 pub struct ExactQuoter {
     rpc: Arc<RpcClients>,
     quote_cache: Arc<Mutex<QuoteCache>>,
+    v3_revert_cache: Arc<Mutex<V3RevertCache>>,
     curve_underlying_support: Arc<Mutex<HashMap<alloy::primitives::Address, bool>>>,
     use_v3_rpc_quoter: bool,
     use_curve_rpc_quoter: bool,
+    use_balancer_rpc_quoter: bool,
     chain_label: String,
 }
 
@@ -36,6 +40,14 @@ struct QuoteKey {
     token_in: alloy::primitives::Address,
     token_out: alloy::primitives::Address,
     amount_in: u128,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct V3DirectionKey {
+    snapshot_id: u64,
+    pool_id: alloy::primitives::Address,
+    token_in: alloy::primitives::Address,
+    token_out: alloy::primitives::Address,
 }
 
 impl ExactQuoter {
@@ -57,11 +69,15 @@ impl ExactQuoter {
         Self {
             rpc,
             quote_cache: Arc::new(Mutex::new(QuoteCache::from_env())),
+            v3_revert_cache: Arc::new(Mutex::new(V3RevertCache::from_env())),
             curve_underlying_support: Arc::new(Mutex::new(HashMap::new())),
             use_v3_rpc_quoter,
             use_curve_rpc_quoter: std::env::var("USE_CURVE_RPC_QUOTER")
                 .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
                 .unwrap_or(false),
+            use_balancer_rpc_quoter: std::env::var("USE_BALANCER_RPC_QUOTER")
+                .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+                .unwrap_or(true),
             chain_label: settings.chain.as_str().to_string(),
         }
     }
@@ -128,42 +144,51 @@ impl ExactQuoter {
                     return Ok(0);
                 }
                 if self.use_v3_rpc_quoter {
-                    if let Some(quoter) = pool.quoter {
+                    let direction_key = V3DirectionKey {
+                        snapshot_id: snapshot.snapshot_id,
+                        pool_id: pool.pool_id,
+                        token_in,
+                        token_out,
+                    };
+                    if self.v3_revert_cache.lock().blocked(&direction_key) {
+                        0
+                    } else if let Some(quoter) = pool.quoter {
                         let zero_for_one = i == 0 && j == 1;
-                        if is_slipstream_pool(pool) {
-                            match self
-                                .quote_slipstream_v3(
-                                    quoter,
-                                    token_in,
-                                    token_out,
-                                    amount_in,
-                                    state.tick_spacing,
-                                    state.sqrt_price_x96,
-                                    zero_for_one,
-                                )
-                                .await
-                            {
-                                Ok(amount) => amount,
-                                Err(err) if is_expected_quote_revert(&err) => 0,
-                                Err(err) => return Err(err),
-                            }
+                        let quoted = if is_slipstream_pool(pool) {
+                            self.quote_slipstream_v3(
+                                quoter,
+                                token_in,
+                                token_out,
+                                amount_in,
+                                state.tick_spacing,
+                                state.sqrt_price_x96,
+                                zero_for_one,
+                            )
+                            .await
                         } else {
-                            match self
-                                .quote_uniswap_v3(
-                                    quoter,
-                                    token_in,
-                                    token_out,
-                                    amount_in,
-                                    state.fee,
-                                    state.sqrt_price_x96,
-                                    zero_for_one,
-                                )
-                                .await
-                            {
-                                Ok(amount) => amount,
-                                Err(err) if is_expected_quote_revert(&err) => 0,
-                                Err(err) => return Err(err),
+                            self.quote_uniswap_v3(
+                                quoter,
+                                token_in,
+                                token_out,
+                                amount_in,
+                                state.fee,
+                                state.sqrt_price_x96,
+                                zero_for_one,
+                            )
+                            .await
+                        };
+                        match quoted {
+                            Ok(amount) => {
+                                if amount > 0 {
+                                    self.v3_revert_cache.lock().clear(&direction_key);
+                                }
+                                amount
                             }
+                            Err(err) if is_expected_quote_revert(&err) => {
+                                self.v3_revert_cache.lock().record_failure(direction_key);
+                                0
+                            }
+                            Err(err) => return Err(err),
                         }
                     } else {
                         let zero_for_one = i == 0 && j == 1;
@@ -255,7 +280,28 @@ impl ExactQuoter {
                 amount
             }
             PoolSpecificState::BalancerWeighted(state) => {
-                amm::balancer::fallback_quote(state, i, j, amount_in)
+                if self.use_balancer_rpc_quoter {
+                    if let Some(vault) = pool.vault {
+                        match self
+                            .quote_balancer_vault(
+                                vault,
+                                state.pool_id,
+                                token_in,
+                                token_out,
+                                amount_in,
+                            )
+                            .await
+                        {
+                            Ok(amount) => amount,
+                            Err(err) if is_expected_quote_revert(&err) => 0,
+                            Err(err) => return Err(err),
+                        }
+                    } else {
+                        amm::balancer::fallback_quote(state, i, j, amount_in)
+                    }
+                } else {
+                    amm::balancer::fallback_quote(state, i, j, amount_in)
+                }
             }
         };
 
@@ -285,7 +331,7 @@ impl ExactQuoter {
                         tokenOut: token_out,
                         amountIn: U256::saturating_from(amount_in),
                         fee: Uint::<24, 1>::saturating_from(fee),
-                        sqrtPriceLimitX96: v3_sqrt_price_limit_u160(sqrt_price_x96, zero_for_one),
+                        sqrtPriceLimitX96: sqrt_price_limit_u160(sqrt_price_x96, zero_for_one),
                     },
                 }
                 .abi_encode()
@@ -322,7 +368,7 @@ impl ExactQuoter {
                         tokenOut: token_out,
                         amountIn: U256::saturating_from(amount_in),
                         tickSpacing: tick_spacing,
-                        sqrtPriceLimitX96: v3_sqrt_price_limit_u160(sqrt_price_x96, zero_for_one),
+                        sqrtPriceLimitX96: sqrt_price_limit_u160(sqrt_price_x96, zero_for_one),
                     },
                 }
                 .abi_encode()
@@ -332,6 +378,49 @@ impl ExactQuoter {
             .await?;
         let ret = IAerodromeCLQuoter::quoteExactInputSingleCall::abi_decode_returns(&raw)?;
         Ok(u256_to_u128(ret.amountOut))
+    }
+
+    async fn quote_balancer_vault(
+        &self,
+        vault: Address,
+        pool_id: alloy::primitives::B256,
+        token_in: Address,
+        token_out: Address,
+        amount_in: u128,
+    ) -> Result<u128> {
+        let raw = self
+            .rpc
+            .best_read()
+            .eth_call(
+                vault,
+                None,
+                IBalancerVault::queryBatchSwapCall {
+                    kind: 0,
+                    swaps: vec![IBalancerVault::BatchSwapStep {
+                        poolId: pool_id,
+                        assetInIndex: U256::ZERO,
+                        assetOutIndex: U256::from(1u8),
+                        amount: U256::saturating_from(amount_in),
+                        userData: Bytes::new(),
+                    }],
+                    assets: vec![token_in, token_out],
+                    funds: IBalancerVault::FundManagement {
+                        sender: Address::ZERO,
+                        fromInternalBalance: false,
+                        recipient: Address::ZERO,
+                        toInternalBalance: false,
+                    },
+                }
+                .abi_encode()
+                .into(),
+                "latest",
+            )
+            .await?;
+        let ret = IBalancerVault::queryBatchSwapCall::abi_decode_returns(&raw)?;
+        let Some(delta_out) = ret.get(1) else {
+            return Ok(0);
+        };
+        Ok(negative_signed_abs_to_u128(delta_out))
     }
 
     fn insert_quote(&self, key: QuoteKey, value: u128) {
@@ -405,6 +494,56 @@ impl QuoteSegment {
     }
 }
 
+#[derive(Debug)]
+struct V3RevertCache {
+    threshold: u32,
+    max_segments: usize,
+    failures: HashMap<u64, HashMap<V3DirectionKey, u32>>,
+}
+
+impl V3RevertCache {
+    fn from_env() -> Self {
+        Self {
+            threshold: env_usize("V3_DIRECTION_REVERT_CACHE_THRESHOLD", 2) as u32,
+            max_segments: env_usize("QUOTE_CACHE_MAX_SEGMENTS", 4),
+            failures: HashMap::new(),
+        }
+    }
+
+    fn blocked(&mut self, key: &V3DirectionKey) -> bool {
+        self.failures
+            .get(&key.snapshot_id)
+            .and_then(|segment| segment.get(key))
+            .copied()
+            .unwrap_or(0)
+            >= self.threshold
+    }
+
+    fn record_failure(&mut self, key: V3DirectionKey) {
+        if !self.failures.contains_key(&key.snapshot_id) {
+            self.evict_old_segments_for_new_segment();
+        }
+        let segment = self.failures.entry(key.snapshot_id).or_default();
+        let count = segment.entry(key).or_default();
+        *count = count.saturating_add(1);
+    }
+
+    fn clear(&mut self, key: &V3DirectionKey) {
+        if let Some(segment) = self.failures.get_mut(&key.snapshot_id) {
+            segment.remove(key);
+        }
+    }
+
+    fn evict_old_segments_for_new_segment(&mut self) {
+        while self.failures.len() >= self.max_segments {
+            let Some(oldest) = self.failures.keys().min().copied() else {
+                break;
+            };
+            self.failures.remove(&oldest);
+        }
+    }
+}
+
 fn env_usize(key: &str, default: usize) -> usize {
     std::env::var(key)
         .ok()
@@ -417,30 +556,12 @@ fn u256_to_u128(value: alloy::primitives::U256) -> u128 {
     value.to_string().parse::<u128>().unwrap_or(u128::MAX)
 }
 
-fn v3_sqrt_price_limit_u160(current: U256, zero_for_one: bool) -> U160 {
-    let bps = std::env::var("V3_SQRT_PRICE_LIMIT_BPS")
-        .ok()
-        .and_then(|value| value.parse::<u128>().ok())
-        .filter(|value| *value < 10_000)
-        .unwrap_or(50);
-    if bps == 0 || current.is_zero() {
-        return U160::ZERO;
-    }
-    let denominator = U256::from(10_000u128);
-    let numerator = if zero_for_one {
-        U256::from(10_000u128.saturating_sub(bps))
-    } else {
-        U256::from(10_000u128.saturating_add(bps))
+fn negative_signed_abs_to_u128(value: &impl ToString) -> u128 {
+    let text = value.to_string();
+    let Some(raw) = text.strip_prefix('-') else {
+        return 0;
     };
-    u160_saturating_from_u256(current.saturating_mul(numerator) / denominator)
-}
-
-fn u160_saturating_from_u256(value: U256) -> U160 {
-    let bytes = value.to_be_bytes::<32>();
-    if bytes[..12].iter().any(|byte| *byte != 0) {
-        return U160::from_be_slice(&[0xff; 20]);
-    }
-    U160::from_be_slice(&bytes[12..])
+    raw.parse::<u128>().unwrap_or(u128::MAX)
 }
 
 fn is_slipstream_pool(pool: &PoolState) -> bool {
@@ -459,9 +580,9 @@ fn is_expected_quote_revert(err: &anyhow::Error) -> bool {
 mod tests {
     use std::collections::HashMap;
 
-    use alloy::primitives::{Address, U160, U256};
+    use alloy::primitives::Address;
 
-    use super::{v3_sqrt_price_limit_u160, QuoteCache, QuoteKey};
+    use super::{QuoteCache, QuoteKey, V3DirectionKey, V3RevertCache};
 
     fn key(snapshot_id: u64, amount_in: u128) -> QuoteKey {
         QuoteKey {
@@ -514,16 +635,24 @@ mod tests {
     }
 
     #[test]
-    fn v3_quoter_price_limit_matches_execution_default_bps() {
-        let current = U256::from(1_000_000u64);
+    fn v3_revert_cache_blocks_after_threshold_and_clears_on_success() {
+        let direction = V3DirectionKey {
+            snapshot_id: 1,
+            pool_id: Address::repeat_byte(1),
+            token_in: Address::repeat_byte(2),
+            token_out: Address::repeat_byte(3),
+        };
+        let mut cache = V3RevertCache {
+            threshold: 2,
+            max_segments: 2,
+            failures: HashMap::new(),
+        };
 
-        assert_eq!(
-            v3_sqrt_price_limit_u160(current, true),
-            U160::from(995_000u64)
-        );
-        assert_eq!(
-            v3_sqrt_price_limit_u160(current, false),
-            U160::from(1_005_000u64)
-        );
+        cache.record_failure(direction);
+        assert!(!cache.blocked(&direction));
+        cache.record_failure(direction);
+        assert!(cache.blocked(&direction));
+        cache.clear(&direction);
+        assert!(!cache.blocked(&direction));
     }
 }

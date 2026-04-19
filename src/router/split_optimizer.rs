@@ -7,12 +7,15 @@ use crate::{
     types::{AdapterType, SplitExtra, SplitPlan},
 };
 
-use super::{exact_quoter::ExactQuoter, split_decision::should_split};
+use super::{
+    exact_quoter::ExactQuoter, split_decision::should_split, v3_limits::sqrt_price_limit_x96,
+};
 
 #[derive(Debug, Clone)]
 pub struct SplitOptimizer {
     exact_quoter: ExactQuoter,
     max_parallel_pools: usize,
+    pair_edge_scan_limit: usize,
 }
 
 impl SplitOptimizer {
@@ -24,9 +27,17 @@ impl SplitOptimizer {
         settings: Arc<crate::config::Settings>,
         exact_quoter: ExactQuoter,
     ) -> Self {
+        let max_parallel_pools = settings.search.max_split_parallel_pools.max(1);
         Self {
             exact_quoter,
-            max_parallel_pools: settings.search.max_split_parallel_pools,
+            max_parallel_pools,
+            pair_edge_scan_limit: env_usize(
+                "ROUTE_PAIR_EDGE_SCAN_LIMIT",
+                max_parallel_pools
+                    .saturating_mul(4)
+                    .clamp(max_parallel_pools, 32),
+            )
+            .max(max_parallel_pools),
         }
     }
 
@@ -40,7 +51,8 @@ impl SplitOptimizer {
         let edge_refs = ranked_pair_edges(
             snapshot,
             snapshot.pair_edges(token_in, token_out),
-            self.max_parallel_pools,
+            self.pair_edge_scan_limit,
+            total_in,
         );
         if edge_refs.is_empty() {
             return Ok((Vec::new(), 0));
@@ -52,11 +64,20 @@ impl SplitOptimizer {
                 .await;
         }
 
+        let v2_edge_refs = edge_refs
+            .iter()
+            .copied()
+            .take(self.max_parallel_pools)
+            .collect::<Vec<_>>();
         if let Some(allocations) = super::v2_split::optimal_v2_allocations(
-            snapshot, &edge_refs, token_in, token_out, total_in,
+            snapshot,
+            &v2_edge_refs,
+            token_in,
+            token_out,
+            total_in,
         ) {
             let materialized = self
-                .materialize_allocations(snapshot, &edge_refs, token_in, token_out, allocations)
+                .materialize_allocations(snapshot, &v2_edge_refs, token_in, token_out, allocations)
                 .await?;
             if !materialized.0.is_empty() {
                 return Ok(materialized);
@@ -66,11 +87,15 @@ impl SplitOptimizer {
         let mut allocations = vec![0u128; edge_refs.len()];
         let mut quoted_outputs = vec![0u128; edge_refs.len()];
         let mut assigned = 0u128;
+        let mut active_allocations = 0usize;
 
         while assigned < total_in {
             let slice = (total_in - assigned).min(min_slice);
             let mut ranked = Vec::new();
             for (idx, edge_ref) in edge_refs.iter().enumerate() {
+                if allocations[idx] == 0 && active_allocations >= self.max_parallel_pools {
+                    continue;
+                }
                 let edge = match snapshot.edge(*edge_ref) {
                     Some(edge) => edge,
                     None => continue,
@@ -94,33 +119,32 @@ impl SplitOptimizer {
                     )
                     .await?;
                 let marginal = total_quote.saturating_sub(quoted_outputs[idx]);
-                ranked.push((idx, marginal));
+                ranked.push((idx, marginal, total_quote));
             }
             ranked.sort_by(|a, b| b.1.cmp(&a.1));
-            let Some((winner, marginal)) = ranked.first().copied() else {
+            let Some((winner, marginal, total_quote)) = ranked.first().copied() else {
                 break;
             };
             if marginal == 0 {
                 break;
             }
+            if allocations[winner] == 0 {
+                active_allocations += 1;
+            }
             allocations[winner] = allocations[winner].saturating_add(slice);
-            quoted_outputs[winner] = self
-                .exact_quoter
-                .quote_pool(
-                    snapshot,
-                    snapshot
-                        .pool(snapshot.edge(edge_refs[winner]).unwrap().pool_id)
-                        .unwrap(),
-                    token_in,
-                    token_out,
-                    allocations[winner],
-                )
-                .await?;
+            quoted_outputs[winner] = total_quote;
             assigned = assigned.saturating_add(slice);
         }
 
-        self.materialize_allocations(snapshot, &edge_refs, token_in, token_out, allocations)
-            .await
+        self.materialize_allocations_with_quotes(
+            snapshot,
+            &edge_refs,
+            token_in,
+            token_out,
+            allocations,
+            Some(quoted_outputs),
+        )
+        .await
     }
 
     async fn single_best(
@@ -147,14 +171,21 @@ impl SplitOptimizer {
                 .exact_quoter
                 .quote_pool(snapshot, pool, token_in, token_out, total_in)
                 .await?;
-            if best.as_ref().map(|(_, out)| quote > *out).unwrap_or(true) {
+            if quote > 0 && best.as_ref().map(|(_, out)| quote > *out).unwrap_or(true) {
                 best = Some((edge_ref, quote));
             }
         }
 
-        if let Some((edge_ref, _out)) = best {
-            self.materialize_allocations(snapshot, &[edge_ref], token_in, token_out, vec![total_in])
-                .await
+        if let Some((edge_ref, out)) = best {
+            self.materialize_allocations_with_quotes(
+                snapshot,
+                &[edge_ref],
+                token_in,
+                token_out,
+                vec![total_in],
+                Some(vec![out]),
+            )
+            .await
         } else {
             Ok((Vec::new(), 0))
         }
@@ -167,6 +198,26 @@ impl SplitOptimizer {
         token_in: alloy::primitives::Address,
         token_out: alloy::primitives::Address,
         allocations: Vec<u128>,
+    ) -> Result<(Vec<SplitPlan>, u128)> {
+        self.materialize_allocations_with_quotes(
+            snapshot,
+            edge_refs,
+            token_in,
+            token_out,
+            allocations,
+            None,
+        )
+        .await
+    }
+
+    async fn materialize_allocations_with_quotes(
+        &self,
+        snapshot: &GraphSnapshot,
+        edge_refs: &[crate::types::EdgeRef],
+        token_in: alloy::primitives::Address,
+        token_out: alloy::primitives::Address,
+        allocations: Vec<u128>,
+        expected_outputs: Option<Vec<u128>>,
     ) -> Result<(Vec<SplitPlan>, u128)> {
         let mut plans = Vec::new();
         let mut total_out = 0u128;
@@ -181,10 +232,18 @@ impl SplitOptimizer {
             let Some(pool) = snapshot.pool(edge.pool_id) else {
                 continue;
             };
-            let expected = self
-                .exact_quoter
-                .quote_pool(snapshot, pool, token_in, token_out, allocation)
-                .await?;
+            let expected = match expected_outputs
+                .as_ref()
+                .and_then(|outputs| outputs.get(idx))
+                .copied()
+            {
+                Some(expected) if expected > 0 => expected,
+                _ => {
+                    self.exact_quoter
+                        .quote_pool(snapshot, pool, token_in, token_out, allocation)
+                        .await?
+                }
+            };
             if expected == 0 {
                 continue;
             }
@@ -203,7 +262,7 @@ impl SplitOptimizer {
                     let zero_for_one = pool.token_addresses.first().copied() == Some(token_in);
                     SplitExtra::V3 {
                         zero_for_one,
-                        sqrt_price_limit_x96: v3_sqrt_price_limit(
+                        sqrt_price_limit_x96: sqrt_price_limit_x96(
                             state.sqrt_price_x96,
                             zero_for_one,
                         ),
@@ -278,55 +337,101 @@ impl SplitOptimizer {
 
 fn ranked_pair_edges(
     snapshot: &GraphSnapshot,
-    mut edge_refs: Vec<crate::types::EdgeRef>,
+    edge_refs: Vec<crate::types::EdgeRef>,
     max_edges: usize,
+    target_input: u128,
 ) -> Vec<crate::types::EdgeRef> {
-    edge_refs.sort_by(|a, b| {
-        let a_edge = snapshot.edge(*a);
-        let b_edge = snapshot.edge(*b);
-        match (a_edge, b_edge) {
-            (Some(a_edge), Some(b_edge)) => a_edge
-                .weight_log_q32
-                .cmp(&b_edge.weight_log_q32)
+    let max_edges = max_edges.max(1);
+    let mut by_price = edge_refs.clone();
+    by_price.sort_by(|a, b| compare_edge_refs_for_price(snapshot, *a, *b));
+
+    let mut selected = Vec::<crate::types::EdgeRef>::new();
+    let price_slots = max_edges.div_ceil(2);
+    push_unique(
+        &mut selected,
+        by_price.iter().copied().take(price_slots),
+        max_edges,
+    );
+
+    let mut by_capacity = edge_refs;
+    by_capacity.sort_by(|a, b| compare_edge_refs_for_capacity(snapshot, *a, *b, target_input));
+    push_unique(&mut selected, by_capacity.into_iter(), max_edges);
+
+    selected.sort_by(|a, b| compare_edge_refs_for_price(snapshot, *a, *b));
+    selected
+}
+
+fn push_unique<I>(out: &mut Vec<crate::types::EdgeRef>, refs: I, max_edges: usize)
+where
+    I: IntoIterator<Item = crate::types::EdgeRef>,
+{
+    for edge_ref in refs {
+        if out.len() >= max_edges {
+            break;
+        }
+        if !out.contains(&edge_ref) {
+            out.push(edge_ref);
+        }
+    }
+}
+
+fn compare_edge_refs_for_price(
+    snapshot: &GraphSnapshot,
+    a: crate::types::EdgeRef,
+    b: crate::types::EdgeRef,
+) -> Ordering {
+    let a_edge = snapshot.edge(a);
+    let b_edge = snapshot.edge(b);
+    match (a_edge, b_edge) {
+        (Some(a_edge), Some(b_edge)) => a_edge
+            .weight_log_q32
+            .cmp(&b_edge.weight_log_q32)
+            .then_with(|| {
+                b_edge
+                    .liquidity
+                    .safe_capacity_in
+                    .cmp(&a_edge.liquidity.safe_capacity_in)
+            })
+            .then_with(|| a_edge.pool_id.cmp(&b_edge.pool_id)),
+        (Some(_), None) => Ordering::Less,
+        (None, Some(_)) => Ordering::Greater,
+        (None, None) => Ordering::Equal,
+    }
+}
+
+fn compare_edge_refs_for_capacity(
+    snapshot: &GraphSnapshot,
+    a: crate::types::EdgeRef,
+    b: crate::types::EdgeRef,
+    target_input: u128,
+) -> Ordering {
+    let a_edge = snapshot.edge(a);
+    let b_edge = snapshot.edge(b);
+    match (a_edge, b_edge) {
+        (Some(a_edge), Some(b_edge)) => {
+            let a_fits = target_input > 0 && a_edge.liquidity.safe_capacity_in >= target_input;
+            let b_fits = target_input > 0 && b_edge.liquidity.safe_capacity_in >= target_input;
+            b_fits
+                .cmp(&a_fits)
                 .then_with(|| {
                     b_edge
                         .liquidity
                         .safe_capacity_in
                         .cmp(&a_edge.liquidity.safe_capacity_in)
                 })
-                .then_with(|| a_edge.pool_id.cmp(&b_edge.pool_id)),
-            (Some(_), None) => Ordering::Less,
-            (None, Some(_)) => Ordering::Greater,
-            (None, None) => Ordering::Equal,
+                .then_with(|| a_edge.weight_log_q32.cmp(&b_edge.weight_log_q32))
+                .then_with(|| a_edge.pool_id.cmp(&b_edge.pool_id))
         }
-    });
-    edge_refs.truncate(max_edges);
-    edge_refs
+        (Some(_), None) => Ordering::Less,
+        (None, Some(_)) => Ordering::Greater,
+        (None, None) => Ordering::Equal,
+    }
 }
 
-fn v3_sqrt_price_limit(
-    current: alloy::primitives::U256,
-    zero_for_one: bool,
-) -> alloy::primitives::U256 {
-    let bps = std::env::var("V3_SQRT_PRICE_LIMIT_BPS")
+fn env_usize(key: &str, default: usize) -> usize {
+    std::env::var(key)
         .ok()
-        .and_then(|value| value.parse::<u128>().ok())
-        .filter(|value| *value < 10_000)
-        .unwrap_or(50);
-    if bps == 0 || current.is_zero() {
-        return alloy::primitives::U256::ZERO;
-    }
-
-    let denominator = alloy::primitives::U256::from(10_000u64);
-    let numerator = if zero_for_one {
-        alloy::primitives::U256::from(10_000u128.saturating_sub(bps))
-    } else {
-        alloy::primitives::U256::from(10_000u128.saturating_add(bps))
-    };
-    let limit = current.saturating_mul(numerator) / denominator;
-    if zero_for_one {
-        limit.max(alloy::primitives::U256::from(4_295_128_740u64))
-    } else {
-        limit
-    }
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(default)
 }

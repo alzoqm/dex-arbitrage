@@ -1161,3 +1161,115 @@ forge build: 통과, lint note/warning만 존재
     특히 V3 exact quote 탈락, V2/AerodromeV2 hop no-output, 낮은 용량으로 인한 amount range missing을 분리해서
     후보 품질과 수익 후보 발견률을 더 개선해야 한다.
 ```
+
+## 2026-04-19 추가 라우터 최적화
+
+목표:
+- Base 전체 venue/symbol 범위는 유지한다.
+- fallback V3 가격 근사 때문에 생기는 false-positive 후보가 실제 exact quote 단계에서 계속 RPC와 시간을 소모하는 문제를 줄인다.
+- 실행 가능한 후보를 놓치지 않도록, V3 검증 시 fallback이 고른 단일 split만 재검증하지 않고 같은 token pair의 대체 pool까지 exact quoter로 다시 최적화한다.
+
+수정:
+- `VERIFY_V3_EARLY_REOPTIMIZE=true`
+  - V3 후보의 early exact 검증에서 기존 split 고정 검증 대신 exact quoter 기반 pair 재최적화를 수행한다.
+- `ROUTE_PAIR_EDGE_SCAN_LIMIT=24`
+  - pair별 실제 실행 split 수(`MAX_SPLIT_PARALLEL_POOLS=5`)는 유지하면서, 후보 pool 탐색 폭만 넓힌다.
+  - 상위 false-price pool 5개가 모두 실패해도 같은 token pair의 다른 pool을 확인할 수 있다.
+- `V3_DIRECTION_REVERT_CACHE_THRESHOLD=2`
+  - 같은 snapshot에서 동일 V3 pool/direction이 expected revert를 2회 발생시키면 이후 금액은 즉시 0으로 처리한다.
+  - 반복 RPC 호출을 줄이고, 같은 실패 방향이 후보 처리 시간을 계속 잡아먹는 것을 막는다.
+- detector 단계에 route-level 최소 거래금액 capacity filter를 추가했다.
+  - hop 개별 capacity는 충분하지만 전체 route 기준으로 시작 자산 최소 거래금액을 처리할 수 없는 후보를 router 전에 제거한다.
+- no-route sample 로그에 `first_no_output_hop`, `first_no_output_pool`, `first_no_output_amount_in`을 추가했다.
+
+검증:
+- `cargo test`: 통과, 62 tests
+- `cargo build --release`: 통과
+- `state/base-capacity-filter-reopt-smoke-20260419-202805.log`
+  - `route_amount_range_missing=0`
+  - `refresh_total_ms=4142`
+  - `no_route=32`, `simulated=0`, `submitted=0`
+- `state/base-edge-scan24-smoke-20260419-203023.log`
+  - pool scan 폭을 넓혔지만 direction cache 전에는 `refresh_total_ms=18272`로 지연이 커졌다.
+- `state/base-v3-direction-cache-smoke-20260419-203509.log`
+  - direction cache 적용 후 `refresh_total_ms=5759`
+  - `route_profitable_plans=29`
+  - `no_route=32`, `simulated=0`, `submitted=0`
+- `state/base-candidate128-scan24-smoke-20260419-203608.log`
+  - 후보 예산을 128로 넓혔지만 실제 생성 후보는 57개였다.
+  - `refresh_total_ms=10166`
+  - `no_route=57`, `simulated=0`, `submitted=0`
+
+해석:
+- 이번 변경은 후보 범위를 임의 심볼/거래소 allowlist로 줄인 것이 아니다.
+- 현재 관찰 블록에서는 exact quote 기준 실행 가능한 양수 기대수익 후보가 없었다.
+- 후보 수를 57개까지 넓혀도 simulated 후보가 나오지 않았으므로, 해당 시점에 검증 가능한 수익 기회가 없었거나 V3 tick-level 근사가 아직 detector 단계에서 false-positive를 많이 만들고 있다.
+- 적용 가치가 확인된 기본값은 `VERIFY_V3_EARLY_REOPTIMIZE=true`, `ROUTE_PAIR_EDGE_SCAN_LIMIT=24`, `V3_DIRECTION_REVERT_CACHE_THRESHOLD=2`다.
+- 실매매 전 다음 개선 후보는 V3 pool/direction revert cache를 장기 상태로 승격하거나, V3 후보에 대해 cheap exact prefilter를 도입하는 것이다. 단, 이 작업은 RPC 비용과 후보 발견률 사이의 균형 검증이 필요하다.
+
+## 2026-04-19 Base simulate-only 지연/정확도 최적화
+
+목표:
+- Base 전체 venue/symbol/pool 범위는 유지한다.
+- 실제 알파 후보를 심볼, 커넥터, DEX allowlist로 잘라내지 않는다.
+- fallback 가격에서 생기는 false-positive는 정확한 RPC quote와 실행 비용 계산으로 제거한다.
+- 느린 후보 때문에 전체 snapshot refresh가 밀리지 않도록 후보 평가 지연을 제한한다.
+
+수정:
+- `USE_BALANCER_RPC_QUOTER=true`
+  - Balancer fallback quote만으로 후보를 통과시키지 않고 `queryBatchSwap` 기반 exact quote를 사용한다.
+  - 이전 smoke에서 발생한 `BAL#507` 검증 실패를 제거했다.
+- `ROUTE_SEARCH_TIMEOUT_MS=1000`
+  - 후보 하나가 exact quote 단계에서 1초를 넘기면 stale 후보로 간주하고 해당 후보만 버린다.
+  - Base 차익매매에서는 1초 넘게 quote가 끝나지 않는 후보는 이미 블록 경쟁력이 낮다고 판단했다.
+- `ROUTE_CANDIDATE_CONCURRENCY=16`
+  - simulate-only 후보 평가는 동시에 최대 16개까지 수행한다.
+  - live 제출 경로는 nonce/risk 보호를 위해 기존 순차 제출 흐름을 유지한다.
+- `CANDIDATE_SELECTION_LARGE_REFRESH_THRESHOLD=8192`
+  - 최초 대형 refresh에서는 후보 selection buffer multiplier를 1로 낮춰 전체 초기 edge scan을 빠르게 끝낸다.
+  - 일반 live refresh에서는 기존 `SEARCH_CANDIDATE_SELECTION_BUFFER_MULTIPLIER=4`를 유지한다.
+- `ROUTE_CAPACITY_PREFILTER_MAX_CHANGED_EDGES=8192`
+  - 작은 refresh에서는 route-level 최소 거래금액 capacity prefilter를 적용한다.
+  - 최초 대형 refresh에서는 prefilter 자체가 detector 병목이 되지 않도록 건너뛴다.
+- profitability summary에 `router_timeouts`를 추가했다.
+  - no-route 원인이 실제 quote 실패인지, gross nonpositive인지, timeout인지 분리해서 볼 수 있다.
+
+검증:
+- `cargo fmt`: 통과
+- `cargo test`: 통과, 63 lib tests + integration tests
+- `cargo build --release`: 통과
+- `state/base-balancer-exact-steady-2m-20260419-204557.log`
+  - `BAL#507` 재발 없음
+  - validation reject 없음
+  - simulated=0, submitted=0
+- `state/base-current-env-timeout-smoke-20260419-211028.log`
+  - timeout 전 순차 처리 기준:
+    - snapshot 0: `refresh_total_ms=6888`
+    - snapshot 1: `refresh_total_ms=26643`
+  - 느린 후보가 전체 refresh를 밀어내는 문제가 확인됐다.
+- `state/base-parallel-candidates-smoke-20260419-211449.log`
+  - `ROUTE_SEARCH_TIMEOUT_MS=1000`, `ROUTE_CANDIDATE_CONCURRENCY=8`
+  - snapshot 0: `refresh_total_ms=1120`
+  - 이후 refresh는 대체로 2.0-3.0초 범위
+  - simulated=0, submitted=0
+- `state/base-concurrency16-smoke-20260419-211950.log`
+  - `ROUTE_CANDIDATE_CONCURRENCY=16`
+  - snapshot 0: `refresh_total_ms=1106`
+  - 이후 refresh는 대체로 1.0-2.0초 범위
+  - 30초 RPC summary:
+    - 첫 구간: `total_requests=467`, `total_cu=12246`
+    - 둘째 구간: `total_requests=1380`, `total_cu=35934`
+  - simulated=0, submitted=0
+- `state/base-no-route-score-samples-20260419-212131.log`
+  - no-route 샘플의 주 원인은 V3/소형 풀 경유 중간 hop `no_output`, gross nonpositive, 일부 router timeout이었다.
+  - 특정 DEX나 특정 심볼만의 문제가 아니므로 범위 축소형 allowlist는 적용하지 않았다.
+
+해석:
+- 실매매 범위를 줄이지 않고도 후보 처리 지연을 순차 26초대에서 1-2초대로 낮췄다.
+- 후보는 여전히 Base 전체 discovery 결과에서 생성되며, 특정 심볼/DEX/커넥터 전용으로 축소하지 않았다.
+- 관찰 구간에서는 exact quote, flash fee, gas, validator까지 통과한 실행 가능 수익 후보가 없었다.
+- 이 결과는 “수익 없음”을 증명하지 않는다. 해당 관찰 블록들에서 실행 가능한 후보가 없었고, 현재 세팅은 false-positive를 빠르게 제거하도록 조정됐다는 의미다.
+- 다음 실매매 전 확인 포인트:
+  - 더 긴 simulate-only 관찰에서 `simulated > 0` 후보가 실제로 발생하는지 확인한다.
+  - 발생 시 `best_net_profit_usd_e8`, `best_gas_to_gross_bps`, `capital_source`를 기준으로 최소 수익/최대 포지션을 재조정한다.
+  - live 전환 전에는 `SIMULATION_ONLY=false` 변경, 보호 RPC/프라이빗 제출 경로, 손실 한도, executor allowlist 정책을 별도로 재검증해야 한다.
