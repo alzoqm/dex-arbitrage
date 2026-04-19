@@ -153,6 +153,7 @@ fn candidate() -> CandidatePath {
         start_token: addr(1),
         start_symbol: "USDC".to_string(),
         screening_score_q32: 0,
+        route_capacity_usd_e8: 0,
         cycle_key: "cycle".to_string(),
         path: SmallVec::new(),
     }

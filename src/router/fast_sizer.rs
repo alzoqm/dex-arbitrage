@@ -326,6 +326,7 @@ mod tests {
             start_token: token_a,
             start_symbol: "A".to_string(),
             screening_score_q32: 0,
+            route_capacity_usd_e8: 0,
             cycle_key: "A-B-A".to_string(),
             path: smallvec![
                 CandidateHop {

@@ -354,6 +354,7 @@ pub struct CandidatePath {
     pub start_token: Address,
     pub start_symbol: String,
     pub screening_score_q32: i64,
+    pub route_capacity_usd_e8: u128,
     pub cycle_key: String,
     pub path: SmallVec<[CandidateHop; 8]>,
 }

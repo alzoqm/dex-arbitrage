@@ -295,7 +295,7 @@ fn detector_can_start_from_non_stable_cycle_anchor() {
 }
 
 #[test]
-fn detector_deduplicates_parallel_pool_route_variants_by_token_path() {
+fn detector_retains_bounded_parallel_pool_route_variants_by_token_path() {
     let (snapshot, changed_edges) = manual_parallel_snapshot(4);
     let distance_cache = DistanceCache::recompute(&snapshot);
     let detector = Detector::new(settings_with_search(SearchSettings {
@@ -305,7 +305,7 @@ fn detector_deduplicates_parallel_pool_route_variants_by_token_path() {
 
     let candidates = detector.detect(&snapshot, &changed_edges, &distance_cache);
 
-    assert_eq!(candidates.len(), 1);
+    assert_eq!(candidates.len(), 3);
     assert!(candidates.iter().all(|candidate| candidate.path.len() == 4));
     assert_eq!(
         token_cycle_key(candidates.first().expect("candidate")),

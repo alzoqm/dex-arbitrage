@@ -10,7 +10,7 @@ use crate::{
     config::Settings,
     detector::pruning,
     graph::{DistanceCache, GraphSnapshot},
-    risk::valuation::usd_e8_to_amount,
+    risk::valuation::{amount_to_usd_e8, usd_e8_to_amount},
     types::{CandidateHop, CandidatePath, Edge, EdgeRef},
 };
 
@@ -33,6 +33,9 @@ struct SearchTuning {
     candidate_selection_buffer_multiplier: usize,
     dedup_token_paths: bool,
     max_pair_edges_per_pair: usize,
+    pool_variants_per_token_path: usize,
+    canonical_variants_per_cycle: usize,
+    anchor_variants_per_cycle: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -62,6 +65,9 @@ impl PathFinder {
                     .max(1),
                 dedup_token_paths: search.dedup_token_paths,
                 max_pair_edges_per_pair: search.max_pair_edges_per_pair,
+                pool_variants_per_token_path: env_usize("SEARCH_POOL_VARIANTS_PER_TOKEN_PATH", 3),
+                canonical_variants_per_cycle: env_usize("SEARCH_CANONICAL_VARIANTS_PER_CYCLE", 3),
+                anchor_variants_per_cycle: env_usize("SEARCH_ANCHOR_VARIANTS_PER_CYCLE", 1),
             },
         }
     }
@@ -82,7 +88,8 @@ impl PathFinder {
         }
 
         let mut candidates = Vec::new();
-        let mut token_path_candidates = HashMap::<String, CandidatePath>::new();
+        let mut token_path_candidates = HashMap::<String, Vec<CandidatePath>>::new();
+        let mut token_path_candidate_count = 0usize;
         let mut dedup = HashSet::<String>::new();
         let mut top_path_cache = HashMap::<(usize, usize, usize), Vec<SearchPath>>::new();
         let mut outgoing_cache = HashMap::<usize, Vec<EdgeRef>>::new();
@@ -196,21 +203,21 @@ impl PathFinder {
                             ) {
                                 if self.tuning.dedup_token_paths {
                                     let token_key = candidate_token_cycle_key(&candidate);
-                                    match token_path_candidates.get_mut(&token_key) {
-                                        Some(existing)
-                                            if candidate_precedes(&candidate, existing) =>
-                                        {
-                                            *existing = candidate;
-                                        }
-                                        Some(_) => {}
-                                        None => {
-                                            token_path_candidates.insert(token_key, candidate);
-                                        }
+                                    if insert_token_path_variant(
+                                        &mut token_path_candidates,
+                                        token_key,
+                                        candidate,
+                                        self.tuning.pool_variants_per_token_path,
+                                    ) {
+                                        token_path_candidate_count =
+                                            token_path_candidate_count.saturating_add(1);
                                     }
-                                    if token_path_candidates.len() >= selection_budget {
+                                    if token_path_candidate_count >= selection_budget {
                                         return finalize_candidates(
-                                            token_path_candidates.into_values().collect(),
+                                            flatten_candidate_map(token_path_candidates),
                                             self.tuning.max_candidates_per_refresh,
+                                            self.tuning.canonical_variants_per_cycle,
+                                            self.tuning.anchor_variants_per_cycle,
                                         );
                                     }
                                 } else {
@@ -219,6 +226,8 @@ impl PathFinder {
                                         return finalize_candidates(
                                             candidates,
                                             self.tuning.max_candidates_per_refresh,
+                                            self.tuning.canonical_variants_per_cycle,
+                                            self.tuning.anchor_variants_per_cycle,
                                         );
                                     }
                                 }
@@ -231,11 +240,18 @@ impl PathFinder {
 
         if self.tuning.dedup_token_paths {
             finalize_candidates(
-                token_path_candidates.into_values().collect(),
+                flatten_candidate_map(token_path_candidates),
                 self.tuning.max_candidates_per_refresh,
+                self.tuning.canonical_variants_per_cycle,
+                self.tuning.anchor_variants_per_cycle,
             )
         } else {
-            finalize_candidates(candidates, self.tuning.max_candidates_per_refresh)
+            finalize_candidates(
+                candidates,
+                self.tuning.max_candidates_per_refresh,
+                self.tuning.canonical_variants_per_cycle,
+                self.tuning.anchor_variants_per_cycle,
+            )
         }
     }
 
@@ -437,11 +453,16 @@ impl PathFinder {
             return None;
         }
 
+        let route_capacity_usd_e8 = route_start_capacity_raw(snapshot, edge_refs)
+            .and_then(|capacity| amount_to_usd_e8(capacity, &snapshot.tokens[anchor_idx]))
+            .unwrap_or(0);
+
         Some(CandidatePath {
             snapshot_id: snapshot.snapshot_id,
             start_token: snapshot.tokens[anchor_idx].address,
             start_symbol: snapshot.tokens[anchor_idx].symbol.clone(),
             screening_score_q32: score_q32,
+            route_capacity_usd_e8,
             cycle_key: key,
             path,
         })
@@ -451,39 +472,131 @@ impl PathFinder {
 fn finalize_candidates(
     mut candidates: Vec<CandidatePath>,
     max_candidates_per_refresh: usize,
+    canonical_variants_per_cycle: usize,
+    anchor_variants_per_cycle: usize,
 ) -> Vec<CandidatePath> {
-    candidates.sort_by(|a, b| a.screening_score_q32.cmp(&b.screening_score_q32));
+    finalize_candidates_with_tuning(
+        &mut candidates,
+        max_candidates_per_refresh,
+        canonical_variants_per_cycle,
+        anchor_variants_per_cycle,
+        env_bool("SEARCH_FILL_ROTATED_CANDIDATES", true),
+    )
+}
+
+fn finalize_candidates_with_tuning(
+    candidates: &mut [CandidatePath],
+    max_candidates_per_refresh: usize,
+    canonical_variants_per_cycle: usize,
+    anchor_variants_per_cycle: usize,
+    fill_rotated_candidates: bool,
+) -> Vec<CandidatePath> {
+    candidates.sort_by(candidate_ordering);
 
     let mut selected = Vec::with_capacity(max_candidates_per_refresh);
-    let mut selected_canonical_cycles = HashSet::<String>::new();
-    for candidate in &candidates {
-        let key = canonical_token_cycle_key(candidate);
-        if selected_canonical_cycles.insert(key) {
-            selected.push(candidate.clone());
-            if selected.len() >= max_candidates_per_refresh {
-                return selected;
-            }
+    let mut selected_pool_cycles = HashSet::<String>::new();
+    let mut selected_token_cycle_counts = HashMap::<String, usize>::new();
+    let mut selected_anchor_cycle_counts = HashMap::<String, usize>::new();
+    let variants_per_cycle = canonical_variants_per_cycle.max(1);
+    let variants_per_anchor = anchor_variants_per_cycle.max(1);
+    for candidate in candidates.iter() {
+        let pool_key = canonical_anchor_pool_cycle_key(candidate);
+        if !selected_pool_cycles.insert(pool_key) {
+            continue;
+        }
+        let token_key = canonical_token_cycle_key(candidate);
+        let count = selected_token_cycle_counts
+            .entry(token_key.clone())
+            .or_insert(0);
+        if *count >= variants_per_cycle {
+            continue;
+        }
+        let anchor_key = format!("{}:{}", token_key, candidate.start_token);
+        let anchor_count = selected_anchor_cycle_counts.entry(anchor_key).or_insert(0);
+        if *anchor_count >= variants_per_anchor {
+            continue;
+        }
+        *count += 1;
+        *anchor_count += 1;
+        selected.push(candidate.clone());
+        if selected.len() >= max_candidates_per_refresh {
+            return selected;
         }
     }
-    if !env_bool("SEARCH_FILL_ROTATED_CANDIDATES", true)
-        || selected.len() >= max_candidates_per_refresh
-    {
+    if !fill_rotated_candidates || selected.len() >= max_candidates_per_refresh {
         return selected;
     }
 
-    let mut selected_token_paths = selected
+    let mut selected_pool_cycles = selected
         .iter()
-        .map(candidate_token_cycle_key)
+        .map(canonical_anchor_pool_cycle_key)
         .collect::<HashSet<_>>();
-    for candidate in candidates {
+    for candidate in candidates.iter() {
         if selected.len() >= max_candidates_per_refresh {
             break;
         }
-        if selected_token_paths.insert(candidate_token_cycle_key(&candidate)) {
-            selected.push(candidate);
+        if selected_pool_cycles.insert(canonical_anchor_pool_cycle_key(candidate)) {
+            selected.push(candidate.clone());
         }
     }
     selected
+}
+
+fn flatten_candidate_map(candidates: HashMap<String, Vec<CandidatePath>>) -> Vec<CandidatePath> {
+    candidates
+        .into_values()
+        .flat_map(|variants| variants.into_iter())
+        .collect()
+}
+
+fn insert_token_path_variant(
+    candidates: &mut HashMap<String, Vec<CandidatePath>>,
+    key: String,
+    candidate: CandidatePath,
+    max_variants: usize,
+) -> bool {
+    let max_variants = max_variants.max(1);
+    let variants = candidates.entry(key).or_default();
+    if variants.len() < max_variants {
+        variants.push(candidate);
+        variants.sort_by(candidate_ordering);
+        return true;
+    }
+
+    if let Some(worst) = variants.last() {
+        if candidate_ordering(&candidate, worst).is_lt() {
+            *variants.last_mut().expect("last exists") = candidate;
+            variants.sort_by(candidate_ordering);
+        }
+    }
+    false
+}
+
+fn candidate_ordering(left: &CandidatePath, right: &CandidatePath) -> std::cmp::Ordering {
+    let left_potential = candidate_profit_potential_usd_e8(left);
+    let right_potential = candidate_profit_potential_usd_e8(right);
+    match (left_potential, right_potential) {
+        (0, 0) => left.screening_score_q32.cmp(&right.screening_score_q32),
+        _ => right_potential.cmp(&left_potential),
+    }
+    .then_with(|| left.screening_score_q32.cmp(&right.screening_score_q32))
+    .then_with(|| right.route_capacity_usd_e8.cmp(&left.route_capacity_usd_e8))
+    .then_with(|| left.path.len().cmp(&right.path.len()))
+}
+
+fn candidate_profit_potential_usd_e8(candidate: &CandidatePath) -> u128 {
+    candidate
+        .route_capacity_usd_e8
+        .saturating_mul(screening_edge_bps(candidate.screening_score_q32))
+        / 10_000
+}
+
+fn screening_edge_bps(score_q32: i64) -> u128 {
+    if score_q32 >= 0 {
+        return 0;
+    }
+    let edge = score_q32.unsigned_abs() as u128;
+    edge.saturating_mul(10_000) / (1u128 << 32)
 }
 
 fn candidate_token_cycle_key(candidate: &CandidatePath) -> String {
@@ -518,6 +631,34 @@ fn canonical_token_cycle_key(candidate: &CandidatePath) -> String {
     parts.join(">")
 }
 
+fn canonical_pool_cycle_key(candidate: &CandidatePath) -> String {
+    if candidate.path.is_empty() {
+        return candidate.start_token.to_string();
+    }
+
+    let entries = candidate
+        .path
+        .iter()
+        .map(|hop| format!("{}>{}:{}", hop.from, hop.to, hop.pool_id))
+        .collect::<Vec<_>>();
+    let best_start = (0..entries.len())
+        .min_by(|left, right| compare_string_rotation(&entries, *left, *right))
+        .unwrap_or(0);
+    let mut out = Vec::with_capacity(entries.len());
+    for offset in 0..entries.len() {
+        out.push(entries[(best_start + offset) % entries.len()].clone());
+    }
+    out.join("|")
+}
+
+fn canonical_anchor_pool_cycle_key(candidate: &CandidatePath) -> String {
+    format!(
+        "{}:{}",
+        candidate.start_token,
+        canonical_pool_cycle_key(candidate)
+    )
+}
+
 fn compare_cycle_rotation(
     tokens: &[alloy::primitives::Address],
     left: usize,
@@ -534,12 +675,16 @@ fn compare_cycle_rotation(
     std::cmp::Ordering::Equal
 }
 
-fn candidate_precedes(candidate: &CandidatePath, existing: &CandidatePath) -> bool {
-    candidate
-        .screening_score_q32
-        .cmp(&existing.screening_score_q32)
-        .then_with(|| candidate.path.len().cmp(&existing.path.len()))
-        .is_lt()
+fn compare_string_rotation(tokens: &[String], left: usize, right: usize) -> std::cmp::Ordering {
+    for offset in 0..tokens.len() {
+        let lhs = &tokens[(left + offset) % tokens.len()];
+        let rhs = &tokens[(right + offset) % tokens.len()];
+        let cmp = lhs.cmp(rhs);
+        if cmp != std::cmp::Ordering::Equal {
+            return cmp;
+        }
+    }
+    std::cmp::Ordering::Equal
 }
 
 fn candidate_selection_budget(max_candidates_per_refresh: usize, multiplier: usize) -> usize {
@@ -573,7 +718,10 @@ mod tests {
 
     use crate::types::{AmmKind, CandidateHop, CandidatePath};
 
-    use super::{candidate_selection_budget, canonical_token_cycle_key, q128_to_f64};
+    use super::{
+        candidate_selection_budget, canonical_token_cycle_key, finalize_candidates_with_tuning,
+        q128_to_f64,
+    };
 
     fn addr(byte: u8) -> Address {
         Address::from_slice(&[byte; 20])
@@ -592,6 +740,7 @@ mod tests {
             start_token: start,
             start_symbol: "A".to_string(),
             screening_score_q32: 0,
+            route_capacity_usd_e8: 0,
             cycle_key: "cycle".to_string(),
             path,
         };
@@ -613,6 +762,41 @@ mod tests {
             canonical_token_cycle_key(&first),
             canonical_token_cycle_key(&rotated)
         );
+    }
+
+    #[test]
+    fn finalize_keeps_pool_variants_for_same_token_cycle() {
+        let candidate = |score, pool_byte| CandidatePath {
+            snapshot_id: 1,
+            start_token: addr(1),
+            start_symbol: "A".to_string(),
+            screening_score_q32: score,
+            route_capacity_usd_e8: 1_000_000_000,
+            cycle_key: format!("cycle-{pool_byte}"),
+            path: smallvec![
+                CandidateHop {
+                    from: addr(1),
+                    to: addr(2),
+                    pool_id: addr(pool_byte),
+                    amm_kind: AmmKind::UniswapV2Like,
+                    dex_name: "dex".to_string(),
+                },
+                CandidateHop {
+                    from: addr(2),
+                    to: addr(1),
+                    pool_id: addr(pool_byte + 10),
+                    amm_kind: AmmKind::UniswapV2Like,
+                    dex_name: "dex".to_string(),
+                },
+            ],
+        };
+        let mut candidates = vec![candidate(-3, 3), candidate(-2, 2), candidate(-1, 1)];
+
+        let selected = finalize_candidates_with_tuning(&mut candidates, 8, 2, 2, false);
+
+        assert_eq!(selected.len(), 2);
+        assert_eq!(selected[0].cycle_key, "cycle-3");
+        assert_eq!(selected[1].cycle_key, "cycle-2");
     }
 
     #[test]
