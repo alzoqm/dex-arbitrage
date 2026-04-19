@@ -675,7 +675,7 @@ VERIFY_V3_EARLY_PROBE_POINTS=1
 SEARCH_MAX_CANDIDATES_PER_REFRESH=32
 SEARCH_CANDIDATE_SELECTION_BUFFER_MULTIPLIER=4
 SEARCH_DEDUP_TOKEN_PATHS=true
-INITIAL_REFRESH_MAX_EDGES=4096
+INITIAL_REFRESH_MAX_EDGES=0
 BOOTSTRAP_REPLAY_CACHED_POOL_STATES=true
 BOOTSTRAP_REPLAY_MAX_BLOCKS=900
 EVENT_INGEST_MODE=wss
@@ -782,10 +782,11 @@ SEARCH_DEDUP_TOKEN_PATHS:
 
 INITIAL_REFRESH_MAX_EDGES:
   bootstrap 직후 첫 detect 단계에서 한 번에 평가할 edge 수 상한이다.
-  discovery 범위를 줄이는 설정이 아니라, 이미 구성된 전체 Base 그래프에서
-  플래시론/앵커 도달성, USD 기준 유동성, 풀 신뢰도가 높은 대표 pair부터
-  초기 후보 탐색에 넣어 첫 구동 지연을 제한한다.
-  기본 4096으로 두고, 0이면 전체 edge를 평가한다.
+  0이면 전체 edge를 평가한다.
+  2026-04-19 Base smoke에서 전체 초기 edge 80783개 기준 detect_ms=182, refresh_total_ms=86이었으므로
+  수익 후보 보존을 위해 pre-live 기본값은 0으로 둔다.
+  값을 양수로 두면 이미 구성된 전체 Base 그래프에서 플래시론/앵커 도달성, USD 기준 유동성,
+  풀 신뢰도가 높은 대표 pair부터 초기 후보 탐색에 넣어 첫 구동 지연을 제한한다.
 
 EVENT_INGEST_MODE / EVENT_WSS_* / EVENT_RECEIPT_*:
   WSS 구독 자체는 address_logs로 둔다.
@@ -1098,6 +1099,23 @@ forge build: 통과, lint note/warning만 존재
     selected_edges=4096, candidate_count=32, detect_ms=154
     refresh_total_ms=1745, avg_candidate_ms=54, max_candidate_ms=339
     no_route=32, simulated=0, submitted=0
+  V3 early probe 비교:
+    log: state/base-v3-probe3-smoke-20260419-172015.log
+    VERIFY_V3_EARLY_PROBE_POINTS=3, refresh_total_ms=4532, simulated=0, submitted=0
+    log: state/base-v3-probe5-smoke-20260419-172037.log
+    VERIFY_V3_EARLY_PROBE_POINTS=5, refresh_total_ms=7323, simulated=0, submitted=0
+    추가 probe는 실행 가능 후보를 찾지 못하고 지연만 늘렸으므로 기본값 1을 유지한다.
+  후보 64 비교:
+    log: state/base-c64-token-dedup-smoke-20260419-172115.log
+    SEARCH_MAX_CANDIDATES_PER_REFRESH=64, candidate_count=64, refresh_total_ms=3810
+    no_route=64, simulated=0, submitted=0
+    후보 64도 실행 가능 후보를 찾지 못했고, 지연만 늘어 기본값 32를 유지한다.
+  전체 초기 edge 비교:
+    log: state/base-full-initial-edges-smoke-20260419-172148.log
+    INITIAL_REFRESH_MAX_EDGES=0
+    selected_edges=80783, total_edges=91256, candidate_count=32, detect_ms=182
+    refresh_total_ms=86, no_route=32, simulated=0, submitted=0
+    전체 초기 edge 평가 비용이 작았으므로 초기 검증 범위 축소를 제거하고 기본값을 0으로 변경했다.
   결론:
     Base 전체 venue/symbol/pool discovery 범위는 유지했다.
     후보 처리 지연은 warm 기준 1.745초로 Base block cadence에 근접했다.

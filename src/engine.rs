@@ -1118,7 +1118,7 @@ fn initial_refresh_max_edges() -> Option<usize> {
     {
         Some(0) => None,
         Some(value) => Some(value),
-        None => Some(4096),
+        None => None,
     }
 }
 
