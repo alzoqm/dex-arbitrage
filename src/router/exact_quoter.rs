@@ -129,6 +129,7 @@ impl ExactQuoter {
                 }
                 if self.use_v3_rpc_quoter {
                     if let Some(quoter) = pool.quoter {
+                        let zero_for_one = i == 0 && j == 1;
                         if is_slipstream_pool(pool) {
                             match self
                                 .quote_slipstream_v3(
@@ -137,6 +138,8 @@ impl ExactQuoter {
                                     token_out,
                                     amount_in,
                                     state.tick_spacing,
+                                    state.sqrt_price_x96,
+                                    zero_for_one,
                                 )
                                 .await
                             {
@@ -146,7 +149,15 @@ impl ExactQuoter {
                             }
                         } else {
                             match self
-                                .quote_uniswap_v3(quoter, token_in, token_out, amount_in, state.fee)
+                                .quote_uniswap_v3(
+                                    quoter,
+                                    token_in,
+                                    token_out,
+                                    amount_in,
+                                    state.fee,
+                                    state.sqrt_price_x96,
+                                    zero_for_one,
+                                )
                                 .await
                             {
                                 Ok(amount) => amount,
@@ -259,6 +270,8 @@ impl ExactQuoter {
         token_out: alloy::primitives::Address,
         amount_in: u128,
         fee: u32,
+        sqrt_price_x96: U256,
+        zero_for_one: bool,
     ) -> Result<u128> {
         let raw = self
             .rpc
@@ -272,7 +285,7 @@ impl ExactQuoter {
                         tokenOut: token_out,
                         amountIn: U256::saturating_from(amount_in),
                         fee: Uint::<24, 1>::saturating_from(fee),
-                        sqrtPriceLimitX96: U160::ZERO,
+                        sqrtPriceLimitX96: v3_sqrt_price_limit_u160(sqrt_price_x96, zero_for_one),
                     },
                 }
                 .abi_encode()
@@ -291,6 +304,8 @@ impl ExactQuoter {
         token_out: alloy::primitives::Address,
         amount_in: u128,
         tick_spacing: i32,
+        sqrt_price_x96: U256,
+        zero_for_one: bool,
     ) -> Result<u128> {
         let Ok(tick_spacing) = I24::try_from(tick_spacing) else {
             return Ok(0);
@@ -307,7 +322,7 @@ impl ExactQuoter {
                         tokenOut: token_out,
                         amountIn: U256::saturating_from(amount_in),
                         tickSpacing: tick_spacing,
-                        sqrtPriceLimitX96: U160::ZERO,
+                        sqrtPriceLimitX96: v3_sqrt_price_limit_u160(sqrt_price_x96, zero_for_one),
                     },
                 }
                 .abi_encode()
@@ -402,6 +417,32 @@ fn u256_to_u128(value: alloy::primitives::U256) -> u128 {
     value.to_string().parse::<u128>().unwrap_or(u128::MAX)
 }
 
+fn v3_sqrt_price_limit_u160(current: U256, zero_for_one: bool) -> U160 {
+    let bps = std::env::var("V3_SQRT_PRICE_LIMIT_BPS")
+        .ok()
+        .and_then(|value| value.parse::<u128>().ok())
+        .filter(|value| *value < 10_000)
+        .unwrap_or(50);
+    if bps == 0 || current.is_zero() {
+        return U160::ZERO;
+    }
+    let denominator = U256::from(10_000u128);
+    let numerator = if zero_for_one {
+        U256::from(10_000u128.saturating_sub(bps))
+    } else {
+        U256::from(10_000u128.saturating_add(bps))
+    };
+    u160_saturating_from_u256(current.saturating_mul(numerator) / denominator)
+}
+
+fn u160_saturating_from_u256(value: U256) -> U160 {
+    let bytes = value.to_be_bytes::<32>();
+    if bytes[..12].iter().any(|byte| *byte != 0) {
+        return U160::from_be_slice(&[0xff; 20]);
+    }
+    U160::from_be_slice(&bytes[12..])
+}
+
 fn is_slipstream_pool(pool: &PoolState) -> bool {
     pool.dex_name.starts_with("aerodrome_v3")
 }
@@ -418,9 +459,9 @@ fn is_expected_quote_revert(err: &anyhow::Error) -> bool {
 mod tests {
     use std::collections::HashMap;
 
-    use alloy::primitives::Address;
+    use alloy::primitives::{Address, U160, U256};
 
-    use super::{QuoteCache, QuoteKey};
+    use super::{v3_sqrt_price_limit_u160, QuoteCache, QuoteKey};
 
     fn key(snapshot_id: u64, amount_in: u128) -> QuoteKey {
         QuoteKey {
@@ -470,5 +511,19 @@ mod tests {
         assert_eq!(cache.get(&key(2, 1)), Some(20));
         assert_eq!(cache.get(&key(2, 2)), Some(30));
         assert_eq!(cache.segments.len(), 2);
+    }
+
+    #[test]
+    fn v3_quoter_price_limit_matches_execution_default_bps() {
+        let current = U256::from(1_000_000u64);
+
+        assert_eq!(
+            v3_sqrt_price_limit_u160(current, true),
+            U160::from(995_000u64)
+        );
+        assert_eq!(
+            v3_sqrt_price_limit_u160(current, false),
+            U160::from(1_005_000u64)
+        );
     }
 }

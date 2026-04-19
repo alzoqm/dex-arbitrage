@@ -1110,12 +1110,32 @@ forge build: 통과, lint note/warning만 존재
     SEARCH_MAX_CANDIDATES_PER_REFRESH=64, candidate_count=64, refresh_total_ms=3810
     no_route=64, simulated=0, submitted=0
     후보 64도 실행 가능 후보를 찾지 못했고, 지연만 늘어 기본값 32를 유지한다.
+  후보 256 비교:
+    log: state/base-c256-full-initial-smoke-20260419-172437.log
+    SEARCH_MAX_CANDIDATES_PER_REFRESH=256, INITIAL_REFRESH_MAX_EDGES=0
+    selected_edges=80783, candidate_count=256, detect_ms=41772, refresh_total_ms=11537
+    no_route=256, simulated=0, submitted=0
+    후보 256은 detector 시간이 41.7초까지 늘었고 실행 가능 후보도 없었으므로 실매매 기본값으로 부적합하다.
   전체 초기 edge 비교:
     log: state/base-full-initial-edges-smoke-20260419-172148.log
     INITIAL_REFRESH_MAX_EDGES=0
     selected_edges=80783, total_edges=91256, candidate_count=32, detect_ms=182
     refresh_total_ms=86, no_route=32, simulated=0, submitted=0
     전체 초기 edge 평가 비용이 작았으므로 초기 검증 범위 축소를 제거하고 기본값을 0으로 변경했다.
+  V3 exact quoter price limit 정렬:
+    문제:
+      기존 V3 RPC quoter 검증은 sqrtPriceLimitX96=0으로 quote했지만,
+      실제 calldata는 V3_SQRT_PRICE_LIMIT_BPS 기준 sqrtPriceLimitX96를 넣었다.
+      따라서 검증은 통과했지만 실제 실행에서는 price limit 때문에 실패하는 후보가 생길 수 있었다.
+    수정:
+      Uniswap V3와 Aerodrome Slipstream RPC quoter 검증도 실행 calldata와 같은 price limit을 사용하도록 맞췄다.
+    검증:
+      cargo test router::exact_quoter::tests::v3_quoter_price_limit_matches_execution_default_bps: 통과
+      cargo test --lib: 통과, 58 tests
+      cargo build --release: 통과
+      log: state/base-default-after-v3-limit-smoke-20260419-172759.log
+      selected_edges=80783, candidate_count=32, detect_ms=183, refresh_total_ms=95
+      no_route=32, simulated=0, submitted=0
   결론:
     Base 전체 venue/symbol/pool discovery 범위는 유지했다.
     후보 처리 지연은 warm 기준 1.745초로 Base block cadence에 근접했다.
