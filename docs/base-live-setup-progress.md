@@ -1136,6 +1136,23 @@ forge build: 통과, lint note/warning만 존재
       log: state/base-default-after-v3-limit-smoke-20260419-172759.log
       selected_edges=80783, candidate_count=32, detect_ms=183, refresh_total_ms=95
       no_route=32, simulated=0, submitted=0
+  기본 설정 3분 연속 simulate-only 관찰:
+    log: state/base-default-steady-after-v3-limit-20260419-172908.log
+    refresh_samples=31
+    avg_refresh_ms=2088
+    min_refresh_ms=115
+    max_refresh_ms=3253
+    avg_candidate_count=32.0
+    no_route_total=992
+    simulated_total=0
+    submitted_total=0
+    route_profitable_plans_total=307
+    rpc_summaries=5
+    summarized_requests=1144
+    summarized_cu=29340
+    해석:
+      기본 설정은 연속 루프에서 대체로 2-3초 refresh 범위에 머문다.
+      관찰 구간에서는 fallback 단계의 양수 후보가 있었지만 exact quote, 수수료, 실행 가능성 검증 후 제출 가능한 후보는 없었다.
   결론:
     Base 전체 venue/symbol/pool discovery 범위는 유지했다.
     후보 처리 지연은 warm 기준 1.745초로 Base block cadence에 근접했다.
