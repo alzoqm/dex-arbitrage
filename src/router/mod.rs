@@ -96,6 +96,7 @@ pub struct Router {
     verify_v3_refinement_points: usize,
     verify_v3_early_exit: bool,
     verify_v3_early_reoptimize: bool,
+    verify_v3_final_reoptimize: bool,
     verify_v3_early_probe_points: usize,
 }
 
@@ -114,9 +115,10 @@ impl Router {
         };
         let quantity_searcher = QuantitySearcher::new(settings.clone());
         let fast_sizer = FastSizer::new();
-        let verify_v3_refinement_points = env_usize("VERIFY_V3_REFINEMENT_POINTS", 5);
+        let verify_v3_refinement_points = env_usize("VERIFY_V3_REFINEMENT_POINTS", 3);
         let verify_v3_early_exit = env_bool("VERIFY_V3_EARLY_EXIT", true);
-        let verify_v3_early_reoptimize = env_bool("VERIFY_V3_EARLY_REOPTIMIZE", true);
+        let verify_v3_early_reoptimize = env_bool("VERIFY_V3_EARLY_REOPTIMIZE", false);
+        let verify_v3_final_reoptimize = env_bool("VERIFY_V3_FINAL_REOPTIMIZE", false);
         let verify_v3_early_probe_points = env_usize("VERIFY_V3_EARLY_PROBE_POINTS", 1);
         let flash = FlashLoanEngine::new(settings, rpc);
         Self {
@@ -128,6 +130,7 @@ impl Router {
             verify_v3_refinement_points,
             verify_v3_early_exit,
             verify_v3_early_reoptimize,
+            verify_v3_final_reoptimize,
             verify_v3_early_probe_points,
         }
     }
@@ -609,8 +612,8 @@ impl Router {
             max_amount,
             self.verify_v3_refinement_points,
         ) {
-            if let Some(verified) = self
-                .quote_candidate_with_optimizer(
+            let verified = if self.verify_v3_final_reoptimize {
+                self.quote_candidate_with_optimizer(
                     split_optimizer,
                     snapshot,
                     candidate,
@@ -619,7 +622,19 @@ impl Router {
                     stats,
                 )
                 .await?
-            {
+            } else {
+                self.quote_existing_plan_splits(
+                    split_optimizer,
+                    snapshot,
+                    candidate,
+                    &plan,
+                    amount,
+                    premium_ppm,
+                    stats,
+                )
+                .await?
+            };
+            if let Some(verified) = verified {
                 best = better_plan(best, verified);
             }
         }
@@ -709,7 +724,7 @@ impl Router {
                     return Ok(None);
                 }
                 split.expected_amount_out = amount_out;
-                split.min_amount_out = ((amount_out as f64) * 0.995) as u128;
+                split.min_amount_out = min_amount_out(amount_out);
                 total_out = total_out.saturating_add(amount_out);
             }
             if splits.is_empty() || total_out == 0 {
@@ -832,6 +847,10 @@ fn estimated_full_flash_fee_raw(
 
 fn u128_to_i128_saturating(value: u128) -> i128 {
     i128::try_from(value).unwrap_or(i128::MAX)
+}
+
+fn min_amount_out(expected: u128) -> u128 {
+    expected.saturating_mul(env_usize("SPLIT_MIN_OUTPUT_BPS", 9_950) as u128) / 10_000
 }
 
 fn better_plan(current: Option<ExactPlan>, next: ExactPlan) -> Option<ExactPlan> {

@@ -276,6 +276,12 @@ impl Validator {
         );
 
         if !simulation_ok {
+            if env_bool("LOG_FAILED_PLAN_DETAILS", false) {
+                warn!(
+                    plan = ?plan,
+                    "simulation failed plan details"
+                );
+            }
             warn!(
                 input_token = %plan.input_token,
                 input_amount = plan.input_amount,

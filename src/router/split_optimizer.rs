@@ -1,6 +1,7 @@
 use std::{cmp::Ordering, sync::Arc};
 
 use anyhow::Result;
+use futures::{stream, StreamExt};
 
 use crate::{
     graph::GraphSnapshot,
@@ -16,6 +17,8 @@ pub struct SplitOptimizer {
     exact_quoter: ExactQuoter,
     max_parallel_pools: usize,
     pair_edge_scan_limit: usize,
+    pair_quote_concurrency: usize,
+    split_min_output_bps: u128,
 }
 
 impl SplitOptimizer {
@@ -38,6 +41,8 @@ impl SplitOptimizer {
                     .clamp(max_parallel_pools, 32),
             )
             .max(max_parallel_pools),
+            pair_quote_concurrency: env_usize("ROUTE_PAIR_QUOTE_CONCURRENCY", 1).clamp(1, 32),
+            split_min_output_bps: env_usize("SPLIT_MIN_OUTPUT_BPS", 9_950).clamp(1, 10_000) as u128,
         }
     }
 
@@ -91,33 +96,43 @@ impl SplitOptimizer {
 
         while assigned < total_in {
             let slice = (total_in - assigned).min(min_slice);
-            let mut ranked = Vec::new();
-            for (idx, edge_ref) in edge_refs.iter().enumerate() {
+            let mut quote_jobs = Vec::new();
+            for (idx, edge_ref) in edge_refs.iter().copied().enumerate() {
                 if allocations[idx] == 0 && active_allocations >= self.max_parallel_pools {
                     continue;
                 }
-                let edge = match snapshot.edge(*edge_ref) {
+                let edge = match snapshot.edge(edge_ref) {
                     Some(edge) => edge,
                     None => continue,
                 };
+                let quote_amount = allocations[idx].saturating_add(slice);
                 if edge.liquidity.safe_capacity_in > 0
-                    && allocations[idx].saturating_add(slice) > edge.liquidity.safe_capacity_in
+                    && quote_amount > edge.liquidity.safe_capacity_in
                 {
                     continue;
                 }
-                let Some(pool) = snapshot.pool(edge.pool_id) else {
-                    continue;
-                };
-                let total_quote = self
-                    .exact_quoter
-                    .quote_pool(
-                        snapshot,
-                        pool,
-                        token_in,
-                        token_out,
-                        allocations[idx].saturating_add(slice),
-                    )
-                    .await?;
+                quote_jobs.push((idx, edge.pool_id, quote_amount));
+            }
+
+            let exact_quoter = self.exact_quoter.clone();
+            let mut quote_stream = stream::iter(quote_jobs)
+                .map(|(idx, pool_id, quote_amount)| {
+                    let exact_quoter = exact_quoter.clone();
+                    async move {
+                        let Some(pool) = snapshot.pool(pool_id) else {
+                            return Ok((idx, 0u128));
+                        };
+                        let total_quote = exact_quoter
+                            .quote_pool(snapshot, pool, token_in, token_out, quote_amount)
+                            .await?;
+                        Ok::<_, anyhow::Error>((idx, total_quote))
+                    }
+                })
+                .buffer_unordered(self.pair_quote_concurrency);
+
+            let mut ranked = Vec::new();
+            while let Some(quoted) = quote_stream.next().await {
+                let (idx, total_quote) = quoted?;
                 let marginal = total_quote.saturating_sub(quoted_outputs[idx]);
                 ranked.push((idx, marginal, total_quote));
             }
@@ -155,7 +170,7 @@ impl SplitOptimizer {
         token_out: alloy::primitives::Address,
         total_in: u128,
     ) -> Result<(Vec<SplitPlan>, u128)> {
-        let mut best = None::<(crate::types::EdgeRef, u128)>;
+        let mut quote_jobs = Vec::new();
         for edge_ref in edge_refs {
             let edge = match snapshot.edge(edge_ref) {
                 Some(edge) => edge,
@@ -164,13 +179,28 @@ impl SplitOptimizer {
             if edge.liquidity.safe_capacity_in > 0 && total_in > edge.liquidity.safe_capacity_in {
                 continue;
             }
-            let Some(pool) = snapshot.pool(edge.pool_id) else {
-                continue;
-            };
-            let quote = self
-                .exact_quoter
-                .quote_pool(snapshot, pool, token_in, token_out, total_in)
-                .await?;
+            quote_jobs.push((edge_ref, edge.pool_id));
+        }
+
+        let exact_quoter = self.exact_quoter.clone();
+        let mut quote_stream = stream::iter(quote_jobs)
+            .map(|(edge_ref, pool_id)| {
+                let exact_quoter = exact_quoter.clone();
+                async move {
+                    let Some(pool) = snapshot.pool(pool_id) else {
+                        return Ok((edge_ref, 0u128));
+                    };
+                    let quote = exact_quoter
+                        .quote_pool(snapshot, pool, token_in, token_out, total_in)
+                        .await?;
+                    Ok::<_, anyhow::Error>((edge_ref, quote))
+                }
+            })
+            .buffer_unordered(self.pair_quote_concurrency);
+
+        let mut best = None::<(crate::types::EdgeRef, u128)>;
+        while let Some(quoted) = quote_stream.next().await {
+            let (edge_ref, quote) = quoted?;
             if quote > 0 && best.as_ref().map(|(_, out)| quote > *out).unwrap_or(true) {
                 best = Some((edge_ref, quote));
             }
@@ -247,7 +277,7 @@ impl SplitOptimizer {
             if expected == 0 {
                 continue;
             }
-            let min_amount_out = ((expected as f64) * 0.995) as u128;
+            let min_amount_out = expected.saturating_mul(self.split_min_output_bps) / 10_000;
             let extra = match &pool.state {
                 crate::types::PoolSpecificState::UniswapV2Like(state) => SplitExtra::V2 {
                     fee_ppm: state.fee_ppm,

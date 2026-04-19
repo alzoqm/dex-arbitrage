@@ -1,6 +1,7 @@
 use std::{
     collections::{HashMap, VecDeque},
     sync::Arc,
+    time::Duration,
 };
 
 use alloy::{
@@ -9,6 +10,7 @@ use alloy::{
 };
 use anyhow::Result;
 use parking_lot::Mutex;
+use tokio::time::timeout;
 
 use crate::{
     abi::{IAerodromeCLQuoter, IBalancerVault, ICurvePool, IV3QuoterV2},
@@ -30,6 +32,7 @@ pub struct ExactQuoter {
     use_v3_rpc_quoter: bool,
     use_curve_rpc_quoter: bool,
     use_balancer_rpc_quoter: bool,
+    quote_rpc_timeout: Duration,
     chain_label: String,
 }
 
@@ -78,6 +81,9 @@ impl ExactQuoter {
             use_balancer_rpc_quoter: std::env::var("USE_BALANCER_RPC_QUOTER")
                 .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
                 .unwrap_or(true),
+            quote_rpc_timeout: Duration::from_millis(
+                env_usize("EXACT_QUOTE_TIMEOUT_MS", 1_000) as u64
+            ),
             chain_label: settings.chain.as_str().to_string(),
         }
     }
@@ -213,11 +219,8 @@ impl ExactQuoter {
                     .unwrap_or(state.supports_underlying);
                 let amount = if try_underlying {
                     let raw = self
-                        .rpc
-                        .best_read()
-                        .eth_call(
+                        .eth_call_with_timeout(
                             pool.pool_id,
-                            None,
                             ICurvePool::get_dy_underlyingCall {
                                 i: i as i128,
                                 j: j as i128,
@@ -225,24 +228,21 @@ impl ExactQuoter {
                             }
                             .abi_encode()
                             .into(),
-                            "latest",
                         )
                         .await;
                     match raw {
-                        Ok(raw) => {
+                        Ok(Some(raw)) => {
                             let ret = ICurvePool::get_dy_underlyingCall::abi_decode_returns(&raw)?;
                             u256_to_u128(ret)
                         }
+                        Ok(None) => 0,
                         Err(_) => {
                             self.curve_underlying_support
                                 .lock()
                                 .insert(pool.pool_id, false);
-                            let raw = self
-                                .rpc
-                                .best_read()
-                                .eth_call(
+                            let Some(raw) = self
+                                .eth_call_with_timeout(
                                     pool.pool_id,
-                                    None,
                                     ICurvePool::get_dyCall {
                                         i: i as i128,
                                         j: j as i128,
@@ -250,20 +250,19 @@ impl ExactQuoter {
                                     }
                                     .abi_encode()
                                     .into(),
-                                    "latest",
                                 )
-                                .await?;
+                                .await?
+                            else {
+                                return Ok(0);
+                            };
                             let ret = ICurvePool::get_dyCall::abi_decode_returns(&raw)?;
                             u256_to_u128(ret)
                         }
                     }
                 } else {
-                    let raw = self
-                        .rpc
-                        .best_read()
-                        .eth_call(
+                    let Some(raw) = self
+                        .eth_call_with_timeout(
                             pool.pool_id,
-                            None,
                             ICurvePool::get_dyCall {
                                 i: i as i128,
                                 j: j as i128,
@@ -271,9 +270,11 @@ impl ExactQuoter {
                             }
                             .abi_encode()
                             .into(),
-                            "latest",
                         )
-                        .await?;
+                        .await?
+                    else {
+                        return Ok(0);
+                    };
                     let ret = ICurvePool::get_dyCall::abi_decode_returns(&raw)?;
                     u256_to_u128(ret)
                 };
@@ -319,12 +320,9 @@ impl ExactQuoter {
         sqrt_price_x96: U256,
         zero_for_one: bool,
     ) -> Result<u128> {
-        let raw = self
-            .rpc
-            .best_read()
-            .eth_call(
+        let Some(raw) = self
+            .eth_call_with_timeout(
                 quoter,
-                None,
                 IV3QuoterV2::quoteExactInputSingleCall {
                     params: IV3QuoterV2::QuoteExactInputSingleParams {
                         tokenIn: token_in,
@@ -336,9 +334,11 @@ impl ExactQuoter {
                 }
                 .abi_encode()
                 .into(),
-                "latest",
             )
-            .await?;
+            .await?
+        else {
+            return Ok(0);
+        };
         let ret = IV3QuoterV2::quoteExactInputSingleCall::abi_decode_returns(&raw)?;
         Ok(u256_to_u128(ret.amountOut))
     }
@@ -356,12 +356,9 @@ impl ExactQuoter {
         let Ok(tick_spacing) = I24::try_from(tick_spacing) else {
             return Ok(0);
         };
-        let raw = self
-            .rpc
-            .best_read()
-            .eth_call(
+        let Some(raw) = self
+            .eth_call_with_timeout(
                 quoter,
-                None,
                 IAerodromeCLQuoter::quoteExactInputSingleCall {
                     params: IAerodromeCLQuoter::QuoteExactInputSingleParams {
                         tokenIn: token_in,
@@ -373,9 +370,11 @@ impl ExactQuoter {
                 }
                 .abi_encode()
                 .into(),
-                "latest",
             )
-            .await?;
+            .await?
+        else {
+            return Ok(0);
+        };
         let ret = IAerodromeCLQuoter::quoteExactInputSingleCall::abi_decode_returns(&raw)?;
         Ok(u256_to_u128(ret.amountOut))
     }
@@ -388,12 +387,9 @@ impl ExactQuoter {
         token_out: Address,
         amount_in: u128,
     ) -> Result<u128> {
-        let raw = self
-            .rpc
-            .best_read()
-            .eth_call(
+        let Some(raw) = self
+            .eth_call_with_timeout(
                 vault,
-                None,
                 IBalancerVault::queryBatchSwapCall {
                     kind: 0,
                     swaps: vec![IBalancerVault::BatchSwapStep {
@@ -413,14 +409,28 @@ impl ExactQuoter {
                 }
                 .abi_encode()
                 .into(),
-                "latest",
             )
-            .await?;
+            .await?
+        else {
+            return Ok(0);
+        };
         let ret = IBalancerVault::queryBatchSwapCall::abi_decode_returns(&raw)?;
         let Some(delta_out) = ret.get(1) else {
             return Ok(0);
         };
         Ok(negative_signed_abs_to_u128(delta_out))
+    }
+
+    async fn eth_call_with_timeout(&self, to: Address, data: Bytes) -> Result<Option<Bytes>> {
+        match timeout(
+            self.quote_rpc_timeout,
+            self.rpc.best_read().eth_call(to, None, data, "latest"),
+        )
+        .await
+        {
+            Ok(raw) => raw.map(Some),
+            Err(_) => Ok(None),
+        }
     }
 
     fn insert_quote(&self, key: QuoteKey, value: u128) {

@@ -8,7 +8,7 @@ pub fn sqrt_price_limit_x96(current: U256, zero_for_one: bool) -> U256 {
         .ok()
         .and_then(|value| value.parse::<u128>().ok())
         .filter(|value| *value < 10_000)
-        .unwrap_or(50);
+        .unwrap_or(200);
     if bps == 0 || current.is_zero() {
         return if zero_for_one {
             U256::from(MIN_SQRT_RATIO_PLUS_ONE)
@@ -66,11 +66,11 @@ mod tests {
         );
         assert_eq!(
             sqrt_price_limit_u160(U256::from(1_000_000_000_000u64), true),
-            U160::from(995_000_000_000u64)
+            U160::from(980_000_000_000u64)
         );
         assert_eq!(
             sqrt_price_limit_u160(current, false),
-            U160::from(1_005_000u64)
+            U160::from(1_020_000u64)
         );
     }
 

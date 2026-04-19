@@ -238,7 +238,7 @@ contract ArbitrageExecutor is IFlashLoanSimpleReceiver, IUniswapV3SwapCallback {
             Hop memory hop = params.hops[i];
             require(hop.splits.length > 0, "EMPTY_HOP");
 
-            uint256 hopInputSum = 0;
+            uint256 configuredInputSum = 0;
             uint256 hopOutputSum = 0;
             address nextToken = hop.splits[0].tokenOut;
 
@@ -246,14 +246,37 @@ contract ArbitrageExecutor is IFlashLoanSimpleReceiver, IUniswapV3SwapCallback {
                 Split memory split = hop.splits[j];
                 require(split.tokenIn == currentToken, "HOP_TOKEN_IN_MISMATCH");
                 require(split.tokenOut == nextToken, "HOP_TOKEN_OUT_MISMATCH");
-                hopInputSum += split.amountIn;
+                configuredInputSum += split.amountIn;
+            }
+            require(configuredInputSum > 0, "ZERO_HOP_INPUT");
+
+            uint256 remainingInput = expectedAvailable;
+            for (uint256 j = 0; j < hop.splits.length; ++j) {
+                Split memory split = hop.splits[j];
+                uint256 originalAmountIn = split.amountIn;
+
+                if (configuredInputSum != expectedAvailable) {
+                    if (j + 1 == hop.splits.length) {
+                        split.amountIn = remainingInput;
+                    } else {
+                        split.amountIn = originalAmountIn * expectedAvailable / configuredInputSum;
+                        remainingInput -= split.amountIn;
+                    }
+                    split.minAmountOut = originalAmountIn == 0 ? 0 : split.minAmountOut * split.amountIn / originalAmountIn;
+                } else {
+                    remainingInput -= split.amountIn;
+                }
+
+                if (split.amountIn == 0) {
+                    continue;
+                }
 
                 uint256 amountOut = _executeSplit(params.snapshotId, split);
                 require(amountOut >= split.minAmountOut, "SPLIT_SLIPPAGE");
                 hopOutputSum += amountOut;
             }
 
-            require(hopInputSum == expectedAvailable, "HOP_INPUT_SUM_MISMATCH");
+            require(hopOutputSum > 0, "ZERO_HOP_OUTPUT");
             currentToken = nextToken;
             expectedAvailable = hopOutputSum;
         }
