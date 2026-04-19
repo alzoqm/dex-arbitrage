@@ -281,12 +281,14 @@ async fn process_refresh(
 
     let refresh_started = Instant::now();
     let mut profitability = ProfitabilityRefreshStats::new(candidates.len());
+    let no_route_sample_limit = env_usize("NO_ROUTE_SAMPLE_LOG_LIMIT", 0);
+    let mut no_route_samples = 0usize;
 
     for candidate in candidates {
         let result = process_candidate(
             settings.clone(),
             snapshot.as_ref(),
-            candidate,
+            candidate.clone(),
             router,
             validator,
             submitter,
@@ -296,6 +298,41 @@ async fn process_refresh(
             simulate_only,
         )
         .await?;
+        if matches!(result.verdict, CandidateVerdict::NoRoute)
+            && no_route_samples < no_route_sample_limit
+        {
+            no_route_samples += 1;
+            info!(
+                snapshot_id = snapshot.snapshot_id,
+                sample_index = no_route_samples,
+                cycle_key = %candidate.cycle_key,
+                anchor_symbol = %candidate.start_symbol,
+                screening_score_q32 = candidate.screening_score_q32,
+                route = %format_candidate_route(&candidate),
+                dex_route = %format_candidate_dex_route(&candidate),
+                path_len = candidate.path.len(),
+                router_ms = result.router_ms,
+                candidate_total_ms = result.total_ms,
+                route_amount_range_missing = result.route_stats.amount_range_missing,
+                route_evaluated_amounts = result.route_stats.evaluated_amounts,
+                route_no_output_quotes = result.route_stats.no_output_quotes,
+                route_no_output_hop0 = result.route_stats.no_output_hop0,
+                route_no_output_hop1 = result.route_stats.no_output_hop1,
+                route_no_output_hop2 = result.route_stats.no_output_hop2,
+                route_no_output_hop3_plus = result.route_stats.no_output_hop3_plus,
+                route_no_output_v2 = result.route_stats.no_output_v2,
+                route_no_output_aerodrome_v2 = result.route_stats.no_output_aerodrome_v2,
+                route_no_output_v3 = result.route_stats.no_output_v3,
+                route_no_output_curve = result.route_stats.no_output_curve,
+                route_no_output_balancer = result.route_stats.no_output_balancer,
+                route_gross_nonpositive = result.route_stats.gross_nonpositive,
+                route_flash_fee_nonpositive = result.route_stats.flash_fee_nonpositive,
+                route_profitable_plans = result.route_stats.profitable_plans,
+                min_amount = result.route_stats.min_amount,
+                max_amount = result.route_stats.max_amount,
+                "no-route candidate sample"
+            );
+        }
         profitability.record(&result);
         if let Some(result) = result.submission {
             info!(tx_hash = %result.tx_hash, channel = %result.channel, "submission accepted");
@@ -1083,6 +1120,13 @@ fn initial_refresh_max_edges() -> Option<usize> {
         Some(value) => Some(value),
         None => Some(4096),
     }
+}
+
+fn env_usize(key: &str, default: usize) -> usize {
+    std::env::var(key)
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(default)
 }
 
 #[derive(Debug, Clone)]

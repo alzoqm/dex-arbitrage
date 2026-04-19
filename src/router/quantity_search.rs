@@ -44,9 +44,14 @@ impl QuantitySearcher {
         let token_idx = snapshot.token_index(candidate.start_token)?;
         let token = &snapshot.tokens[token_idx];
         let decimals = token.decimals;
-        let max_position_raw = self
-            .calculate_max_position_raw(token)
-            .min(route_start_capacity_raw(snapshot, candidate).unwrap_or(u128::MAX));
+        let max_position_raw = self.calculate_max_position_raw(token).min(
+            route_start_capacity_raw(
+                snapshot,
+                candidate,
+                self.settings.search.max_split_parallel_pools,
+            )
+            .unwrap_or(u128::MAX),
+        );
         let min_trade_raw = usd_e8_to_amount(self.settings.risk.min_trade_usd_e8, token)
             .unwrap_or(10u128.pow(decimals as u32) / 100);
 
@@ -98,7 +103,11 @@ impl QuantitySearcher {
     }
 }
 
-fn route_start_capacity_raw(snapshot: &GraphSnapshot, candidate: &CandidatePath) -> Option<u128> {
+fn route_start_capacity_raw(
+    snapshot: &GraphSnapshot,
+    candidate: &CandidatePath,
+    max_parallel_pools: usize,
+) -> Option<u128> {
     if candidate.path.is_empty() {
         return None;
     }
@@ -106,17 +115,35 @@ fn route_start_capacity_raw(snapshot: &GraphSnapshot, candidate: &CandidatePath)
     let mut cumulative_rate = 1.0f64;
     let mut max_start = f64::INFINITY;
     for hop in &candidate.path {
-        let edge = snapshot
+        let mut pair_edges = snapshot
             .pair_edges(hop.from, hop.to)
             .into_iter()
             .filter_map(|edge_ref| snapshot.edge(edge_ref))
-            .find(|edge| edge.pool_id == hop.pool_id)?;
-        if edge.liquidity.safe_capacity_in == 0 || cumulative_rate <= 0.0 {
+            .collect::<Vec<_>>();
+        if pair_edges.is_empty() {
+            return None;
+        }
+        pair_edges.sort_by(|a, b| {
+            a.weight_log_q32
+                .cmp(&b.weight_log_q32)
+                .then_with(|| {
+                    b.liquidity
+                        .safe_capacity_in
+                        .cmp(&a.liquidity.safe_capacity_in)
+                })
+                .then_with(|| a.pool_id.cmp(&b.pool_id))
+        });
+
+        let edge_limit = max_parallel_pools.max(1);
+        let capacity_in = pair_edges.iter().take(edge_limit).fold(0u128, |acc, edge| {
+            acc.saturating_add(edge.liquidity.safe_capacity_in)
+        });
+        if capacity_in == 0 || cumulative_rate <= 0.0 {
             return Some(0);
         }
 
-        max_start = max_start.min(edge.liquidity.safe_capacity_in as f64 / cumulative_rate);
-        let rate = q128_to_f64(edge.spot_rate_q128);
+        max_start = max_start.min(capacity_in as f64 / cumulative_rate);
+        let rate = q128_to_f64(pair_edges[0].spot_rate_q128);
         if !rate.is_finite() || rate <= 0.0 {
             return Some(0);
         }

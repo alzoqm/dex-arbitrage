@@ -107,6 +107,7 @@ pub struct SearchSettings {
     pub path_beam_width: usize,
     pub max_candidates_per_refresh: usize,
     pub candidate_selection_buffer_multiplier: usize,
+    pub dedup_token_paths: bool,
     pub max_pair_edges_per_pair: usize,
     pub max_split_parallel_pools: usize,
 }
@@ -119,6 +120,7 @@ impl Default for SearchSettings {
             path_beam_width: 96,
             max_candidates_per_refresh: 512,
             candidate_selection_buffer_multiplier: 1,
+            dedup_token_paths: true,
             max_pair_edges_per_pair: 1,
             max_split_parallel_pools: 3,
         }
@@ -221,6 +223,7 @@ struct FileSearchConfig {
     path_beam_width: Option<usize>,
     max_candidates_per_refresh: Option<usize>,
     candidate_selection_buffer_multiplier: Option<usize>,
+    dedup_token_paths: Option<bool>,
     max_pair_edges_per_pair: Option<usize>,
     max_split_parallel_pools: Option<usize>,
 }
@@ -426,6 +429,10 @@ impl Settings {
                 "SEARCH_CANDIDATE_SELECTION_BUFFER_MULTIPLIER",
                 file_cfg.search.candidate_selection_buffer_multiplier,
                 1,
+            ),
+            dedup_token_paths: env_bool(
+                "SEARCH_DEDUP_TOKEN_PATHS",
+                file_cfg.search.dedup_token_paths.unwrap_or(true),
             ),
             max_pair_edges_per_pair: configured_usize(
                 "SEARCH_MAX_PAIR_EDGES_PER_PAIR",

@@ -541,7 +541,7 @@ Curve/Balancer 등 기타 pool fetch는 eth_call 실패 시 재시도
 추가된 환경값:
 
 ```env
-POOL_FETCH_MULTICALL_CHUNK_SIZE=150
+POOL_FETCH_MULTICALL_CHUNK_SIZE=300
 POOL_FETCH_MAX_RETRIES=5
 POOL_FETCH_RETRY_BASE_DELAY_MS=250
 ```
@@ -674,8 +674,10 @@ VERIFY_V3_EARLY_EXIT=true
 VERIFY_V3_EARLY_PROBE_POINTS=1
 SEARCH_MAX_CANDIDATES_PER_REFRESH=32
 SEARCH_CANDIDATE_SELECTION_BUFFER_MULTIPLIER=4
+SEARCH_DEDUP_TOKEN_PATHS=true
 INITIAL_REFRESH_MAX_EDGES=4096
 BOOTSTRAP_REPLAY_CACHED_POOL_STATES=true
+BOOTSTRAP_REPLAY_MAX_BLOCKS=900
 EVENT_INGEST_MODE=wss
 EVENT_WSS_FILTER_MODE=address_logs
 EVENT_WSS_RECONCILE_MODE=topic_logs
@@ -698,6 +700,7 @@ EVENT_RECEIPT_MAX_BLOCKS=64
 EVENT_RECEIPT_CONCURRENCY=8
 EVENT_RECEIPTS_FALLBACK_TO_TOPIC_LOGS=false
 RPC_USAGE_LOG_INTERVAL_SECS=30
+NO_ROUTE_SAMPLE_LOG_LIMIT=0
 BASE_L1_FEE_TX_SIZE_OVERHEAD_BYTES=160
 ```
 
@@ -771,6 +774,12 @@ SEARCH_CANDIDATE_SELECTION_BUFFER_MULTIPLIER:
   최대 128개 후보를 모은 뒤 screening score 상위 32개만 router/exact 검증으로 넘긴다.
   이는 expensive 검증 수는 유지하면서 반복 순서 때문에 더 좋은 후보가 밀리는 위험을 줄이기 위한 수익성 guard다.
 
+SEARCH_DEDUP_TOKEN_PATHS:
+  true면 같은 토큰 순환 경로는 pool ID만 다르더라도 한 후보로 합친다.
+  현재 router는 각 hop에서 해당 token pair의 여러 pool을 다시 최적화하고 split할 수 있으므로,
+  같은 token path 후보가 여러 슬롯을 차지하면 실질적으로 같은 경로를 반복 검증하는 비용이 커진다.
+  이 값은 DEX/pool discovery 범위를 줄이는 설정이 아니라, 후보 슬롯을 더 다양한 token path에 쓰기 위한 selection guard다.
+
 INITIAL_REFRESH_MAX_EDGES:
   bootstrap 직후 첫 detect 단계에서 한 번에 평가할 edge 수 상한이다.
   discovery 범위를 줄이는 설정이 아니라, 이미 구성된 전체 Base 그래프에서
@@ -787,6 +796,11 @@ EVENT_INGEST_MODE / EVENT_WSS_* / EVENT_RECEIPT_*:
   보정 1회당 eth_getLogs가 약 215회 발생했다.
   topic_logs 보정은 같은 블록 범위를 topic 기준 1회 조회한 뒤 로컬에서 watched pool만 필터링하므로,
   알파 보존을 유지하면서 RPC 호출 수를 크게 줄인다.
+
+NO_ROUTE_SAMPLE_LOG_LIMIT:
+  기본 0이면 no-route 후보별 상세 로그를 출력하지 않는다.
+  진단할 때만 5-10 정도로 켜면 상위 탈락 후보의 route, dex_route, no-output 위치, AMM 종류를 로그에 남긴다.
+  실매매 상시 실행에서는 로그 I/O 지연을 피하기 위해 0으로 둔다.
   2026-04-18 Base 검증에서 Alchemy는 eth_getBlockReceipts를 403 unsupported로 거부했다.
   그래서 pre-live 기본값은 WSS address filter + topic_logs reconcile이다.
   EVENT_WSS_FILTER_MODE=address_logs는 WSS 구독 자체에 watched pool 주소 필터를 싣는다.
@@ -811,6 +825,14 @@ BOOTSTRAP_REPLAY_CACHED_POOL_STATES:
   매번 4만 개 이상의 pool을 eth_call로 다시 읽지 않기 위한 설정이다.
   단, 이전 cache에 기준 블록이 없으면 안전하게 한 번은 full refresh가 필요하고,
   그 다음 저장된 cache부터 replay 방식이 적용된다.
+
+BOOTSTRAP_REPLAY_MAX_BLOCKS:
+  cached pool event replay를 허용할 최대 블록 gap이다.
+  기본 900블록은 Base 기준 대략 30분 수준이다.
+  gap이 이보다 크면 수만 블록의 `eth_getLogs`를 순차 replay하는 대신,
+  cached pool의 현재 상태를 batch refresh한다.
+  오래 꺼져 있다가 재시작할 때 RPC 비용과 시작 지연을 제한하기 위한 운영 guard다.
+  0으로 두면 gap 제한 없이 항상 replay를 시도한다.
 
 BASE_L1_FEE_TX_SIZE_OVERHEAD_BYTES:
   Base 트랜잭션 비용은 L2 실행비와 L1 데이터비로 나뉜다.
@@ -1046,4 +1068,41 @@ forge build: 통과, lint note/warning만 존재
     scripts/check_env.sh base live: 통과
   이유:
     Base 실매매 범위에 Aerodrome을 포함했으므로 env 검증도 같은 범위를 확인해야 한다.
+
+2026-04-19 token path dedup 및 warm smoke:
+  문제:
+    no-route sample에서 같은 token path가 pool ID만 바뀐 형태로 여러 candidate slot을 차지했다.
+    현재 router는 각 hop의 token pair에 대해 여러 pool을 다시 quote/split하므로,
+    같은 token path를 pool ID별 후보로 반복 검증하는 것은 대부분 중복 비용이었다.
+  수정:
+    SEARCH_DEDUP_TOKEN_PATHS=true를 추가했다.
+    detector는 pool-specific cycle_key 중복 제거를 유지하되, 기본적으로 token path 단위로 후보를 한 번 더 합친다.
+    quantity search의 route capacity도 특정 후보 pool 하나가 아니라 해당 token pair의 상위 split 대상 pool 용량 합을 기준으로 잡는다.
+    따라서 token path dedup이 최적 진입금액 상한을 불필요하게 낮추는 위험을 줄였다.
+  replay gap guard 검증:
+    log: state/base-no-route-samples-gapguard-c300-20260419-170209.log
+    replay_gap_blocks=26280, BOOTSTRAP_REPLAY_MAX_BLOCKS=900
+    replay_cached_pools=false로 전환되어 장시간 eth_getLogs replay 대신 direct state refresh가 실행됐다.
+    pool_count=45628, skipped_pools=3827, selected_edges=4096, candidate_count=32
+  token dedup cold-ish smoke:
+    log: state/base-token-dedup-smoke-20260419-171608.log
+    replay_gap_blocks=688, replay_cached_pools=true
+    candidate_count=32, detect_ms=150, refresh_total_ms=4876
+    no_route=32, simulated=0, submitted=0
+    route_evaluated_amounts=84, route_profitable_plans=21
+    route_no_output_v2=24, route_no_output_aerodrome_v2=3, route_no_output_v3=29
+  token dedup warm smoke:
+    log: state/base-token-dedup-warm-smoke-20260419-171732.log
+    replay_gap_blocks=40, stale_cached_to_refresh=0, stale_cached_to_replay=0
+    bootstrap complete pool_count=45628, token_count=42565
+    selected_edges=4096, candidate_count=32, detect_ms=154
+    refresh_total_ms=1745, avg_candidate_ms=54, max_candidate_ms=339
+    no_route=32, simulated=0, submitted=0
+  결론:
+    Base 전체 venue/symbol/pool discovery 범위는 유지했다.
+    후보 처리 지연은 warm 기준 1.745초로 Base block cadence에 근접했다.
+    현재 관찰 블록에서는 exact quote와 비용 계산 후 실행 가능한 양수 기대수익 후보가 없어서 제출은 없었다.
+    다음 개선 초점은 no-output의 실제 원인 분해다.
+    특히 V3 exact quote 탈락, V2/AerodromeV2 hop no-output, 낮은 용량으로 인한 amount range missing을 분리해서
+    후보 품질과 수익 후보 발견률을 더 개선해야 한다.
 ```

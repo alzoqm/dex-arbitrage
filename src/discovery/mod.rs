@@ -124,9 +124,23 @@ impl DiscoveryManager {
             };
         let fetch_unseen_pools = fetch_unseen_pools_on_bootstrap() || !pool_state_cache_loaded;
         let save_intermediate_checkpoints = fetch_unseen_pools || !pool_state_cache_loaded;
-        let replay_cached_pools = bootstrap_replay_cached_pool_states()
+        let requested_replay_cached_pools = bootstrap_replay_cached_pool_states()
             && pool_state_cache_loaded
             && cache_anchor_block.is_some();
+        let replay_gap_blocks = cache_anchor_block
+            .map(|anchor| latest_at_bootstrap.saturating_sub(anchor))
+            .unwrap_or(0);
+        let replay_max_blocks = bootstrap_replay_max_blocks();
+        let replay_cached_pools = requested_replay_cached_pools
+            && replay_max_blocks
+                .map(|max_blocks| replay_gap_blocks <= max_blocks)
+                .unwrap_or(true);
+        if requested_replay_cached_pools && !replay_cached_pools {
+            info!(
+                replay_gap_blocks,
+                replay_max_blocks, "cached pool replay gap too large; using direct state refresh"
+            );
+        }
         let cached_pool_count = cached_pools.len();
         let active_skipped_pool_count = skipped_pool_cache.len();
 
@@ -203,6 +217,8 @@ impl DiscoveryManager {
             stale_cached_to_refresh,
             stale_cached_to_replay,
             cache_anchor_block,
+            replay_gap_blocks,
+            replay_cached_pools,
             v2_to_fetch = v2_to_fetch.len(),
             aerodrome_v2_to_fetch = aerodrome_v2_to_fetch.len(),
             v3_to_fetch = v3_to_fetch.len(),
@@ -1428,6 +1444,17 @@ fn bootstrap_replay_cached_pool_states() -> bool {
     std::env::var("BOOTSTRAP_REPLAY_CACHED_POOL_STATES")
         .map(|value| !matches!(value.as_str(), "0" | "false" | "FALSE" | "no" | "NO"))
         .unwrap_or(true)
+}
+
+fn bootstrap_replay_max_blocks() -> Option<u64> {
+    match std::env::var("BOOTSTRAP_REPLAY_MAX_BLOCKS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+    {
+        Some(0) => None,
+        Some(value) => Some(value),
+        None => Some(900),
+    }
 }
 
 fn skipped_pool_cache_disabled() -> bool {

@@ -31,6 +31,7 @@ struct SearchTuning {
     path_beam_width: usize,
     max_candidates_per_refresh: usize,
     candidate_selection_buffer_multiplier: usize,
+    dedup_token_paths: bool,
     max_pair_edges_per_pair: usize,
 }
 
@@ -59,6 +60,7 @@ impl PathFinder {
                 candidate_selection_buffer_multiplier: search
                     .candidate_selection_buffer_multiplier
                     .max(1),
+                dedup_token_paths: search.dedup_token_paths,
                 max_pair_edges_per_pair: search.max_pair_edges_per_pair,
             },
         }
@@ -80,6 +82,7 @@ impl PathFinder {
         }
 
         let mut candidates = Vec::new();
+        let mut token_path_candidates = HashMap::<String, CandidatePath>::new();
         let mut dedup = HashSet::<String>::new();
         let mut top_path_cache = HashMap::<(usize, usize, usize), Vec<SearchPath>>::new();
         let mut outgoing_cache = HashMap::<usize, Vec<EdgeRef>>::new();
@@ -177,12 +180,33 @@ impl PathFinder {
                                 &edge_refs,
                                 changed_edge_ref,
                             ) {
-                                candidates.push(candidate);
-                                if candidates.len() >= selection_budget {
-                                    return finalize_candidates(
-                                        candidates,
-                                        self.tuning.max_candidates_per_refresh,
-                                    );
+                                if self.tuning.dedup_token_paths {
+                                    let token_key = candidate_token_cycle_key(&candidate);
+                                    match token_path_candidates.get_mut(&token_key) {
+                                        Some(existing)
+                                            if candidate_precedes(&candidate, existing) =>
+                                        {
+                                            *existing = candidate;
+                                        }
+                                        Some(_) => {}
+                                        None => {
+                                            token_path_candidates.insert(token_key, candidate);
+                                        }
+                                    }
+                                    if token_path_candidates.len() >= selection_budget {
+                                        return finalize_candidates(
+                                            token_path_candidates.into_values().collect(),
+                                            self.tuning.max_candidates_per_refresh,
+                                        );
+                                    }
+                                } else {
+                                    candidates.push(candidate);
+                                    if candidates.len() >= selection_budget {
+                                        return finalize_candidates(
+                                            candidates,
+                                            self.tuning.max_candidates_per_refresh,
+                                        );
+                                    }
                                 }
                             }
                         }
@@ -191,7 +215,14 @@ impl PathFinder {
             }
         }
 
-        finalize_candidates(candidates, self.tuning.max_candidates_per_refresh)
+        if self.tuning.dedup_token_paths {
+            finalize_candidates(
+                token_path_candidates.into_values().collect(),
+                self.tuning.max_candidates_per_refresh,
+            )
+        } else {
+            finalize_candidates(candidates, self.tuning.max_candidates_per_refresh)
+        }
     }
 
     fn find_top_paths_cached(
@@ -389,6 +420,21 @@ fn finalize_candidates(
     candidates.sort_by(|a, b| a.screening_score_q32.cmp(&b.screening_score_q32));
     candidates.truncate(max_candidates_per_refresh);
     candidates
+}
+
+fn candidate_token_cycle_key(candidate: &CandidatePath) -> String {
+    let mut parts = Vec::with_capacity(candidate.path.len() + 1);
+    parts.push(candidate.start_token.to_string());
+    parts.extend(candidate.path.iter().map(|hop| hop.to.to_string()));
+    parts.join(">")
+}
+
+fn candidate_precedes(candidate: &CandidatePath, existing: &CandidatePath) -> bool {
+    candidate
+        .screening_score_q32
+        .cmp(&existing.screening_score_q32)
+        .then_with(|| candidate.path.len().cmp(&existing.path.len()))
+        .is_lt()
 }
 
 fn candidate_selection_budget(max_candidates_per_refresh: usize, multiplier: usize) -> usize {

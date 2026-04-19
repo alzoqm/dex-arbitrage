@@ -9,8 +9,8 @@ use dex_arbitrage::{
     detector::Detector,
     graph::{DistanceCache, GraphSnapshot},
     types::{
-        AmmKind, Chain, Edge, EdgeRef, LiquidityInfo, PoolAdmissionStatus, PoolHealth,
-        PoolSpecificState, PoolState, TokenBehavior, TokenInfo, V2PoolState,
+        AmmKind, CandidatePath, Chain, Edge, EdgeRef, LiquidityInfo, PoolAdmissionStatus,
+        PoolHealth, PoolSpecificState, PoolState, TokenBehavior, TokenInfo, V2PoolState,
     },
 };
 
@@ -188,6 +188,13 @@ fn settings_with_search(search: SearchSettings) -> Arc<Settings> {
     Arc::new(settings)
 }
 
+fn token_cycle_key(candidate: &CandidatePath) -> String {
+    let mut parts = Vec::with_capacity(candidate.path.len() + 1);
+    parts.push(candidate.start_token.to_string());
+    parts.extend(candidate.path.iter().map(|hop| hop.to.to_string()));
+    parts.join(">")
+}
+
 #[test]
 fn detector_finds_profitable_cycle_touching_changed_edges() {
     let usdc = token("USDC", addr(1), 6, true);
@@ -288,7 +295,7 @@ fn detector_can_start_from_non_stable_cycle_anchor() {
 }
 
 #[test]
-fn detector_preserves_parallel_pool_route_variants() {
+fn detector_deduplicates_parallel_pool_route_variants_by_token_path() {
     let (snapshot, changed_edges) = manual_parallel_snapshot(4);
     let distance_cache = DistanceCache::recompute(&snapshot);
     let detector = Detector::new(settings_with_search(SearchSettings {
@@ -298,14 +305,19 @@ fn detector_preserves_parallel_pool_route_variants() {
 
     let candidates = detector.detect(&snapshot, &changed_edges, &distance_cache);
 
-    assert!(candidates.len() > 1);
+    assert_eq!(candidates.len(), 1);
     assert!(candidates.iter().all(|candidate| candidate.path.len() == 4));
-    assert!(candidates
-        .iter()
-        .any(|candidate| candidate.cycle_key.contains(&addr(200).to_string())));
-    assert!(candidates
-        .iter()
-        .any(|candidate| candidate.cycle_key.contains(&addr(203).to_string())));
+    assert_eq!(
+        token_cycle_key(candidates.first().expect("candidate")),
+        format!(
+            "{}>{}>{}>{}>{}",
+            addr(50),
+            addr(51),
+            addr(52),
+            addr(53),
+            addr(50)
+        )
+    );
 }
 
 #[test]
