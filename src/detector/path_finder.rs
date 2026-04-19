@@ -453,9 +453,6 @@ fn finalize_candidates(
     max_candidates_per_refresh: usize,
 ) -> Vec<CandidatePath> {
     candidates.sort_by(|a, b| a.screening_score_q32.cmp(&b.screening_score_q32));
-    if candidates.len() <= max_candidates_per_refresh {
-        return candidates;
-    }
 
     let mut selected = Vec::with_capacity(max_candidates_per_refresh);
     let mut selected_canonical_cycles = HashSet::<String>::new();
@@ -467,6 +464,11 @@ fn finalize_candidates(
                 return selected;
             }
         }
+    }
+    if !env_bool("SEARCH_FILL_ROTATED_CANDIDATES", true)
+        || selected.len() >= max_candidates_per_refresh
+    {
+        return selected;
     }
 
     let mut selected_token_paths = selected
@@ -549,6 +551,17 @@ fn env_usize(key: &str, default: usize) -> usize {
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
         .filter(|value| *value > 0)
+        .unwrap_or(default)
+}
+
+fn env_bool(key: &str, default: bool) -> bool {
+    std::env::var(key)
+        .ok()
+        .and_then(|value| match value.trim().to_ascii_lowercase().as_str() {
+            "1" | "true" | "yes" | "on" => Some(true),
+            "0" | "false" | "no" | "off" => Some(false),
+            _ => None,
+        })
         .unwrap_or(default)
 }
 

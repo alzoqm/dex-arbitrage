@@ -1231,6 +1231,9 @@ forge build: 통과, lint note/warning만 존재
 - `ROUTE_CAPACITY_PREFILTER_MAX_CHANGED_EDGES=8192`
   - 작은 refresh에서는 route-level 최소 거래금액 capacity prefilter를 적용한다.
   - 최초 대형 refresh에서는 prefilter 자체가 detector 병목이 되지 않도록 건너뛴다.
+- `SEARCH_FILL_ROTATED_CANDIDATES=false`
+  - 같은 경제적 cycle의 시작점만 다른 회전 후보를 후보 수 채우기 용도로 추가하지 않는다.
+  - 특정 심볼이나 DEX를 제외하는 것이 아니라, 동일 canonical cycle 중복 평가만 줄인다.
 - profitability summary에 `router_timeouts`를 추가했다.
   - no-route 원인이 실제 quote 실패인지, gross nonpositive인지, timeout인지 분리해서 볼 수 있다.
 
@@ -1260,6 +1263,15 @@ forge build: 통과, lint note/warning만 존재
     - 첫 구간: `total_requests=467`, `total_cu=12246`
     - 둘째 구간: `total_requests=1380`, `total_cu=35934`
   - simulated=0, submitted=0
+- `state/base-no-rotations-smoke-20260419-212518.log`
+  - `SEARCH_FILL_ROTATED_CANDIDATES=false`
+  - snapshot 0 후보 수: 32 -> 17
+  - 이후 refresh 후보 수: 21-32
+  - refresh는 대체로 1.0-2.0초 범위
+  - 30초 RPC summary:
+    - 첫 구간: `total_requests=261`, `total_cu=6890`
+    - 둘째 구간: `total_requests=1420`, `total_cu=36928`
+  - simulated=0, submitted=0
 - `state/base-no-route-score-samples-20260419-212131.log`
   - no-route 샘플의 주 원인은 V3/소형 풀 경유 중간 hop `no_output`, gross nonpositive, 일부 router timeout이었다.
   - 특정 DEX나 특정 심볼만의 문제가 아니므로 범위 축소형 allowlist는 적용하지 않았다.
@@ -1267,6 +1279,7 @@ forge build: 통과, lint note/warning만 존재
 해석:
 - 실매매 범위를 줄이지 않고도 후보 처리 지연을 순차 26초대에서 1-2초대로 낮췄다.
 - 후보는 여전히 Base 전체 discovery 결과에서 생성되며, 특정 심볼/DEX/커넥터 전용으로 축소하지 않았다.
+- 회전 후보 제거는 같은 canonical cycle 중복만 줄이며, 고유 cycle이 32개 이상인 refresh에서는 후보 수가 그대로 32개까지 채워진다.
 - 관찰 구간에서는 exact quote, flash fee, gas, validator까지 통과한 실행 가능 수익 후보가 없었다.
 - 이 결과는 “수익 없음”을 증명하지 않는다. 해당 관찰 블록들에서 실행 가능한 후보가 없었고, 현재 세팅은 false-positive를 빠르게 제거하도록 조정됐다는 의미다.
 - 다음 실매매 전 확인 포인트:
