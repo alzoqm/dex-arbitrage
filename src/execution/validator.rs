@@ -1,6 +1,7 @@
 use std::{
+    collections::HashMap,
     sync::Arc,
-    time::{Instant, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::Result;
@@ -27,6 +28,214 @@ pub struct Validator {
     gas_tracker: GasTracker,
     tx_builder: TxBuilder,
     capital_selector: CapitalSelector,
+    failure_cache: Arc<parking_lot::Mutex<FailureCache>>,
+}
+
+#[derive(Debug, Clone)]
+struct SimulationOutcome {
+    success: bool,
+    reason: Option<String>,
+}
+
+impl SimulationOutcome {
+    fn failed(reason: String) -> Self {
+        Self {
+            success: false,
+            reason: Some(reason),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct CachedFailure {
+    expires_at: Instant,
+    reason: String,
+}
+
+#[derive(Debug)]
+struct FailureCache {
+    enabled: bool,
+    entries: HashMap<String, CachedFailure>,
+    slippage_ttl: Duration,
+    transfer_ttl: Duration,
+    callback_ttl: Duration,
+    overflow_ttl: Duration,
+    route_ttl: Duration,
+}
+
+impl FailureCache {
+    fn from_env() -> Self {
+        Self {
+            enabled: env_bool("VALIDATOR_FAILURE_CACHE", true),
+            entries: HashMap::new(),
+            slippage_ttl: Duration::from_secs(env_u64("FAILURE_CACHE_SLIPPAGE_SECS", 180)),
+            transfer_ttl: Duration::from_secs(env_u64("FAILURE_CACHE_TRANSFER_SECS", 1_800)),
+            callback_ttl: Duration::from_secs(env_u64("FAILURE_CACHE_CALLBACK_SECS", 600)),
+            overflow_ttl: Duration::from_secs(env_u64("FAILURE_CACHE_OVERFLOW_SECS", 600)),
+            route_ttl: Duration::from_secs(env_u64("FAILURE_CACHE_ROUTE_SECS", 300)),
+        }
+    }
+
+    fn skip_reason(&mut self, plan: &ExactPlan) -> Option<String> {
+        if !self.enabled {
+            return None;
+        }
+        self.prune();
+        for key in failure_keys(plan) {
+            if let Some(failure) = self.entries.get(&key) {
+                return Some(failure.reason.clone());
+            }
+        }
+        None
+    }
+
+    fn record(&mut self, plan: &ExactPlan, reason: &str) {
+        if !self.enabled {
+            return;
+        }
+        self.prune();
+        let class = FailureClass::from_reason(reason);
+        let ttl = self.ttl_for(class);
+        if ttl.is_zero() {
+            return;
+        }
+        let expires_at = Instant::now() + ttl;
+        for key in failure_keys_for_class(plan, class) {
+            self.entries.insert(
+                key,
+                CachedFailure {
+                    expires_at,
+                    reason: normalize_failure_reason(reason).to_string(),
+                },
+            );
+        }
+    }
+
+    fn prune(&mut self) {
+        let now = Instant::now();
+        self.entries.retain(|_, failure| failure.expires_at > now);
+    }
+
+    fn ttl_for(&self, class: FailureClass) -> Duration {
+        match class {
+            FailureClass::Slippage => self.slippage_ttl,
+            FailureClass::Transfer => self.transfer_ttl,
+            FailureClass::Callback => self.callback_ttl,
+            FailureClass::Overflow => self.overflow_ttl,
+            FailureClass::HopMismatch => self.route_ttl,
+            FailureClass::Other => self.route_ttl,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FailureClass {
+    Slippage,
+    Transfer,
+    Callback,
+    Overflow,
+    HopMismatch,
+    Other,
+}
+
+impl FailureClass {
+    fn from_reason(reason: &str) -> Self {
+        let normalized = normalize_failure_reason(reason);
+        if normalized.contains("SPLIT_SLIPPAGE") {
+            Self::Slippage
+        } else if normalized.contains("TRANSFER_FAILED") {
+            Self::Transfer
+        } else if normalized.contains("NO_CALLBACK_PAYMENT") {
+            Self::Callback
+        } else if normalized.contains("underflow") || normalized.contains("overflow") {
+            Self::Overflow
+        } else if normalized.contains("HOP_INPUT_SUM_MISMATCH") {
+            Self::HopMismatch
+        } else {
+            Self::Other
+        }
+    }
+}
+
+fn normalize_failure_reason(reason: &str) -> &str {
+    reason
+        .split("execution reverted: ")
+        .nth(1)
+        .unwrap_or(reason)
+        .split(" for method")
+        .next()
+        .unwrap_or(reason)
+}
+
+fn failure_keys(plan: &ExactPlan) -> Vec<String> {
+    let mut keys = vec![route_failure_key(plan)];
+    keys.extend(pool_direction_failure_keys(plan));
+    keys.extend(token_pair_failure_keys(plan));
+    keys
+}
+
+fn failure_keys_for_class(plan: &ExactPlan, class: FailureClass) -> Vec<String> {
+    match class {
+        FailureClass::Transfer => {
+            let mut keys = vec![route_failure_key(plan)];
+            keys.extend(pool_direction_failure_keys(plan));
+            keys.extend(token_pair_failure_keys(plan));
+            keys
+        }
+        FailureClass::Callback => {
+            let mut keys = vec![route_failure_key(plan)];
+            keys.extend(
+                pool_direction_failure_keys(plan)
+                    .into_iter()
+                    .filter(|key| key.contains(":UniswapV3Like:")),
+            );
+            keys
+        }
+        FailureClass::Overflow | FailureClass::Slippage => {
+            let mut keys = vec![route_failure_key(plan)];
+            keys.extend(pool_direction_failure_keys(plan));
+            keys
+        }
+        FailureClass::HopMismatch | FailureClass::Other => vec![route_failure_key(plan)],
+    }
+}
+
+fn route_failure_key(plan: &ExactPlan) -> String {
+    let mut parts = vec![format!("route:{}", plan.input_token)];
+    for hop in &plan.hops {
+        for split in &hop.splits {
+            parts.push(format!(
+                "{}:{}>{}",
+                split.pool_id, split.token_in, split.token_out
+            ));
+        }
+    }
+    parts.join("|")
+}
+
+fn pool_direction_failure_keys(plan: &ExactPlan) -> Vec<String> {
+    plan.hops
+        .iter()
+        .flat_map(|hop| {
+            hop.splits.iter().map(|split| {
+                format!(
+                    "pool:{}:{:?}:{}>{}",
+                    split.pool_id, split.adapter_type, split.token_in, split.token_out
+                )
+            })
+        })
+        .collect()
+}
+
+fn token_pair_failure_keys(plan: &ExactPlan) -> Vec<String> {
+    plan.hops
+        .iter()
+        .flat_map(|hop| {
+            hop.splits
+                .iter()
+                .map(|split| format!("token:{}>{}", split.token_in, split.token_out))
+        })
+        .collect()
 }
 
 impl Validator {
@@ -40,6 +249,7 @@ impl Validator {
             gas_tracker,
             tx_builder,
             capital_selector,
+            failure_cache: Arc::new(parking_lot::Mutex::new(FailureCache::from_env())),
         }
     }
 
@@ -265,17 +475,30 @@ impl Validator {
         // Rebuild calldata with final contract_min_profit_raw
         let calldata = self.tx_builder.build_calldata(&plan, deadline_unix)?;
 
+        if let Some(reason) = self.failure_cache.lock().skip_reason(&plan) {
+            debug!(
+                input_token = %plan.input_token,
+                input_amount = plan.input_amount,
+                reason = %reason,
+                "validator failure cache skipped known-bad route"
+            );
+            return Ok(None);
+        }
+
         // Step 7: Simulation
         let simulation_started = Instant::now();
-        let simulation_ok = self
+        let simulation = self
             .simulate(executor, operator, &calldata, &gas_quote)
             .await?;
         telemetry::record_simulation_latency(
             simulation_started.elapsed().as_secs_f64(),
-            simulation_ok,
+            simulation.success,
         );
 
-        if !simulation_ok {
+        if !simulation.success {
+            if let Some(reason) = &simulation.reason {
+                self.failure_cache.lock().record(&plan, reason);
+            }
             if env_bool("LOG_FAILED_PLAN_DETAILS", false) {
                 warn!(
                     plan = ?plan,
@@ -334,7 +557,7 @@ impl Validator {
         operator: alloy::primitives::Address,
         calldata: &alloy::primitives::Bytes,
         gas_quote: &GasQuote,
-    ) -> Result<bool> {
+    ) -> Result<SimulationOutcome> {
         let best = self.rpc.best_read();
         let method = self.settings.rpc.simulate_method.as_str();
 
@@ -359,19 +582,19 @@ impl Validator {
                 Ok(result) => {
                     // Parse the simulation result
                     match self.parse_simulation_result(result) {
-                        Ok(success) => Ok(success),
+                        Ok(outcome) => Ok(outcome),
                         Err(e) => {
                             warn!(
                                 error = %e,
                                 "failed to parse simulation result, treating as failure"
                             );
-                            Ok(false)
+                            Ok(SimulationOutcome::failed(e.to_string()))
                         }
                     }
                 }
                 Err(e) => {
                     warn!(error = %e, "custom simulation call failed");
-                    Ok(false)
+                    Ok(SimulationOutcome::failed(e.to_string()))
                 }
             };
         }
@@ -385,22 +608,25 @@ impl Validator {
             Ok(return_data) => {
                 // Parse the return data to ensure successful execution
                 match Self::parse_call_return_data(return_data) {
-                    Ok(success) => Ok(success),
+                    Ok(success) => Ok(SimulationOutcome {
+                        success,
+                        reason: None,
+                    }),
                     Err(e) => {
                         warn!(error = %e, "failed to parse eth_call return data");
-                        Ok(false)
+                        Ok(SimulationOutcome::failed(e.to_string()))
                     }
                 }
             }
             Err(e) => {
                 warn!(error = %e, "eth_call failed");
-                Ok(false)
+                Ok(SimulationOutcome::failed(e.to_string()))
             }
         }
     }
 
     /// Parse the result from custom simulation methods
-    fn parse_simulation_result(&self, result: serde_json::Value) -> Result<bool> {
+    fn parse_simulation_result(&self, result: serde_json::Value) -> Result<SimulationOutcome> {
         // Handle different response formats from providers
 
         // Format 1: Alchemy eth_simulateV1 - array of simulation results
@@ -416,26 +642,33 @@ impl Validator {
                             .and_then(|v| v.as_str())
                             .unwrap_or("unknown error");
                         debug!(%message, "simulation returned error");
-                        return Ok(false);
+                        return Ok(SimulationOutcome::failed(message.to_string()));
                     }
                 }
 
                 // Check for revert reason in result
                 if let Some(revert_reason) = first.get("revertReason") {
                     if revert_reason.is_string() && !revert_reason.as_str().unwrap().is_empty() {
-                        warn!(revert = %revert_reason.as_str().unwrap(), "simulation reverted");
-                        return Ok(false);
+                        let reason = revert_reason.as_str().unwrap().to_string();
+                        warn!(revert = %reason, "simulation reverted");
+                        return Ok(SimulationOutcome::failed(reason));
                     }
                 }
 
                 // Check if the transaction succeeded
                 if let Some(success) = first.get("success") {
-                    return Ok(success.as_bool().unwrap_or(false));
+                    return Ok(SimulationOutcome {
+                        success: success.as_bool().unwrap_or(false),
+                        reason: None,
+                    });
                 }
 
                 // Check for gasUsed (some providers only include it on success)
                 if first.get("gasUsed").is_some() {
-                    return Ok(true);
+                    return Ok(SimulationOutcome {
+                        success: true,
+                        reason: None,
+                    });
                 }
             }
         }
@@ -449,21 +682,29 @@ impl Validator {
                         .and_then(|v| v.as_str())
                         .unwrap_or("unknown error");
                     debug!(%message, "simulation returned error");
-                    return Ok(false);
+                    return Ok(SimulationOutcome::failed(message.to_string()));
                 }
             }
 
             if let Some(success) = result.get("success") {
-                return Ok(success.as_bool().unwrap_or(false));
+                return Ok(SimulationOutcome {
+                    success: success.as_bool().unwrap_or(false),
+                    reason: None,
+                });
             }
 
             if result.get("gasUsed").is_some() {
-                return Ok(true);
+                return Ok(SimulationOutcome {
+                    success: true,
+                    reason: None,
+                });
             }
         }
 
         warn!("unable to determine simulation success from result");
-        Ok(false)
+        Ok(SimulationOutcome::failed(
+            "unknown simulation result".to_string(),
+        ))
     }
 
     /// Parse the return data from eth_call
