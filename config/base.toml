@@ -95,6 +95,14 @@ allow_self_funded = false
 price_env = "BASE_WETH_PRICE_E8"
 
 [[tokens]]
+symbol = "cbBTC"
+address_env = "BASE_CBBTC"
+decimals = 8
+is_stable = false
+allow_self_funded = false
+price_env = "BASE_CBBTC_PRICE_E8"
+
+[[tokens]]
 symbol = "DAI"
 address_env = "BASE_DAI"
 decimals = 18

@@ -344,7 +344,9 @@ impl DiscoveryManager {
         }
 
         let mut tokens = self.discover_tokens(&pools, &flash_reserves).await?;
-        derive_missing_prices_from_pools(&mut tokens, &pools);
+        if derive_pool_prices_enabled() {
+            derive_missing_prices_from_pools(&mut tokens, &pools);
+        }
 
         let block_ref = if latest_at_bootstrap > 0 {
             self.scanner.current_block_ref().await.ok()
@@ -591,7 +593,9 @@ impl DiscoveryManager {
         self.extend_tokens_with_discovered(&mut tokens, pools.values(), &flash_reserves)
             .await?;
         apply_aave_flash_reserves(&mut tokens, &flash_reserves);
-        derive_missing_prices_from_pools(&mut tokens, &pools);
+        if derive_pool_prices_enabled() {
+            derive_missing_prices_from_pools(&mut tokens, &pools);
+        }
         let snapshot = GraphSnapshot::build(current_snapshot_id + 1, block_ref, tokens, pools);
         Ok((snapshot, changed_pool_ids))
     }
@@ -1630,6 +1634,17 @@ fn token_metadata_multicall_chunk_size() -> usize {
         .and_then(|value| value.parse::<usize>().ok())
         .filter(|value| *value > 0)
         .unwrap_or(250)
+}
+
+fn derive_pool_prices_enabled() -> bool {
+    std::env::var("DERIVE_POOL_PRICES")
+        .ok()
+        .and_then(|value| match value.trim().to_ascii_lowercase().as_str() {
+            "1" | "true" | "yes" | "on" => Some(true),
+            "0" | "false" | "no" | "off" => Some(false),
+            _ => None,
+        })
+        .unwrap_or(false)
 }
 
 fn stable_price_for_symbol(symbol: &str) -> Option<u64> {

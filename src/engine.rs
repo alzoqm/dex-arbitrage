@@ -82,28 +82,35 @@ pub async fn run_chain(
     if let Some(block_ref) = initial_snapshot.block_ref.clone() {
         reorg_detector.update_chain(block_ref).ok();
     }
-    let initial_distance_cache = DistanceCache::recompute(initial_snapshot.as_ref());
-    let initial_changed_edges =
-        initial_edge_refs(initial_snapshot.as_ref(), &initial_distance_cache);
-    info!(
-        selected_edges = initial_changed_edges.len(),
-        total_edges = total_edge_count(initial_snapshot.as_ref()),
-        "initial refresh edge set selected"
-    );
-    process_refresh(
-        settings.clone(),
-        initial_snapshot,
-        initial_changed_edges,
-        &detector,
-        &router,
-        &validator,
-        &submitter,
-        &risk,
-        &depeg_guard,
-        &nonce_manager,
-        simulate_only,
-    )
-    .await?;
+    if env_bool("SKIP_INITIAL_REFRESH", false) {
+        info!(
+            total_edges = total_edge_count(initial_snapshot.as_ref()),
+            "initial refresh skipped for low-latency live startup"
+        );
+    } else {
+        let initial_distance_cache = DistanceCache::recompute(initial_snapshot.as_ref());
+        let initial_changed_edges =
+            initial_edge_refs(initial_snapshot.as_ref(), &initial_distance_cache);
+        info!(
+            selected_edges = initial_changed_edges.len(),
+            total_edges = total_edge_count(initial_snapshot.as_ref()),
+            "initial refresh edge set selected"
+        );
+        process_refresh(
+            settings.clone(),
+            initial_snapshot,
+            initial_changed_edges,
+            &detector,
+            &router,
+            &validator,
+            &submitter,
+            &risk,
+            &depeg_guard,
+            &nonce_manager,
+            simulate_only,
+        )
+        .await?;
+    }
 
     if once {
         return Ok(());

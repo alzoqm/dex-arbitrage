@@ -472,6 +472,40 @@ impl RpcClient {
         logs.iter().map(parse_log).collect()
     }
 
+    pub async fn get_logs_by_tag(
+        &self,
+        from_block: &str,
+        to_block: &str,
+        addresses: &[Address],
+        topics: &[B256],
+    ) -> Result<Vec<RpcLog>> {
+        let address_values = addresses
+            .iter()
+            .map(|addr| Value::String(addr.to_string()))
+            .collect::<Vec<_>>();
+        let topic_values = topics
+            .iter()
+            .map(|topic| Value::String(topic.to_string()))
+            .collect::<Vec<_>>();
+
+        let mut filter = json!({
+            "fromBlock": from_block,
+            "toBlock": to_block,
+        });
+        if !addresses.is_empty() {
+            filter["address"] = json!(address_values);
+        }
+        if !topics.is_empty() {
+            filter["topics"] = json!([topic_values]);
+        }
+
+        let value = self.request("eth_getLogs", json!([filter])).await?;
+        let logs = value
+            .as_array()
+            .context("eth_getLogs did not return array")?;
+        logs.iter().map(parse_log).collect()
+    }
+
     pub async fn get_block_receipts_logs(&self, block_number: u64) -> Result<Vec<RpcLog>> {
         let value = self
             .request(

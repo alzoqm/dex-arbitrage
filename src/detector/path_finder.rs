@@ -1,9 +1,11 @@
 use std::{
     collections::{HashMap, HashSet},
+    str::FromStr,
     sync::Arc,
     time::Duration,
 };
 
+use alloy::primitives::Address;
 use smallvec::SmallVec;
 
 use crate::{
@@ -108,6 +110,7 @@ impl PathFinder {
             self.tuning.max_candidates_per_refresh,
             selection_multiplier,
         );
+        let execution_token_policy = execution_token_policy(snapshot);
 
         for ((from, to), changed_edge_ref) in changed_pairs {
             if !distance_cache.reachable_from_anchor[from]
@@ -200,6 +203,7 @@ impl PathFinder {
                                 changed_edge_ref,
                                 &min_trade_raw_by_token,
                                 use_route_capacity_filter,
+                                &execution_token_policy,
                             ) {
                                 if self.tuning.dedup_token_paths {
                                     let token_key = candidate_token_cycle_key(&candidate);
@@ -419,6 +423,7 @@ impl PathFinder {
         changed_edge_ref: EdgeRef,
         min_trade_raw_by_token: &[Option<u128>],
         use_route_capacity_filter: bool,
+        execution_token_policy: &ExecutionTokenPolicy,
     ) -> Option<CandidatePath> {
         let mut path = SmallVec::<[CandidateHop; 8]>::new();
         let mut contains_changed_pair = false;
@@ -439,6 +444,10 @@ impl PathFinder {
         }
 
         if !contains_changed_pair {
+            return None;
+        }
+
+        if !route_tokens_allowed(snapshot, anchor_idx, edge_refs, execution_token_policy) {
             return None;
         }
 
@@ -743,6 +752,20 @@ fn env_bool(key: &str, default: bool) -> bool {
             _ => None,
         })
         .unwrap_or(default)
+}
+
+fn env_csv(key: &str) -> Vec<String> {
+    std::env::var(key)
+        .ok()
+        .map(|value| {
+            value
+                .split(',')
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToString::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -1103,6 +1126,81 @@ fn route_has_min_start_capacity(
     route_start_capacity_raw(snapshot, edge_refs)
         .map(|capacity| capacity >= min_trade_raw.max(1))
         .unwrap_or(false)
+}
+
+#[derive(Debug, Clone)]
+struct ExecutionTokenPolicy {
+    required: bool,
+    symbols: HashSet<String>,
+    addresses: HashSet<Address>,
+}
+
+fn execution_token_policy(snapshot: &GraphSnapshot) -> ExecutionTokenPolicy {
+    let required = env_bool("REQUIRE_TRUSTED_ROUTE_TOKENS", false);
+    let symbols = env_csv("EXECUTION_TRUSTED_SYMBOLS")
+        .into_iter()
+        .map(|symbol| symbol.to_ascii_lowercase())
+        .collect::<HashSet<_>>();
+    let mut addresses = env_csv("EXECUTION_TRUSTED_TOKENS")
+        .into_iter()
+        .filter_map(|value| Address::from_str(value.trim()).ok())
+        .collect::<HashSet<_>>();
+
+    if required && symbols.is_empty() && addresses.is_empty() {
+        addresses.extend(
+            snapshot
+                .tokens
+                .iter()
+                .filter(|token| token.manual_price_usd_e8.is_some())
+                .map(|token| token.address),
+        );
+    }
+
+    ExecutionTokenPolicy {
+        required,
+        symbols,
+        addresses,
+    }
+}
+
+fn route_tokens_allowed(
+    snapshot: &GraphSnapshot,
+    anchor_idx: usize,
+    edge_refs: &[EdgeRef],
+    policy: &ExecutionTokenPolicy,
+) -> bool {
+    if !policy.required {
+        return true;
+    }
+    let Some(anchor) = snapshot.tokens.get(anchor_idx) else {
+        return false;
+    };
+    if !token_allowed_by_execution_policy(anchor, policy) {
+        return false;
+    }
+    for &edge_ref in edge_refs {
+        let Some(edge) = snapshot.edge(edge_ref) else {
+            return false;
+        };
+        let Some(token) = snapshot.tokens.get(edge.to) else {
+            return false;
+        };
+        if !token_allowed_by_execution_policy(token, policy) {
+            return false;
+        }
+    }
+    true
+}
+
+fn token_allowed_by_execution_policy(
+    token: &crate::types::TokenInfo,
+    policy: &ExecutionTokenPolicy,
+) -> bool {
+    policy.addresses.contains(&token.address)
+        || policy.symbols.contains(&token.symbol.to_ascii_lowercase())
+        || (policy.symbols.is_empty()
+            && policy.addresses.is_empty()
+            && token.manual_price_usd_e8.is_some())
 }
 
 fn route_start_capacity_raw(snapshot: &GraphSnapshot, edge_refs: &[EdgeRef]) -> Option<u128> {

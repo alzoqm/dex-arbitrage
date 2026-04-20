@@ -11,7 +11,7 @@ use std::{
 use alloy::{
     primitives::{keccak256, Address, B256, U256},
     providers::{Provider, ProviderBuilder, WsConnect},
-    rpc::types::Filter,
+    rpc::types::{Filter, Log},
 };
 use anyhow::Result;
 use futures::{stream, StreamExt};
@@ -99,6 +99,12 @@ impl EventStream {
         if matches!(event_ingest_mode(), EventIngestMode::Wss) {
             return self
                 .poll_wss_hybrid(snapshot, from_block, &addresses, &event_topics())
+                .await;
+        }
+
+        if matches!(event_ingest_mode(), EventIngestMode::PendingLogs) {
+            return self
+                .poll_pending_logs(snapshot, from_block, &addresses, &event_topics())
                 .await;
         }
 
@@ -210,6 +216,28 @@ impl EventStream {
         Ok((next_from_block, batch))
     }
 
+    async fn poll_pending_logs(
+        &self,
+        snapshot: &GraphSnapshot,
+        from_block: u64,
+        addresses: &[Address],
+        topics: &[B256],
+    ) -> Result<(u64, RefreshBatch)> {
+        let latest = self.rpc.best_read().block_number().await?;
+        let logs = self
+            .rpc
+            .best_read()
+            .get_logs_by_tag("pending", "pending", addresses, topics)
+            .await
+            .unwrap_or_default();
+        let log_count = logs.len();
+        let logs = self.filter_seen_wss_logs(filter_watched_logs(logs, addresses, topics));
+        self.record_wss_log_keys(&logs);
+        let batch = self.build_refresh_batch(snapshot, logs);
+        telemetry::record_event_ingestion("pending_logs", log_count, self.settings.chain.as_str());
+        Ok((latest.max(from_block), batch))
+    }
+
     async fn poll_logs(
         &self,
         from_block: u64,
@@ -226,6 +254,12 @@ impl EventStream {
                     topics,
                 ))
             }
+            EventIngestMode::PendingLogs => self
+                .rpc
+                .best_read()
+                .get_logs_by_tag("pending", "pending", addresses, topics)
+                .await
+                .map(|logs| filter_watched_logs(logs, addresses, topics)),
             EventIngestMode::BlockReceipts => {
                 match self
                     .get_block_receipts_range(from_block, to_block, addresses, topics)
@@ -284,10 +318,11 @@ impl EventStream {
                 self.get_address_logs_chunked(from_block, to_block, addresses, topics)
                     .await
             }
-            EventIngestMode::Wss | EventIngestMode::TopicLogs => self
-                .get_topic_logs_chunked(from_block, to_block, topics)
-                .await
-                .map(|logs| filter_watched_logs(logs, addresses, topics)),
+            EventIngestMode::Wss | EventIngestMode::PendingLogs | EventIngestMode::TopicLogs => {
+                self.get_topic_logs_chunked(from_block, to_block, topics)
+                    .await
+                    .map(|logs| filter_watched_logs(logs, addresses, topics))
+            }
         }
     }
 
@@ -507,6 +542,7 @@ impl EventStream {
         let topics = topics.to_vec();
         let addresses = addresses.to_vec();
         let filter_mode = wss_filter_mode();
+        let subscription_type = wss_subscription_type();
         let capacity = std::env::var("EVENT_WSS_CHANNEL_CAPACITY")
             .ok()
             .and_then(|value| value.parse::<usize>().ok())
@@ -516,8 +552,15 @@ impl EventStream {
         *self.ws_rx.lock() = Some(rx);
         let ws_started = self.ws_started.clone();
         tokio::spawn(async move {
-            if let Err(err) =
-                run_wss_log_subscription(ws_url, addresses, topics, filter_mode, tx).await
+            if let Err(err) = run_wss_log_subscription(
+                ws_url,
+                addresses,
+                topics,
+                filter_mode,
+                subscription_type,
+                tx,
+            )
+            .await
             {
                 warn!(error = %err, "WSS log subscription stopped");
             }
@@ -770,6 +813,7 @@ impl EventStream {
 #[derive(Debug, Clone, Copy)]
 enum EventIngestMode {
     Wss,
+    PendingLogs,
     BlockReceipts,
     TopicLogs,
     AddressLogs,
@@ -792,6 +836,7 @@ impl EventIngestMode {
     fn as_str(self) -> &'static str {
         match self {
             EventIngestMode::Wss => "wss",
+            EventIngestMode::PendingLogs => "pending_logs",
             EventIngestMode::BlockReceipts => "block_receipts",
             EventIngestMode::TopicLogs => "topic_logs",
             EventIngestMode::AddressLogs => "address_logs",
@@ -825,6 +870,7 @@ fn event_ingest_mode() -> EventIngestMode {
         .as_str()
     {
         "wss" | "ws" | "websocket" => EventIngestMode::Wss,
+        "pending_logs" | "pendinglogs" | "pending" | "flashblocks" => EventIngestMode::PendingLogs,
         "address_logs" | "address" | "legacy" => EventIngestMode::AddressLogs,
         "topic_logs" | "topic" | "logs" => EventIngestMode::TopicLogs,
         _ => EventIngestMode::BlockReceipts,
@@ -864,6 +910,10 @@ fn wss_filter_mode() -> WssFilterMode {
         "address_logs" | "address" | "legacy" => WssFilterMode::AddressLogs,
         _ => WssFilterMode::TopicLogs,
     }
+}
+
+fn wss_subscription_type() -> String {
+    std::env::var("EVENT_WSS_SUBSCRIPTION_TYPE").unwrap_or_else(|_| "logs".to_string())
 }
 
 fn wss_reconcile_interval_blocks() -> u64 {
@@ -1020,6 +1070,7 @@ async fn run_wss_log_subscription(
     addresses: Vec<Address>,
     topics: Vec<B256>,
     filter_mode: WssFilterMode,
+    subscription_type: String,
     tx: mpsc::Sender<RpcLog>,
 ) -> Result<()> {
     let provider = ProviderBuilder::new()
@@ -1027,6 +1078,7 @@ async fn run_wss_log_subscription(
         .await?;
     info!(
         mode = filter_mode.as_str(),
+        subscription = %subscription_type,
         topic_count = topics.len(),
         address_count = addresses.len(),
         "starting WSS log subscription"
@@ -1035,7 +1087,13 @@ async fn run_wss_log_subscription(
         WssFilterMode::AddressLogs => Filter::new().address(addresses).event_signature(topics),
         WssFilterMode::TopicLogs => Filter::new().event_signature(topics),
     };
-    let sub = provider.subscribe_logs(&filter).await?;
+    let sub = if subscription_type.eq_ignore_ascii_case("pendingLogs") {
+        provider
+            .subscribe::<_, Log>((subscription_type.clone(), filter.clone()))
+            .await?
+    } else {
+        provider.subscribe_logs(&filter).await?
+    };
     let mut stream = sub.into_stream();
     while let Some(log) = stream.next().await {
         let rpc_log = RpcLog {

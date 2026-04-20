@@ -624,19 +624,12 @@ impl Validator {
         let method = self.settings.rpc.simulate_method.as_str();
 
         if method != "eth_call" {
-            // Use custom simulation method (eth_simulateV1, eth_callBundle, etc.)
+            // Use custom simulation methods (Base Flashblocks eth_simulateV1,
+            // eth_callBundle, etc.) against preconfirmed/pending state.
             let custom = best
                 .custom_simulate(
                     method,
-                    json!([
-                        {
-                            "from": operator.to_string(),
-                            "to": executor.to_string(),
-                            "data": calldata.to_string(),
-                            "maxFeePerGas": format!("0x{:x}", gas_quote.max_fee_per_gas),
-                            "maxPriorityFeePerGas": format!("0x{:x}", gas_quote.max_priority_fee_per_gas),
-                        }
-                    ]),
+                    custom_simulation_params(method, executor, operator, calldata, gas_quote),
                 )
                 .await;
 
@@ -691,10 +684,36 @@ impl Validator {
     fn parse_simulation_result(&self, result: serde_json::Value) -> Result<SimulationOutcome> {
         // Handle different response formats from providers
 
-        // Format 1: Alchemy eth_simulateV1 - array of simulation results
+        // Format 1: Base/Ethereum eth_simulateV1 - array of simulated block results.
         if let Some(array) = result.as_array() {
             if !array.is_empty() {
                 let first = &array[0];
+
+                if let Some(calls) = first.get("calls").and_then(|value| value.as_array()) {
+                    let Some(call) = calls.first() else {
+                        return Ok(SimulationOutcome::failed(
+                            "eth_simulateV1 returned no calls".to_string(),
+                        ));
+                    };
+                    if let Some(error) = call.get("error").and_then(|value| value.as_str()) {
+                        if !error.is_empty() {
+                            return Ok(SimulationOutcome::failed(error.to_string()));
+                        }
+                    }
+                    if let Some(status) = call.get("status").and_then(|value| value.as_str()) {
+                        return Ok(SimulationOutcome {
+                            success: status == "0x1" || status == "1",
+                            reason: (status != "0x1" && status != "1")
+                                .then(|| "eth_simulateV1 status 0x0".to_string()),
+                        });
+                    }
+                    if call.get("gasUsed").is_some() {
+                        return Ok(SimulationOutcome {
+                            success: true,
+                            reason: None,
+                        });
+                    }
+                }
 
                 // Check for error in the simulation result
                 if let Some(error) = first.get("error") {
@@ -815,6 +834,39 @@ fn env_u64(key: &str, default: u64) -> u64 {
         .ok()
         .and_then(|value| value.parse::<u64>().ok())
         .unwrap_or(default)
+}
+
+fn custom_simulation_params(
+    method: &str,
+    executor: alloy::primitives::Address,
+    operator: alloy::primitives::Address,
+    calldata: &alloy::primitives::Bytes,
+    gas_quote: &GasQuote,
+) -> serde_json::Value {
+    let call = json!({
+        "from": operator.to_string(),
+        "to": executor.to_string(),
+        "data": calldata.to_string(),
+        "maxFeePerGas": format!("0x{:x}", gas_quote.max_fee_per_gas),
+        "maxPriorityFeePerGas": format!("0x{:x}", gas_quote.max_priority_fee_per_gas),
+    });
+    if method == "eth_simulateV1" {
+        json!([
+            {
+                "blockStateCalls": [
+                    {
+                        "calls": [call],
+                        "stateOverrides": {}
+                    }
+                ],
+                "traceTransfers": false,
+                "validation": false
+            },
+            "pending"
+        ])
+    } else {
+        json!([call])
+    }
 }
 
 #[cfg(test)]
