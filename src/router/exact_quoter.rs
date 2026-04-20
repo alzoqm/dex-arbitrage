@@ -1,7 +1,7 @@
 use std::{
     collections::{HashMap, VecDeque},
-    sync::Arc,
-    time::Duration,
+    sync::{Arc, OnceLock},
+    time::{Duration, Instant},
 };
 
 use alloy::{
@@ -28,6 +28,7 @@ pub struct ExactQuoter {
     rpc: Arc<RpcClients>,
     quote_cache: Arc<Mutex<QuoteCache>>,
     v3_revert_cache: Arc<Mutex<V3RevertCache>>,
+    v3_direction_blocklist: Arc<Mutex<V3DirectionBlocklist>>,
     curve_underlying_support: Arc<Mutex<HashMap<alloy::primitives::Address, bool>>>,
     use_v3_rpc_quoter: bool,
     use_curve_rpc_quoter: bool,
@@ -53,6 +54,15 @@ struct V3DirectionKey {
     token_out: alloy::primitives::Address,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct PoolDirectionKey {
+    pool_id: alloy::primitives::Address,
+    token_in: alloy::primitives::Address,
+    token_out: alloy::primitives::Address,
+}
+
+static V3_DIRECTION_BLOCKLIST: OnceLock<Arc<Mutex<V3DirectionBlocklist>>> = OnceLock::new();
+
 impl ExactQuoter {
     pub fn new(settings: Arc<crate::config::Settings>, rpc: Arc<RpcClients>) -> Self {
         Self::with_v3_rpc_quoter(
@@ -73,6 +83,7 @@ impl ExactQuoter {
             rpc,
             quote_cache: Arc::new(Mutex::new(QuoteCache::from_env())),
             v3_revert_cache: Arc::new(Mutex::new(V3RevertCache::from_env())),
+            v3_direction_blocklist: shared_v3_direction_blocklist(),
             curve_underlying_support: Arc::new(Mutex::new(HashMap::new())),
             use_v3_rpc_quoter,
             use_curve_rpc_quoter: std::env::var("USE_CURVE_RPC_QUOTER")
@@ -149,6 +160,19 @@ impl ExactQuoter {
                 if pool.token_addresses.len() != 2 {
                     return Ok(0);
                 }
+                let pool_direction_key = PoolDirectionKey {
+                    pool_id: pool.pool_id,
+                    token_in,
+                    token_out,
+                };
+                if self
+                    .v3_direction_blocklist
+                    .lock()
+                    .blocked(&pool_direction_key)
+                {
+                    self.insert_quote(cache_key, 0);
+                    return Ok(0);
+                }
                 if self.use_v3_rpc_quoter {
                     let direction_key = V3DirectionKey {
                         snapshot_id: snapshot.snapshot_id,
@@ -187,11 +211,21 @@ impl ExactQuoter {
                             Ok(amount) => {
                                 if amount > 0 {
                                     self.v3_revert_cache.lock().clear(&direction_key);
+                                    self.v3_direction_blocklist
+                                        .lock()
+                                        .clear(&pool_direction_key);
+                                } else {
+                                    self.v3_direction_blocklist
+                                        .lock()
+                                        .record_failure(pool_direction_key);
                                 }
                                 amount
                             }
                             Err(err) if is_expected_quote_revert(&err) => {
                                 self.v3_revert_cache.lock().record_failure(direction_key);
+                                self.v3_direction_blocklist
+                                    .lock()
+                                    .record_failure(pool_direction_key);
                                 0
                             }
                             Err(err) => return Err(err),
@@ -502,6 +536,49 @@ impl QuoteSegment {
         self.lru.retain(|existing| *existing != key);
         self.lru.push_back(key);
     }
+}
+
+#[derive(Debug)]
+struct V3DirectionBlocklist {
+    ttl: Duration,
+    entries: HashMap<PoolDirectionKey, Instant>,
+}
+
+impl V3DirectionBlocklist {
+    fn from_env() -> Self {
+        Self {
+            ttl: Duration::from_secs(env_usize("V3_DIRECTION_BLOCKLIST_SECS", 180) as u64),
+            entries: HashMap::new(),
+        }
+    }
+
+    fn blocked(&mut self, key: &PoolDirectionKey) -> bool {
+        self.prune();
+        self.entries.contains_key(key)
+    }
+
+    fn record_failure(&mut self, key: PoolDirectionKey) {
+        if self.ttl.is_zero() {
+            return;
+        }
+        self.prune();
+        self.entries.insert(key, Instant::now() + self.ttl);
+    }
+
+    fn clear(&mut self, key: &PoolDirectionKey) {
+        self.entries.remove(key);
+    }
+
+    fn prune(&mut self) {
+        let now = Instant::now();
+        self.entries.retain(|_, expires_at| *expires_at > now);
+    }
+}
+
+fn shared_v3_direction_blocklist() -> Arc<Mutex<V3DirectionBlocklist>> {
+    V3_DIRECTION_BLOCKLIST
+        .get_or_init(|| Arc::new(Mutex::new(V3DirectionBlocklist::from_env())))
+        .clone()
 }
 
 #[derive(Debug)]

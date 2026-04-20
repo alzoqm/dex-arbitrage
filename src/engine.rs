@@ -30,7 +30,7 @@ use crate::{
     router::{RouteSearchResult, RouteSearchStats, Router},
     rpc::RpcClients,
     types::{
-        BlockRef, CandidatePath, EdgeRef, ExactPlan, FinalityLevel, PoolSpecificState,
+        AdapterType, BlockRef, CandidatePath, EdgeRef, ExactPlan, FinalityLevel, PoolSpecificState,
         RefreshBatch, SubmissionResult,
     },
 };
@@ -325,22 +325,29 @@ async fn process_refresh(
 
     let validation_top_k = route_validation_top_k();
     let routed_count = routed.len();
-    profitability.route_rank_skipped =
-        routed_count.saturating_sub(validation_top_k.min(routed_count));
+    let verify_scan_limit = route_verify_scan_limit(validation_top_k, routed_count);
     let best_estimated_net_profit_usd_e8 = routed
         .first()
         .map(|route| route.estimated_net_profit_usd_e8)
         .unwrap_or(i128::MIN);
     info!(
         snapshot_id = snapshot.snapshot_id,
-        routed_count, validation_top_k, best_estimated_net_profit_usd_e8, "route ranking complete"
+        routed_count,
+        validation_top_k,
+        verify_scan_limit,
+        best_estimated_net_profit_usd_e8,
+        "route ranking complete"
     );
 
-    for route in routed.into_iter().take(validation_top_k) {
+    let mut scanned_ranked_routes = 0usize;
+    let mut validator_stage_attempts = 0usize;
+    for route in routed.into_iter().take(verify_scan_limit) {
+        scanned_ranked_routes = scanned_ranked_routes.saturating_add(1);
         let result = process_routed_candidate(
             settings.clone(),
             snapshot.as_ref(),
             route,
+            router,
             validator,
             submitter,
             risk,
@@ -349,11 +356,18 @@ async fn process_refresh(
             simulate_only,
         )
         .await?;
+        if result.validator_ms > 0 {
+            validator_stage_attempts = validator_stage_attempts.saturating_add(1);
+        }
         profitability.record(&result);
         if let Some(result) = result.submission {
             info!(tx_hash = %result.tx_hash, channel = %result.channel, "submission accepted");
         }
+        if validator_stage_attempts >= validation_top_k {
+            break;
+        }
     }
+    profitability.route_rank_skipped = routed_count.saturating_sub(scanned_ranked_routes);
     profitability.log(
         &settings,
         snapshot.snapshot_id,
@@ -373,6 +387,79 @@ fn candidate_processing_concurrency(simulate_only: bool) -> usize {
 
 fn route_validation_top_k() -> usize {
     env_usize("ROUTE_VALIDATION_TOP_K", 16).clamp(1, 256)
+}
+
+fn route_verify_scan_limit(validation_top_k: usize, routed_count: usize) -> usize {
+    if routed_count == 0 {
+        return 0;
+    }
+    let multiplier = env_usize("ROUTE_VERIFY_SCAN_MULTIPLIER", 4).max(1);
+    let default_limit = validation_top_k.saturating_mul(multiplier);
+    let hard_limit = env_usize("ROUTE_VERIFY_SCAN_LIMIT", default_limit).max(validation_top_k);
+    default_limit
+        .min(hard_limit)
+        .max(validation_top_k)
+        .min(routed_count)
+}
+
+fn should_verify_ranked_route(plan: &ExactPlan) -> bool {
+    if !env_bool("VERIFY_RANKED_ROUTE_BEFORE_VALIDATION", true) {
+        return false;
+    }
+    if env_bool("VERIFY_RANKED_ROUTE_ALL_ADAPTERS", false) {
+        return true;
+    }
+    plan.hops.iter().any(|hop| {
+        hop.splits
+            .iter()
+            .any(|split| split.adapter_type == AdapterType::UniswapV3Like)
+    })
+}
+
+fn merge_route_search_stats(left: &mut RouteSearchStats, right: RouteSearchStats) {
+    left.amount_range_missing |= right.amount_range_missing;
+    left.evaluated_amounts = left
+        .evaluated_amounts
+        .saturating_add(right.evaluated_amounts);
+    left.no_output_quotes = left.no_output_quotes.saturating_add(right.no_output_quotes);
+    left.no_output_hop0 = left.no_output_hop0.saturating_add(right.no_output_hop0);
+    left.no_output_hop1 = left.no_output_hop1.saturating_add(right.no_output_hop1);
+    left.no_output_hop2 = left.no_output_hop2.saturating_add(right.no_output_hop2);
+    left.no_output_hop3_plus = left
+        .no_output_hop3_plus
+        .saturating_add(right.no_output_hop3_plus);
+    left.no_output_v2 = left.no_output_v2.saturating_add(right.no_output_v2);
+    left.no_output_aerodrome_v2 = left
+        .no_output_aerodrome_v2
+        .saturating_add(right.no_output_aerodrome_v2);
+    left.no_output_v3 = left.no_output_v3.saturating_add(right.no_output_v3);
+    left.no_output_curve = left.no_output_curve.saturating_add(right.no_output_curve);
+    left.no_output_balancer = left
+        .no_output_balancer
+        .saturating_add(right.no_output_balancer);
+    left.gross_nonpositive = left
+        .gross_nonpositive
+        .saturating_add(right.gross_nonpositive);
+    left.flash_fee_nonpositive = left
+        .flash_fee_nonpositive
+        .saturating_add(right.flash_fee_nonpositive);
+    left.profitable_plans = left.profitable_plans.saturating_add(right.profitable_plans);
+    left.fast_sizer_points = left
+        .fast_sizer_points
+        .saturating_add(right.fast_sizer_points);
+    left.used_fast_sizer |= right.used_fast_sizer;
+    left.used_wide_fallback |= right.used_wide_fallback;
+    left.min_amount = match (left.min_amount, right.min_amount) {
+        (0, value) => value,
+        (value, 0) => value,
+        (a, b) => a.min(b),
+    };
+    left.max_amount = left.max_amount.max(right.max_amount);
+    if left.first_no_output_hop.is_none() {
+        left.first_no_output_hop = right.first_no_output_hop;
+        left.first_no_output_pool = right.first_no_output_pool;
+        left.first_no_output_amount_in = right.first_no_output_amount_in;
+    }
 }
 
 fn estimate_prerank_net_profit_usd_e8(
@@ -544,6 +631,7 @@ async fn process_routed_candidate(
     settings: Arc<Settings>,
     snapshot: &GraphSnapshot,
     route: RoutedCandidate,
+    router: &Router,
     validator: &Validator,
     submitter: &Submitter,
     risk: &RiskManager,
@@ -553,12 +641,115 @@ async fn process_routed_candidate(
 ) -> Result<CandidateProcessResult> {
     let RoutedCandidate {
         candidate,
-        plan,
-        route_stats,
-        router_ms,
+        mut plan,
+        mut route_stats,
+        mut router_ms,
         total_started,
         ..
     } = route;
+
+    if should_verify_ranked_route(&plan) {
+        let verify_timeout =
+            Duration::from_millis(env_usize("ROUTE_VERIFY_TIMEOUT_MS", 1_500) as u64);
+        let verify_started = Instant::now();
+        let verified = match tokio::time::timeout(
+            verify_timeout,
+            router.search_best_plan_with_stats(snapshot, &candidate),
+        )
+        .await
+        {
+            Err(_) => {
+                let verify_ms = verify_started.elapsed().as_millis();
+                router_ms = router_ms.saturating_add(verify_ms);
+                telemetry::record_candidate_rejected(
+                    "route_verify_timeout",
+                    settings.chain.as_str(),
+                );
+                debug!(
+                    snapshot_id = snapshot.snapshot_id,
+                    cycle_key = %candidate.cycle_key,
+                    verify_ms,
+                    route_verify_timeout_ms = verify_timeout.as_millis(),
+                    "ranked route verification timed out before validation"
+                );
+                return Ok(CandidateProcessResult::router_timeout(
+                    CandidateVerdict::NoRoute,
+                    None,
+                    None,
+                    route_stats,
+                    router_ms,
+                    0,
+                    total_started.elapsed().as_millis(),
+                ));
+            }
+            Ok(result) => match result {
+                Ok(result) => result,
+                Err(err) => {
+                    let verify_ms = verify_started.elapsed().as_millis();
+                    router_ms = router_ms.saturating_add(verify_ms);
+                    telemetry::record_candidate_rejected(
+                        "route_verify_error",
+                        settings.chain.as_str(),
+                    );
+                    warn!(
+                        error = %err,
+                        snapshot_id = snapshot.snapshot_id,
+                        cycle_key = %candidate.cycle_key,
+                        verify_ms,
+                        "ranked route verification failed before validation"
+                    );
+                    return Ok(CandidateProcessResult::new(
+                        CandidateVerdict::NoRoute,
+                        None,
+                        None,
+                        route_stats,
+                        router_ms,
+                        0,
+                        total_started.elapsed().as_millis(),
+                    ));
+                }
+            },
+        };
+
+        let verify_ms = verify_started.elapsed().as_millis();
+        router_ms = router_ms.saturating_add(verify_ms);
+        let verified_stats = verified.stats;
+        merge_route_search_stats(&mut route_stats, verified_stats.clone());
+        let Some(verified_plan) = verified.plan else {
+            telemetry::record_candidate_rejected("route_verify_no_plan", settings.chain.as_str());
+            info!(
+                snapshot_id = snapshot.snapshot_id,
+                cycle_key = %candidate.cycle_key,
+                route = %format_candidate_route(&candidate),
+                dex_route = %format_candidate_dex_route(&candidate),
+                verify_ms,
+                verify_evaluated_amounts = verified_stats.evaluated_amounts,
+                verify_no_output_quotes = verified_stats.no_output_quotes,
+                verify_no_output_v2 = verified_stats.no_output_v2,
+                verify_no_output_aerodrome_v2 = verified_stats.no_output_aerodrome_v2,
+                verify_no_output_v3 = verified_stats.no_output_v3,
+                verify_no_output_curve = verified_stats.no_output_curve,
+                verify_no_output_balancer = verified_stats.no_output_balancer,
+                verify_first_no_output_hop = verified_stats.first_no_output_hop,
+                verify_first_no_output_pool = ?verified_stats.first_no_output_pool,
+                verify_first_no_output_amount_in = verified_stats.first_no_output_amount_in,
+                verify_gross_nonpositive = verified_stats.gross_nonpositive,
+                verify_flash_fee_nonpositive = verified_stats.flash_fee_nonpositive,
+                verify_profitable_plans = verified_stats.profitable_plans,
+                "ranked route lost profitability during exact verification"
+            );
+            return Ok(CandidateProcessResult::new(
+                CandidateVerdict::NoRoute,
+                None,
+                None,
+                route_stats,
+                router_ms,
+                0,
+                total_started.elapsed().as_millis(),
+            ));
+        };
+        plan = verified_plan;
+    }
 
     let validator_started = Instant::now();
     let prepared = match validator.prepare(plan, snapshot).await {
@@ -1716,6 +1907,17 @@ fn env_usize(key: &str, default: usize) -> usize {
     std::env::var(key)
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(default)
+}
+
+fn env_bool(key: &str, default: bool) -> bool {
+    std::env::var(key)
+        .ok()
+        .and_then(|value| match value.trim().to_ascii_lowercase().as_str() {
+            "1" | "true" | "yes" | "on" => Some(true),
+            "0" | "false" | "no" | "off" => Some(false),
+            _ => None,
+        })
         .unwrap_or(default)
 }
 

@@ -238,6 +238,45 @@ fn token_pair_failure_keys(plan: &ExactPlan) -> Vec<String> {
         .collect()
 }
 
+fn plan_split_count(plan: &ExactPlan) -> usize {
+    plan.hops.iter().map(|hop| hop.splits.len()).sum()
+}
+
+fn format_plan_token_route(plan: &ExactPlan) -> String {
+    let mut parts = Vec::with_capacity(plan.hops.len() + 1);
+    parts.push(plan.input_token.to_string());
+    parts.extend(plan.hops.iter().map(|hop| hop.token_out.to_string()));
+    parts.join(">")
+}
+
+fn format_plan_dex_route(plan: &ExactPlan) -> String {
+    plan.hops
+        .iter()
+        .map(|hop| {
+            hop.splits
+                .iter()
+                .map(|split| split.dex_name.as_str())
+                .collect::<Vec<_>>()
+                .join("+")
+        })
+        .collect::<Vec<_>>()
+        .join(">")
+}
+
+fn format_plan_pool_route(plan: &ExactPlan) -> String {
+    plan.hops
+        .iter()
+        .map(|hop| {
+            hop.splits
+                .iter()
+                .map(|split| split.pool_id.to_string())
+                .collect::<Vec<_>>()
+                .join("+")
+        })
+        .collect::<Vec<_>>()
+        .join(">")
+}
+
 impl Validator {
     pub fn new(settings: Arc<Settings>, rpc: Arc<RpcClients>) -> Self {
         let gas_tracker = GasTracker::new(&settings);
@@ -298,6 +337,16 @@ impl Validator {
         plan.flash_fee_raw = choice.flash_fee_raw;
         plan.actual_flash_fee_raw = choice.actual_flash_fee_raw;
         plan.net_profit_before_gas_raw = choice.net_profit_before_gas_raw;
+
+        if let Some(reason) = self.failure_cache.lock().skip_reason(&plan) {
+            debug!(
+                input_token = %plan.input_token,
+                input_amount = plan.input_amount,
+                reason = %reason,
+                "validator failure cache skipped known-bad route before gas pricing"
+            );
+            return Ok(None);
+        }
 
         // Step 2: Build preliminary calldata with contract min profit
         plan.contract_min_profit_raw = calculate_contract_min_profit_raw(
@@ -475,16 +524,6 @@ impl Validator {
         // Rebuild calldata with final contract_min_profit_raw
         let calldata = self.tx_builder.build_calldata(&plan, deadline_unix)?;
 
-        if let Some(reason) = self.failure_cache.lock().skip_reason(&plan) {
-            debug!(
-                input_token = %plan.input_token,
-                input_amount = plan.input_amount,
-                reason = %reason,
-                "validator failure cache skipped known-bad route"
-            );
-            return Ok(None);
-        }
-
         // Step 7: Simulation
         let simulation_started = Instant::now();
         let simulation = self
@@ -505,12 +544,35 @@ impl Validator {
                     "simulation failed plan details"
                 );
             }
-            warn!(
-                input_token = %plan.input_token,
-                input_amount = plan.input_amount,
-                net_profit_usd_e8 = net_profit_usd_e8,
-                "simulation failed for executable plan"
-            );
+            let reason = simulation
+                .reason
+                .as_deref()
+                .map(normalize_failure_reason)
+                .unwrap_or("unknown");
+            if env_bool("LOG_VALIDATION_FAILURE_SUMMARY", true) {
+                warn!(
+                    reason = %reason,
+                    input_token = %plan.input_token,
+                    input_amount = plan.input_amount,
+                    net_profit_usd_e8 = net_profit_usd_e8,
+                    gross_profit_raw = plan.gross_profit_raw,
+                    flash_fee_raw = plan.actual_flash_fee_raw,
+                    hop_count = plan.hops.len(),
+                    split_count = plan_split_count(&plan),
+                    token_route = %format_plan_token_route(&plan),
+                    dex_route = %format_plan_dex_route(&plan),
+                    pool_route = %format_plan_pool_route(&plan),
+                    "simulation failed for executable plan"
+                );
+            } else {
+                warn!(
+                    reason = %reason,
+                    input_token = %plan.input_token,
+                    input_amount = plan.input_amount,
+                    net_profit_usd_e8 = net_profit_usd_e8,
+                    "simulation failed for executable plan"
+                );
+            }
             return Ok(None);
         }
 
