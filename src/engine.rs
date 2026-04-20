@@ -4,7 +4,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use alloy::primitives::Address;
+use alloy::primitives::{Address, U256};
 use anyhow::{Context, Result};
 use futures::stream::{self, StreamExt};
 use tokio::time::sleep;
@@ -22,8 +22,12 @@ use crate::{
     graph::{DistanceCache, GraphSnapshot, GraphStore},
     monitoring::metrics as telemetry,
     reorg::{ReorgDetector, ReorgEvent},
-    risk::{depeg_guard::DepegGuard, limits::RiskManager, valuation::amount_to_usd_e8},
-    router::{RouteSearchStats, Router},
+    risk::{
+        depeg_guard::DepegGuard,
+        limits::RiskManager,
+        valuation::{amount_to_usd_e8, native_gas_to_usd_e8},
+    },
+    router::{RouteSearchResult, RouteSearchStats, Router},
     rpc::RpcClients,
     types::{
         BlockRef, CandidatePath, EdgeRef, ExactPlan, FinalityLevel, PoolSpecificState,
@@ -255,7 +259,7 @@ async fn process_refresh(
 
     let distance_cache = DistanceCache::recompute(snapshot.as_ref());
     let detect_started = Instant::now();
-    let mut candidates = detector.detect(snapshot.as_ref(), &changed_edges, &distance_cache);
+    let candidates = detector.detect(snapshot.as_ref(), &changed_edges, &distance_cache);
     let detect_ms = detect_started.elapsed().as_millis();
     for _ in &candidates {
         telemetry::record_candidate_detected(snapshot.snapshot_id, settings.chain.as_str());
@@ -270,14 +274,12 @@ async fn process_refresh(
     if candidates.is_empty() {
         return Ok(());
     }
-    candidates.sort_by_key(|candidate| candidate.screening_score_q32);
-
     info!(
         snapshot_id = snapshot.snapshot_id,
         candidate_count = candidates.len(),
         changed_edge_count = changed_edges.len(),
         simulate_only,
-        "processing candidate set"
+        "routing candidate set before ranking"
     );
 
     let refresh_started = Instant::now();
@@ -286,69 +288,70 @@ async fn process_refresh(
     let mut no_route_samples = 0usize;
     let candidate_concurrency = candidate_processing_concurrency(simulate_only);
 
-    if candidate_concurrency <= 1 {
-        for candidate in candidates {
-            let result = process_candidate(
-                settings.clone(),
-                snapshot.as_ref(),
-                candidate.clone(),
-                router,
-                validator,
-                submitter,
-                risk,
-                depeg_guard,
-                nonce_manager,
-                simulate_only,
-            )
-            .await?;
-            maybe_log_no_route_sample(
-                snapshot.snapshot_id,
-                &candidate,
-                &result,
-                no_route_sample_limit,
-                &mut no_route_samples,
-            );
-            profitability.record(&result);
-            if let Some(result) = result.submission {
-                info!(tx_hash = %result.tx_hash, channel = %result.channel, "submission accepted");
+    let mut routed = Vec::<RoutedCandidate>::new();
+    let mut route_results = stream::iter(candidates.into_iter().map(|candidate| {
+        let settings = settings.clone();
+        let snapshot = snapshot.clone();
+        async move { route_candidate(settings, snapshot.as_ref(), candidate, router).await }
+    }))
+    .buffer_unordered(candidate_concurrency);
+
+    while let Some(item) = route_results.next().await {
+        match item? {
+            RouteCandidateOutcome::Routed(route) => routed.push(route),
+            RouteCandidateOutcome::Rejected { candidate, result } => {
+                maybe_log_no_route_sample(
+                    snapshot.snapshot_id,
+                    &candidate,
+                    &result,
+                    no_route_sample_limit,
+                    &mut no_route_samples,
+                );
+                profitability.record(&result);
             }
         }
-    } else {
-        let mut results = stream::iter(candidates.into_iter().map(|candidate| {
-            let settings = settings.clone();
-            let snapshot = snapshot.clone();
-            async move {
-                let result = process_candidate(
-                    settings,
-                    snapshot.as_ref(),
-                    candidate.clone(),
-                    router,
-                    validator,
-                    submitter,
-                    risk,
-                    depeg_guard,
-                    nonce_manager,
-                    simulate_only,
-                )
-                .await;
-                result.map(|result| (candidate, result))
-            }
-        }))
-        .buffer_unordered(candidate_concurrency);
+    }
 
-        while let Some(item) = results.next().await {
-            let (candidate, result) = item?;
-            maybe_log_no_route_sample(
-                snapshot.snapshot_id,
-                &candidate,
-                &result,
-                no_route_sample_limit,
-                &mut no_route_samples,
-            );
-            profitability.record(&result);
-            if let Some(result) = result.submission {
-                info!(tx_hash = %result.tx_hash, channel = %result.channel, "submission accepted");
-            }
+    for route in &mut routed {
+        route.estimated_net_profit_usd_e8 =
+            estimate_prerank_net_profit_usd_e8(&route.plan, snapshot.as_ref(), &settings);
+    }
+    routed.sort_by(|a, b| {
+        b.estimated_net_profit_usd_e8
+            .cmp(&a.estimated_net_profit_usd_e8)
+            .then_with(|| b.plan.expected_profit.cmp(&a.plan.expected_profit))
+            .then_with(|| a.candidate.path.len().cmp(&b.candidate.path.len()))
+    });
+
+    let validation_top_k = route_validation_top_k();
+    let routed_count = routed.len();
+    profitability.route_rank_skipped =
+        routed_count.saturating_sub(validation_top_k.min(routed_count));
+    let best_estimated_net_profit_usd_e8 = routed
+        .first()
+        .map(|route| route.estimated_net_profit_usd_e8)
+        .unwrap_or(i128::MIN);
+    info!(
+        snapshot_id = snapshot.snapshot_id,
+        routed_count, validation_top_k, best_estimated_net_profit_usd_e8, "route ranking complete"
+    );
+
+    for route in routed.into_iter().take(validation_top_k) {
+        let result = process_routed_candidate(
+            settings.clone(),
+            snapshot.as_ref(),
+            route,
+            validator,
+            submitter,
+            risk,
+            depeg_guard,
+            nonce_manager,
+            simulate_only,
+        )
+        .await?;
+        profitability.record(&result);
+        if let Some(result) = result.submission {
+            info!(tx_hash = %result.tx_hash, channel = %result.channel, "submission accepted");
         }
     }
     profitability.log(
@@ -366,6 +369,462 @@ fn candidate_processing_concurrency(simulate_only: bool) -> usize {
         return 1;
     }
     env_usize("ROUTE_CANDIDATE_CONCURRENCY", 16).clamp(1, 64)
+}
+
+fn route_validation_top_k() -> usize {
+    env_usize("ROUTE_VALIDATION_TOP_K", 16).clamp(1, 256)
+}
+
+fn estimate_prerank_net_profit_usd_e8(
+    plan: &ExactPlan,
+    snapshot: &GraphSnapshot,
+    settings: &Settings,
+) -> i128 {
+    let Some(input_token) = snapshot
+        .tokens
+        .iter()
+        .find(|token| token.address == plan.input_token)
+    else {
+        return i128::MIN;
+    };
+    let Some(gross_profit_usd_e8) =
+        amount_to_usd_e8(plan.gross_profit_raw.unsigned_abs(), input_token)
+    else {
+        return i128::MIN;
+    };
+    let gross_profit_usd_e8 = if plan.gross_profit_raw >= 0 {
+        i128::try_from(gross_profit_usd_e8).unwrap_or(i128::MAX)
+    } else {
+        -i128::try_from(gross_profit_usd_e8).unwrap_or(i128::MAX)
+    };
+    let flash_fee_usd_e8 = amount_to_usd_e8(plan.flash_fee_raw, input_token)
+        .and_then(|value| i128::try_from(value).ok())
+        .unwrap_or(i128::MAX);
+    let gas_cost_usd_e8 =
+        estimate_prerank_gas_cost_usd_e8(plan, snapshot, settings).unwrap_or(i128::MAX);
+
+    gross_profit_usd_e8
+        .saturating_sub(flash_fee_usd_e8)
+        .saturating_sub(gas_cost_usd_e8)
+}
+
+fn estimate_prerank_gas_cost_usd_e8(
+    plan: &ExactPlan,
+    snapshot: &GraphSnapshot,
+    settings: &Settings,
+) -> Option<i128> {
+    let native_symbol = match settings.chain {
+        crate::types::Chain::Base => "WETH",
+        crate::types::Chain::Polygon => "WMATIC",
+    };
+    let native = snapshot
+        .tokens
+        .iter()
+        .find(|token| token.symbol.eq_ignore_ascii_case(native_symbol))?;
+    let native_price = native.manual_price_usd_e8?;
+    let gas_price = env_u128(
+        "PRE_RANK_GAS_PRICE_WEI",
+        settings.risk.gas_price_ceiling_wei,
+    );
+    let gas_limit = plan
+        .gas_limit
+        .saturating_add(env_usize("PRE_RANK_FLASH_GAS_OVERHEAD", 180_000) as u64);
+    let gas_cost_wei = U256::from(gas_price).saturating_mul(U256::from(gas_limit));
+    native_gas_to_usd_e8(gas_cost_wei, native_price, native.decimals)
+        .and_then(|value| i128::try_from(value).ok())
+}
+
+#[derive(Debug)]
+struct RoutedCandidate {
+    candidate: CandidatePath,
+    plan: ExactPlan,
+    route_stats: RouteSearchStats,
+    router_ms: u128,
+    total_started: Instant,
+    estimated_net_profit_usd_e8: i128,
+}
+
+#[derive(Debug)]
+enum RouteCandidateOutcome {
+    Routed(RoutedCandidate),
+    Rejected {
+        candidate: CandidatePath,
+        result: CandidateProcessResult,
+    },
+}
+
+async fn route_candidate(
+    settings: Arc<Settings>,
+    snapshot: &GraphSnapshot,
+    candidate: CandidatePath,
+    router: &Router,
+) -> Result<RouteCandidateOutcome> {
+    let total_started = Instant::now();
+    let router_started = Instant::now();
+    let route_timeout = Duration::from_millis(env_usize("ROUTE_SEARCH_TIMEOUT_MS", 3_000) as u64);
+    let route_result = match tokio::time::timeout(
+        route_timeout,
+        router.search_best_plan_with_stats(snapshot, &candidate),
+    )
+    .await
+    {
+        Err(_) => {
+            let router_ms = router_started.elapsed().as_millis();
+            telemetry::record_candidate_rejected("router_timeout", settings.chain.as_str());
+            return Ok(RouteCandidateOutcome::Rejected {
+                candidate,
+                result: CandidateProcessResult::router_timeout(
+                    CandidateVerdict::NoRoute,
+                    None,
+                    None,
+                    RouteSearchStats::default(),
+                    router_ms,
+                    0,
+                    total_started.elapsed().as_millis(),
+                ),
+            });
+        }
+        Ok(result) => match result {
+            Ok(result) => result,
+            Err(err) => {
+                let router_ms = router_started.elapsed().as_millis();
+                warn!(
+                    error = %err,
+                    snapshot_id = snapshot.snapshot_id,
+                    cycle_key = %candidate.cycle_key,
+                    router_ms,
+                    "route search failed; rejecting candidate without stopping engine"
+                );
+                telemetry::record_candidate_rejected("router_error", settings.chain.as_str());
+                return Ok(RouteCandidateOutcome::Rejected {
+                    candidate,
+                    result: CandidateProcessResult::new(
+                        CandidateVerdict::NoRoute,
+                        None,
+                        None,
+                        RouteSearchStats::default(),
+                        router_ms,
+                        0,
+                        total_started.elapsed().as_millis(),
+                    ),
+                });
+            }
+        },
+    };
+
+    let RouteSearchResult { plan, stats } = route_result;
+    let router_ms = router_started.elapsed().as_millis();
+    let Some(plan) = plan else {
+        return Ok(RouteCandidateOutcome::Rejected {
+            candidate,
+            result: CandidateProcessResult::new(
+                CandidateVerdict::NoRoute,
+                None,
+                None,
+                stats,
+                router_ms,
+                0,
+                total_started.elapsed().as_millis(),
+            ),
+        });
+    };
+
+    Ok(RouteCandidateOutcome::Routed(RoutedCandidate {
+        candidate,
+        plan,
+        route_stats: stats,
+        router_ms,
+        total_started,
+        estimated_net_profit_usd_e8: i128::MIN,
+    }))
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn process_routed_candidate(
+    settings: Arc<Settings>,
+    snapshot: &GraphSnapshot,
+    route: RoutedCandidate,
+    validator: &Validator,
+    submitter: &Submitter,
+    risk: &RiskManager,
+    depeg_guard: &DepegGuard,
+    nonce_manager: &NonceManager,
+    simulate_only: bool,
+) -> Result<CandidateProcessResult> {
+    let RoutedCandidate {
+        candidate,
+        plan,
+        route_stats,
+        router_ms,
+        total_started,
+        ..
+    } = route;
+
+    let validator_started = Instant::now();
+    let prepared = match validator.prepare(plan, snapshot).await {
+        Ok(prepared) => prepared,
+        Err(err) => {
+            let validator_ms = validator_started.elapsed().as_millis();
+            warn!(
+                error = %err,
+                snapshot_id = snapshot.snapshot_id,
+                cycle_key = %candidate.cycle_key,
+                router_ms,
+                validator_ms,
+                "candidate validation failed; rejecting candidate without stopping engine"
+            );
+            telemetry::record_candidate_rejected("validation_error", settings.chain.as_str());
+            return Ok(CandidateProcessResult::new(
+                CandidateVerdict::ValidationRejected,
+                None,
+                None,
+                route_stats,
+                router_ms,
+                validator_ms,
+                total_started.elapsed().as_millis(),
+            ));
+        }
+    };
+    let Some(mut executable) = prepared else {
+        telemetry::record_candidate_rejected("validation", settings.chain.as_str());
+        return Ok(CandidateProcessResult::new(
+            CandidateVerdict::ValidationRejected,
+            None,
+            None,
+            route_stats,
+            router_ms,
+            validator_started.elapsed().as_millis(),
+            total_started.elapsed().as_millis(),
+        ));
+    };
+    let validator_ms = validator_started.elapsed().as_millis();
+    telemetry::record_candidate_validated(executable.exact.snapshot_id, settings.chain.as_str());
+    telemetry::record_opportunity_found(
+        executable.exact.snapshot_id,
+        i128_to_i64_saturating(executable.exact.net_profit_usd_e8),
+        settings.chain.as_str(),
+    );
+    telemetry::record_pnl_expected(
+        i128_to_i64_saturating(executable.exact.net_profit_usd_e8),
+        settings.chain.as_str(),
+    );
+    telemetry::record_opportunity_profitability(
+        settings.chain.as_str(),
+        i128_to_i64_saturating(executable.exact.net_profit_usd_e8),
+        i128_to_i64_saturating(executable.exact.gross_profit_usd_e8),
+        i128_to_i64_saturating(executable.exact.gas_cost_usd_e8),
+        i128_to_i64_saturating(executable.exact.actual_flash_fee_usd_e8),
+        u128_to_u64_saturating(executable.exact.input_value_usd_e8),
+        ratio_bps(
+            executable.exact.net_profit_usd_e8,
+            executable.exact.input_value_usd_e8,
+        ),
+        ratio_bps(
+            executable.exact.gas_cost_usd_e8,
+            executable.exact.gross_profit_usd_e8.max(0) as u128,
+        ),
+    );
+    telemetry::record_route_latency_seconds("router", millis_to_secs(router_ms));
+    telemetry::record_route_latency_seconds("validator", millis_to_secs(validator_ms));
+    telemetry::record_route_latency_seconds(
+        "candidate_total",
+        millis_to_secs(total_started.elapsed().as_millis()),
+    );
+
+    for hop in &executable.exact.hops {
+        for pool_address in [&hop.token_in, &hop.token_out] {
+            if !depeg_guard.token_is_healthy(*pool_address) {
+                telemetry::record_candidate_rejected("depeg", settings.chain.as_str());
+                return Ok(CandidateProcessResult::new(
+                    CandidateVerdict::DepegRejected,
+                    None,
+                    Some(executable.exact.clone()),
+                    route_stats,
+                    router_ms,
+                    validator_ms,
+                    total_started.elapsed().as_millis(),
+                ));
+            }
+        }
+    }
+
+    if let Err(err) = risk.pre_trade_check(&executable) {
+        debug!(error = %err, path_len = candidate.path.len(), "risk pre-trade check rejected plan");
+        telemetry::record_candidate_rejected("risk", settings.chain.as_str());
+        return Ok(CandidateProcessResult::new(
+            CandidateVerdict::RiskRejected,
+            None,
+            Some(executable.exact),
+            route_stats,
+            router_ms,
+            validator_ms,
+            total_started.elapsed().as_millis(),
+        ));
+    }
+
+    if simulate_only {
+        let total_ms = total_started.elapsed().as_millis();
+        info!(
+            chain = %settings.chain,
+            snapshot_id = executable.exact.snapshot_id,
+            anchor_symbol = %candidate.start_symbol,
+            route = %format_candidate_route(&candidate),
+            dex_route = %format_candidate_dex_route(&candidate),
+            input_token = %candidate.start_token,
+            path_len = candidate.path.len(),
+            input_amount = executable.exact.input_amount,
+            output_amount = executable.exact.output_amount,
+            gross_profit_raw = executable.exact.gross_profit_raw,
+            gross_profit_usd_e8 = executable.exact.gross_profit_usd_e8,
+            flash_fee_raw = executable.exact.flash_fee_raw,
+            flash_fee_usd_e8 = executable.exact.flash_fee_usd_e8,
+            flash_loan_amount = executable.exact.flash_loan_amount,
+            flash_loan_value_usd_e8 = executable.exact.flash_loan_value_usd_e8,
+            actual_flash_fee_raw = executable.exact.actual_flash_fee_raw,
+            actual_flash_fee_usd_e8 = executable.exact.actual_flash_fee_usd_e8,
+            gas_cost_usd_e8 = executable.exact.gas_cost_usd_e8,
+            gas_l2_execution_cost_wei = %executable.exact.gas_l2_execution_cost_wei,
+            gas_l1_data_fee_wei = %executable.exact.gas_l1_data_fee_wei,
+            gas_total_cost_wei = %executable.exact.gas_cost_wei,
+            net_profit_usd_e8 = executable.exact.net_profit_usd_e8,
+            profit_margin_bps = ratio_bps(executable.exact.net_profit_usd_e8, executable.exact.input_value_usd_e8),
+            gas_to_gross_bps = ratio_bps(
+                executable.exact.gas_cost_usd_e8,
+                executable.exact.gross_profit_usd_e8.max(0) as u128,
+            ),
+            contract_min_profit_raw = executable.exact.contract_min_profit_raw,
+            capital_source = ?executable.exact.capital_source,
+            router_ms,
+            validator_ms,
+            candidate_total_ms = total_ms,
+            "validated opportunity (simulation only)"
+        );
+        return Ok(CandidateProcessResult::new(
+            CandidateVerdict::Simulated,
+            None,
+            Some(executable.exact),
+            route_stats,
+            router_ms,
+            validator_ms,
+            total_ms,
+        ));
+    }
+
+    executable.nonce = nonce_manager.reserve();
+    risk.mark_submitted();
+
+    match submitter.submit(&executable).await {
+        Ok(result) => {
+            telemetry::record_transaction_submitted(
+                &result.tx_hash.to_string(),
+                &result.channel,
+                settings.chain.as_str(),
+            );
+            nonce_manager.mark_submitted(
+                executable.nonce,
+                result.tx_hash,
+                executable.max_priority_fee_per_gas,
+                executable.max_fee_per_gas,
+            );
+            risk.on_submission_result(&result);
+            match submitter.wait_for_receipt(result.tx_hash).await {
+                Ok(ReceiptOutcome::Included) => {
+                    nonce_manager.mark_included(executable.nonce);
+                    let realized = i128_to_i64_saturating(executable.exact.net_profit_usd_e8);
+                    risk.mark_finalized(i128::from(realized));
+                    telemetry::record_transaction_included(
+                        &result.tx_hash.to_string(),
+                        settings.chain.as_str(),
+                        executable.exact.gas_limit,
+                    );
+                    telemetry::record_pnl_realized(realized, settings.chain.as_str());
+                    Ok(CandidateProcessResult::new(
+                        CandidateVerdict::Submitted,
+                        Some(result),
+                        Some(executable.exact),
+                        route_stats,
+                        router_ms,
+                        validator_ms,
+                        total_started.elapsed().as_millis(),
+                    ))
+                }
+                Ok(ReceiptOutcome::Reverted) => {
+                    nonce_manager.mark_included(executable.nonce);
+                    risk.mark_finalized(-executable.exact.gas_cost_usd_e8);
+                    telemetry::record_transaction_reverted(
+                        &result.tx_hash.to_string(),
+                        settings.chain.as_str(),
+                        "receipt_status_0",
+                    );
+                    telemetry::record_pnl_realized(
+                        i128_to_i64_saturating(-executable.exact.gas_cost_usd_e8),
+                        settings.chain.as_str(),
+                    );
+                    warn!(tx_hash = %result.tx_hash, nonce = executable.nonce, "submitted transaction reverted");
+                    Ok(CandidateProcessResult::new(
+                        CandidateVerdict::SubmissionRejected,
+                        None,
+                        Some(executable.exact),
+                        route_stats,
+                        router_ms,
+                        validator_ms,
+                        total_started.elapsed().as_millis(),
+                    ))
+                }
+                Ok(ReceiptOutcome::TimedOut) => {
+                    risk.mark_failed_submission();
+                    telemetry::record_transaction_failed(
+                        &result.tx_hash.to_string(),
+                        settings.chain.as_str(),
+                        "receipt_timeout",
+                    );
+                    warn!(tx_hash = %result.tx_hash, nonce = executable.nonce, "submitted transaction receipt wait timed out");
+                    Ok(CandidateProcessResult::new(
+                        CandidateVerdict::SubmissionRejected,
+                        None,
+                        Some(executable.exact),
+                        route_stats,
+                        router_ms,
+                        validator_ms,
+                        total_started.elapsed().as_millis(),
+                    ))
+                }
+                Err(err) => {
+                    risk.mark_failed_submission();
+                    telemetry::record_transaction_failed(
+                        &result.tx_hash.to_string(),
+                        settings.chain.as_str(),
+                        "receipt_error",
+                    );
+                    warn!(error = %err, tx_hash = %result.tx_hash, nonce = executable.nonce, "failed while waiting for transaction receipt");
+                    Ok(CandidateProcessResult::new(
+                        CandidateVerdict::SubmissionRejected,
+                        None,
+                        Some(executable.exact),
+                        route_stats,
+                        router_ms,
+                        validator_ms,
+                        total_started.elapsed().as_millis(),
+                    ))
+                }
+            }
+        }
+        Err(err) => {
+            nonce_manager.mark_dropped(executable.nonce);
+            risk.mark_failed_submission();
+            telemetry::record_candidate_rejected("submission", settings.chain.as_str());
+            warn!(error = %err, nonce = executable.nonce, "submission failed");
+            Ok(CandidateProcessResult::new(
+                CandidateVerdict::SubmissionRejected,
+                None,
+                Some(executable.exact),
+                route_stats,
+                router_ms,
+                validator_ms,
+                total_started.elapsed().as_millis(),
+            ))
+        }
+    }
 }
 
 fn maybe_log_no_route_sample(
@@ -422,6 +881,7 @@ fn maybe_log_no_route_sample(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[allow(dead_code)]
 async fn process_candidate(
     settings: Arc<Settings>,
     snapshot: &GraphSnapshot,
@@ -874,6 +1334,7 @@ struct ProfitabilityRefreshStats {
     route_fast_sizer_points: usize,
     route_used_fast_sizer: usize,
     route_used_wide_fallback: usize,
+    route_rank_skipped: usize,
     best: Option<BestProfit>,
 }
 
@@ -1069,6 +1530,7 @@ impl ProfitabilityRefreshStats {
                 route_fast_sizer_points = self.route_fast_sizer_points,
                 route_used_fast_sizer = self.route_used_fast_sizer,
                 route_used_wide_fallback = self.route_used_wide_fallback,
+                route_rank_skipped = self.route_rank_skipped,
                 refresh_total_ms = refresh_duration.as_millis(),
                 "profitability refresh summary"
             );
@@ -1108,6 +1570,7 @@ impl ProfitabilityRefreshStats {
                 route_fast_sizer_points = self.route_fast_sizer_points,
                 route_used_fast_sizer = self.route_used_fast_sizer,
                 route_used_wide_fallback = self.route_used_wide_fallback,
+                route_rank_skipped = self.route_rank_skipped,
                 refresh_total_ms = refresh_duration.as_millis(),
                 "profitability refresh summary"
             );
@@ -1253,6 +1716,14 @@ fn env_usize(key: &str, default: usize) -> usize {
     std::env::var(key)
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(default)
+}
+
+fn env_u128(key: &str, default: u128) -> u128 {
+    std::env::var(key)
+        .ok()
+        .and_then(|value| value.parse::<u128>().ok())
+        .filter(|value| *value > 0)
         .unwrap_or(default)
 }
 

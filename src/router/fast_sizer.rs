@@ -327,6 +327,7 @@ mod tests {
             start_symbol: "A".to_string(),
             screening_score_q32: 0,
             route_capacity_usd_e8: 0,
+            route_quality_bps: 10_000,
             cycle_key: "A-B-A".to_string(),
             path: smallvec![
                 CandidateHop {

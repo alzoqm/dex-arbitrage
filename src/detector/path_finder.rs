@@ -456,6 +456,7 @@ impl PathFinder {
         let route_capacity_usd_e8 = route_start_capacity_raw(snapshot, edge_refs)
             .and_then(|capacity| amount_to_usd_e8(capacity, &snapshot.tokens[anchor_idx]))
             .unwrap_or(0);
+        let route_quality_bps = route_quality_bps(snapshot, anchor_idx, edge_refs);
 
         Some(CandidatePath {
             snapshot_id: snapshot.snapshot_id,
@@ -463,6 +464,7 @@ impl PathFinder {
             start_symbol: snapshot.tokens[anchor_idx].symbol.clone(),
             screening_score_q32: score_q32,
             route_capacity_usd_e8,
+            route_quality_bps,
             cycle_key: key,
             path,
         })
@@ -588,7 +590,8 @@ fn candidate_profit_potential_usd_e8(candidate: &CandidatePath) -> u128 {
     candidate
         .route_capacity_usd_e8
         .saturating_mul(screening_edge_bps(candidate.screening_score_q32))
-        / 10_000
+        .saturating_mul(candidate.route_quality_bps as u128)
+        / 100_000_000
 }
 
 fn screening_edge_bps(score_q32: i64) -> u128 {
@@ -597,6 +600,38 @@ fn screening_edge_bps(score_q32: i64) -> u128 {
     }
     let edge = score_q32.unsigned_abs() as u128;
     edge.saturating_mul(10_000) / (1u128 << 32)
+}
+
+fn route_quality_bps(snapshot: &GraphSnapshot, anchor_idx: usize, edge_refs: &[EdgeRef]) -> u16 {
+    let mut quality = token_quality_bps(&snapshot.tokens[anchor_idx]);
+    for &edge_ref in edge_refs {
+        let Some(edge) = snapshot.edge(edge_ref) else {
+            continue;
+        };
+        let Some(token) = snapshot.tokens.get(edge.to) else {
+            continue;
+        };
+        quality = quality.min(token_quality_bps(token));
+    }
+    let extra_hops = edge_refs.len().saturating_sub(2) as u16;
+    let hop_penalty_bps = extra_hops.saturating_mul(750);
+    quality.saturating_sub(hop_penalty_bps).max(500)
+}
+
+fn token_quality_bps(token: &crate::types::TokenInfo) -> u16 {
+    if token.behavior.is_exotic() {
+        return 1_000;
+    }
+    if token.manual_price_usd_e8.is_some() {
+        return 10_000;
+    }
+    if token.is_stable || token.allow_self_funded {
+        return 8_000;
+    }
+    if token.flash_loan_enabled {
+        return 6_000;
+    }
+    1_500
 }
 
 fn candidate_token_cycle_key(candidate: &CandidatePath) -> String {
@@ -741,6 +776,7 @@ mod tests {
             start_symbol: "A".to_string(),
             screening_score_q32: 0,
             route_capacity_usd_e8: 0,
+            route_quality_bps: 10_000,
             cycle_key: "cycle".to_string(),
             path,
         };
@@ -772,6 +808,7 @@ mod tests {
             start_symbol: "A".to_string(),
             screening_score_q32: score,
             route_capacity_usd_e8: 1_000_000_000,
+            route_quality_bps: 10_000,
             cycle_key: format!("cycle-{pool_byte}"),
             path: smallvec![
                 CandidateHop {
@@ -797,6 +834,42 @@ mod tests {
         assert_eq!(selected.len(), 2);
         assert_eq!(selected[0].cycle_key, "cycle-3");
         assert_eq!(selected[1].cycle_key, "cycle-2");
+    }
+
+    #[test]
+    fn finalize_ranks_by_profit_potential_before_spot_edge() {
+        let candidate = |score: i64, capacity: u128, key: &str| CandidatePath {
+            snapshot_id: 1,
+            start_token: addr(1),
+            start_symbol: "A".to_string(),
+            screening_score_q32: score,
+            route_capacity_usd_e8: capacity,
+            route_quality_bps: 10_000,
+            cycle_key: key.to_string(),
+            path: smallvec![
+                CandidateHop {
+                    from: addr(1),
+                    to: addr(2),
+                    pool_id: addr(key.as_bytes()[0]),
+                    amm_kind: AmmKind::UniswapV2Like,
+                    dex_name: "dex".to_string(),
+                },
+                CandidateHop {
+                    from: addr(2),
+                    to: addr(1),
+                    pool_id: addr(key.as_bytes()[0] + 10),
+                    amm_kind: AmmKind::UniswapV2Like,
+                    dex_name: "dex".to_string(),
+                },
+            ],
+        };
+        let high_percent_dust = candidate(-8_000_000_000, 10_000_000, "dust");
+        let lower_percent_liquid = candidate(-1_000_000_000, 10_000_000_000, "liquid");
+        let mut candidates = vec![high_percent_dust, lower_percent_liquid];
+
+        let selected = finalize_candidates_with_tuning(&mut candidates, 1, 1, 1, false);
+
+        assert_eq!(selected[0].cycle_key, "liquid");
     }
 
     #[test]
