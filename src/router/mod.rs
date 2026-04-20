@@ -151,6 +151,25 @@ impl Router {
         snapshot: &GraphSnapshot,
         candidate: &CandidatePath,
     ) -> Result<RouteSearchResult> {
+        self.search_best_plan_with_stats_mode(snapshot, candidate, true)
+            .await
+    }
+
+    pub async fn search_prerank_plan_with_stats(
+        &self,
+        snapshot: &GraphSnapshot,
+        candidate: &CandidatePath,
+    ) -> Result<RouteSearchResult> {
+        self.search_best_plan_with_stats_mode(snapshot, candidate, false)
+            .await
+    }
+
+    async fn search_best_plan_with_stats_mode(
+        &self,
+        snapshot: &GraphSnapshot,
+        candidate: &CandidatePath,
+        verify_final_plan: bool,
+    ) -> Result<RouteSearchResult> {
         let mut stats = RouteSearchStats::default();
         let mut best = None::<ExactPlan>;
         let premium_ppm = self.flash.premium_ppm().await?;
@@ -177,8 +196,8 @@ impl Router {
             .await?
         {
             stats.used_fast_sizer = true;
-            let plan = self
-                .verify_best_plan(
+            let plan = if verify_final_plan {
+                self.verify_best_plan(
                     snapshot,
                     candidate,
                     plan,
@@ -187,7 +206,10 @@ impl Router {
                     max_amount,
                     &mut stats,
                 )
-                .await?;
+                .await?
+            } else {
+                Some(plan)
+            };
             return Ok(RouteSearchResult { plan, stats });
         }
 
@@ -216,7 +238,8 @@ impl Router {
             return Ok(RouteSearchResult { plan: None, stats });
         }
 
-        if self.verify_v3_early_exit
+        if verify_final_plan
+            && self.verify_v3_early_exit
             && self.verify_split_optimizer.is_some()
             && plan_uses_v3(best.as_ref().expect("best checked above"))
         {
@@ -341,7 +364,7 @@ impl Router {
         }
 
         let plan = match best {
-            Some(plan) => {
+            Some(plan) if verify_final_plan => {
                 self.verify_best_plan(
                     snapshot,
                     candidate,
@@ -353,6 +376,7 @@ impl Router {
                 )
                 .await?
             }
+            Some(plan) => Some(plan),
             None => None,
         };
 

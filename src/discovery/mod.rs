@@ -1453,7 +1453,7 @@ fn bootstrap_replay_max_blocks() -> Option<u64> {
     {
         Some(0) => None,
         Some(value) => Some(value),
-        None => Some(900),
+        None => None,
     }
 }
 

@@ -464,7 +464,7 @@ async fn route_candidate(
     let route_timeout = Duration::from_millis(env_usize("ROUTE_SEARCH_TIMEOUT_MS", 3_000) as u64);
     let route_result = match tokio::time::timeout(
         route_timeout,
-        router.search_best_plan_with_stats(snapshot, &candidate),
+        router.search_prerank_plan_with_stats(snapshot, &candidate),
     )
     .await
     {
