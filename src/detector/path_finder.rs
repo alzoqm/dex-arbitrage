@@ -1133,6 +1133,8 @@ struct ExecutionTokenPolicy {
     required: bool,
     symbols: HashSet<String>,
     addresses: HashSet<Address>,
+    excluded_symbols: Vec<String>,
+    excluded_addresses: HashSet<Address>,
 }
 
 fn execution_token_policy(snapshot: &GraphSnapshot) -> ExecutionTokenPolicy {
@@ -1142,6 +1144,15 @@ fn execution_token_policy(snapshot: &GraphSnapshot) -> ExecutionTokenPolicy {
         .map(|symbol| symbol.to_ascii_lowercase())
         .collect::<HashSet<_>>();
     let mut addresses = env_csv("EXECUTION_TRUSTED_TOKENS")
+        .into_iter()
+        .filter_map(|value| Address::from_str(value.trim()).ok())
+        .collect::<HashSet<_>>();
+    let excluded_symbols = env_csv("EXECUTION_EXCLUDED_SYMBOL_CONTAINS")
+        .into_iter()
+        .map(|symbol| symbol.to_ascii_lowercase())
+        .filter(|symbol| !symbol.is_empty())
+        .collect::<Vec<_>>();
+    let excluded_addresses = env_csv("EXECUTION_EXCLUDED_TOKENS")
         .into_iter()
         .filter_map(|value| Address::from_str(value.trim()).ok())
         .collect::<HashSet<_>>();
@@ -1160,6 +1171,8 @@ fn execution_token_policy(snapshot: &GraphSnapshot) -> ExecutionTokenPolicy {
         required,
         symbols,
         addresses,
+        excluded_symbols,
+        excluded_addresses,
     }
 }
 
@@ -1169,12 +1182,26 @@ fn route_tokens_allowed(
     edge_refs: &[EdgeRef],
     policy: &ExecutionTokenPolicy,
 ) -> bool {
-    if !policy.required {
-        return true;
-    }
     let Some(anchor) = snapshot.tokens.get(anchor_idx) else {
         return false;
     };
+    if token_excluded_by_execution_policy(anchor, policy) {
+        return false;
+    }
+    for &edge_ref in edge_refs {
+        let Some(edge) = snapshot.edge(edge_ref) else {
+            return false;
+        };
+        let Some(token) = snapshot.tokens.get(edge.to) else {
+            return false;
+        };
+        if token_excluded_by_execution_policy(token, policy) {
+            return false;
+        }
+    }
+    if !policy.required {
+        return true;
+    }
     if !token_allowed_by_execution_policy(anchor, policy) {
         return false;
     }
@@ -1192,12 +1219,27 @@ fn route_tokens_allowed(
     true
 }
 
+fn token_excluded_by_execution_policy(
+    token: &crate::types::TokenInfo,
+    policy: &ExecutionTokenPolicy,
+) -> bool {
+    if policy.excluded_addresses.contains(&token.address) {
+        return true;
+    }
+    let symbol = token.symbol.to_ascii_lowercase();
+    policy
+        .excluded_symbols
+        .iter()
+        .any(|excluded| symbol.contains(excluded))
+}
+
 fn token_allowed_by_execution_policy(
     token: &crate::types::TokenInfo,
     policy: &ExecutionTokenPolicy,
 ) -> bool {
     policy.addresses.contains(&token.address)
         || policy.symbols.contains(&token.symbol.to_ascii_lowercase())
+        || (env_bool("EXECUTION_ALLOW_FLASH_LOAN_TOKENS", false) && token.flash_loan_enabled)
         || (policy.symbols.is_empty()
             && policy.addresses.is_empty()
             && token.manual_price_usd_e8.is_some())

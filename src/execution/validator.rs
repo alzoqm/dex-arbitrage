@@ -18,7 +18,7 @@ use crate::{
         valuation::{amount_to_usd_e8, calculate_contract_min_profit_raw, native_gas_to_usd_e8},
     },
     rpc::RpcClients,
-    types::{CapitalSource, Chain, ExactPlan, ExecutablePlan},
+    types::{CapitalSource, ExactPlan, ExecutablePlan},
 };
 
 #[derive(Debug)]
@@ -594,10 +594,7 @@ impl Validator {
     }
 
     fn wrapped_native_symbol(&self) -> &'static str {
-        match self.settings.chain {
-            Chain::Base => "WETH",
-            Chain::Polygon => "WMATIC",
-        }
+        self.settings.chain.wrapped_native_symbol()
     }
 
     fn native_gas_pricing(&self, snapshot: &GraphSnapshot) -> Option<(String, u64, u8)> {

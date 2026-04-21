@@ -147,6 +147,7 @@ impl DiscoveryManager {
         let mut v2_to_fetch = Vec::new();
         let mut aerodrome_v2_to_fetch = Vec::new();
         let mut v3_to_fetch = Vec::new();
+        let mut trader_joe_lb_to_fetch = Vec::new();
         let mut other_to_fetch = Vec::new();
         let mut skipped_cache_hits = 0usize;
         let mut stale_cached_to_refresh = 0usize;
@@ -171,6 +172,7 @@ impl DiscoveryManager {
                         &mut v2_to_fetch,
                         &mut aerodrome_v2_to_fetch,
                         &mut v3_to_fetch,
+                        &mut trader_joe_lb_to_fetch,
                         &mut other_to_fetch,
                         spec,
                     );
@@ -198,6 +200,7 @@ impl DiscoveryManager {
                 &mut v2_to_fetch,
                 &mut aerodrome_v2_to_fetch,
                 &mut v3_to_fetch,
+                &mut trader_joe_lb_to_fetch,
                 &mut other_to_fetch,
                 spec,
             );
@@ -222,6 +225,7 @@ impl DiscoveryManager {
             v2_to_fetch = v2_to_fetch.len(),
             aerodrome_v2_to_fetch = aerodrome_v2_to_fetch.len(),
             v3_to_fetch = v3_to_fetch.len(),
+            trader_joe_lb_to_fetch = trader_joe_lb_to_fetch.len(),
             other_to_fetch = other_to_fetch.len(),
             skipped_cache_hits,
             unseen_pool_skips,
@@ -278,6 +282,23 @@ impl DiscoveryManager {
         }
         if !v3_to_fetch.is_empty() && save_intermediate_checkpoints {
             self.save_pool_state_checkpoint(&pools, &skipped_pool_cache, "v3");
+        }
+
+        let trader_joe_lb_batch = self
+            .fetcher
+            .fetch_trader_joe_lb_batch(&trader_joe_lb_to_fetch, fetch_block_number)
+            .await?;
+        for skipped in trader_joe_lb_batch.skipped {
+            insert_skipped_pool(&mut skipped_pool_cache, skipped);
+        }
+        for pool in trader_joe_lb_batch.pools {
+            if self.admission.admit(&pool) {
+                skipped_pool_cache.remove(&pool.pool_id);
+                pools.insert(pool.pool_id, pool);
+            }
+        }
+        if !trader_joe_lb_to_fetch.is_empty() && save_intermediate_checkpoints {
+            self.save_pool_state_checkpoint(&pools, &skipped_pool_cache, "trader_joe_lb");
         }
 
         let mut skipped_other = 0usize;
@@ -464,12 +485,14 @@ impl DiscoveryManager {
         let mut v2_to_fetch = Vec::new();
         let mut aerodrome_v2_to_fetch = Vec::new();
         let mut v3_to_fetch = Vec::new();
+        let mut trader_joe_lb_to_fetch = Vec::new();
         let mut other_to_fetch = Vec::new();
         for spec in specs {
             push_fetch_spec(
                 &mut v2_to_fetch,
                 &mut aerodrome_v2_to_fetch,
                 &mut v3_to_fetch,
+                &mut trader_joe_lb_to_fetch,
                 &mut other_to_fetch,
                 spec,
             );
@@ -513,6 +536,20 @@ impl DiscoveryManager {
             insert_skipped_pool(skipped_pool_cache, skipped);
         }
         for pool in v3_batch.pools {
+            skipped_pool_cache.remove(&pool.pool_id);
+            failed_full_refresh.remove(&pool.pool_id);
+            pools.insert(pool.pool_id, pool);
+        }
+
+        let trader_joe_lb_batch = self
+            .fetcher
+            .fetch_trader_joe_lb_batch(&trader_joe_lb_to_fetch, block_number)
+            .await?;
+        for skipped in trader_joe_lb_batch.skipped {
+            failed_full_refresh.insert(skipped.spec.address);
+            insert_skipped_pool(skipped_pool_cache, skipped);
+        }
+        for pool in trader_joe_lb_batch.pools {
             skipped_pool_cache.remove(&pool.pool_id);
             failed_full_refresh.remove(&pool.pool_id);
             pools.insert(pool.pool_id, pool);
@@ -1343,6 +1380,7 @@ fn push_fetch_spec(
     v2_to_fetch: &mut Vec<DiscoveredPool>,
     aerodrome_v2_to_fetch: &mut Vec<DiscoveredPool>,
     v3_to_fetch: &mut Vec<DiscoveredPool>,
+    trader_joe_lb_to_fetch: &mut Vec<DiscoveredPool>,
     other_to_fetch: &mut Vec<DiscoveredPool>,
     spec: DiscoveredPool,
 ) {
@@ -1350,6 +1388,7 @@ fn push_fetch_spec(
         AmmKind::UniswapV2Like => v2_to_fetch.push(spec),
         AmmKind::AerodromeV2Like => aerodrome_v2_to_fetch.push(spec),
         AmmKind::UniswapV3Like => v3_to_fetch.push(spec),
+        AmmKind::TraderJoeLb => trader_joe_lb_to_fetch.push(spec),
         _ => other_to_fetch.push(spec),
     }
 }

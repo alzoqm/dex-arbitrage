@@ -82,6 +82,7 @@ fn map_adapter(adapter: crate::types::AdapterType) -> IArbitrageExecutor::Adapte
     match adapter {
         crate::types::AdapterType::UniswapV2Like => IArbitrageExecutor::AdapterType::UniswapV2Like,
         crate::types::AdapterType::UniswapV3Like => IArbitrageExecutor::AdapterType::UniswapV3Like,
+        crate::types::AdapterType::TraderJoeLb => IArbitrageExecutor::AdapterType::TraderJoeLb,
         crate::types::AdapterType::CurvePlain => IArbitrageExecutor::AdapterType::CurvePlain,
         crate::types::AdapterType::BalancerWeighted => {
             IArbitrageExecutor::AdapterType::BalancerWeighted
@@ -110,6 +111,7 @@ fn encode_extra(extra: &SplitExtra) -> Bytes {
             sqrt_price_limit_x96,
             ..
         } => sqrt_price_limit_x96.to_be_bytes::<32>().to_vec().into(),
+        SplitExtra::TraderJoeLb => Bytes::new(),
         SplitExtra::Curve { i, j, underlying } => {
             let mut out = Vec::new();
             out.extend_from_slice(&i.to_be_bytes());

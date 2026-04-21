@@ -60,6 +60,7 @@ fn has_usable_liquidity(pool: &PoolState) -> bool {
         PoolSpecificState::UniswapV2Like(state) => state.reserve0 > 0 && state.reserve1 > 0,
         PoolSpecificState::AerodromeV2Like(state) => state.reserve0 > 0 && state.reserve1 > 0,
         PoolSpecificState::UniswapV3Like(state) => state.liquidity > 0,
+        PoolSpecificState::TraderJoeLb(state) => state.reserve_x > 0 && state.reserve_y > 0,
         PoolSpecificState::CurvePlain(state) => state.balances.iter().any(|balance| *balance > 0),
         PoolSpecificState::BalancerWeighted(state) => {
             state.balances.iter().any(|balance| *balance > 0)

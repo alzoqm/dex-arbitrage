@@ -283,31 +283,24 @@ impl Settings {
             env_bool("STRICT_TARGET_ALLOWLIST", file_cfg.strict_target_allowlist);
         let safe_owner = parse_env_address_opt("SAFE_OWNER")?;
 
-        let rpc = match chain {
-            Chain::Base => RpcSettings {
-                public_rpc_url: env_req("BASE_PUBLIC_RPC_URL")?,
-                fallback_rpc_url: env_opt("BASE_FALLBACK_RPC_URL"),
-                preconf_rpc_url: env_opt("BASE_PRECONF_RPC_URL"),
-                ws_url: env_opt("BASE_WSS_URL"),
-                protected_rpc_url: env_opt("BASE_PROTECTED_RPC_URL"),
-                private_submit_method: env_or(
-                    "BASE_PRIVATE_SUBMIT_METHOD",
-                    "eth_sendRawTransaction",
-                ),
-                simulate_method: env_or("BASE_SIMULATE_METHOD", "eth_call"),
-            },
-            Chain::Polygon => RpcSettings {
-                public_rpc_url: env_req("POLYGON_PUBLIC_RPC_URL")?,
-                fallback_rpc_url: env_opt("POLYGON_FALLBACK_RPC_URL"),
-                preconf_rpc_url: env_opt("POLYGON_PRECONF_RPC_URL"),
-                ws_url: env_opt("POLYGON_WSS_URL"),
-                protected_rpc_url: env_opt("POLYGON_PRIVATE_MEMPOOL_URL"),
-                private_submit_method: env_or(
-                    "POLYGON_PRIVATE_SUBMIT_METHOD",
-                    "eth_sendRawTransaction",
-                ),
-                simulate_method: env_or("POLYGON_SIMULATE_METHOD", "eth_call"),
-            },
+        let public_rpc_key = chain.env_key("PUBLIC_RPC_URL");
+        let fallback_rpc_key = chain.env_key("FALLBACK_RPC_URL");
+        let preconf_rpc_key = chain.env_key("PRECONF_RPC_URL");
+        let ws_key = chain.env_key("WSS_URL");
+        let protected_rpc_key = match chain {
+            Chain::Polygon => chain.env_key("PRIVATE_MEMPOOL_URL"),
+            _ => chain.env_key("PROTECTED_RPC_URL"),
+        };
+        let private_submit_key = chain.env_key("PRIVATE_SUBMIT_METHOD");
+        let simulate_method_key = chain.env_key("SIMULATE_METHOD");
+        let rpc = RpcSettings {
+            public_rpc_url: env_req(&public_rpc_key)?,
+            fallback_rpc_url: env_opt(&fallback_rpc_key),
+            preconf_rpc_url: env_opt(&preconf_rpc_key),
+            ws_url: env_opt(&ws_key),
+            protected_rpc_url: env_opt(&protected_rpc_key),
+            private_submit_method: env_or(&private_submit_key, "eth_sendRawTransaction"),
+            simulate_method: env_or(&simulate_method_key, "eth_call"),
         };
 
         let contracts = ContractSettings {
@@ -319,28 +312,16 @@ impl Settings {
         let risk = RiskSettings {
             max_hops: file_cfg.max_hops,
             screening_margin_bps: file_cfg.screening_margin_bps,
-            min_net_profit: env_opt_i128(if chain == Chain::Base {
-                "BASE_MIN_NET_PROFIT"
-            } else {
-                "POLYGON_MIN_NET_PROFIT"
-            })
-            .unwrap_or(i128::from(file_cfg.min_net_profit_default)),
-            min_net_profit_usd_e8: env_opt_u128(if chain == Chain::Base {
-                "BASE_MIN_NET_PROFIT_USD_E8"
-            } else {
-                "POLYGON_MIN_NET_PROFIT_USD_E8"
-            })
+            min_net_profit: env_opt_i128(&chain.env_key("MIN_NET_PROFIT"))
+                .unwrap_or(i128::from(file_cfg.min_net_profit_default)),
+            min_net_profit_usd_e8: env_opt_u128(&chain.env_key("MIN_NET_PROFIT_USD_E8"))
             .or(file_cfg.min_net_profit_usd_e8.map(u128::from))
             .unwrap_or({
                 // Backward compatible default: convert old raw USDC value
                 // 100000 raw USDC (6 decimals) at $1 = $0.10 = 10_000_000 e8
                 10_000_000
             }),
-            min_trade_usd_e8: env_opt_u128(if chain == Chain::Base {
-                "BASE_MIN_TRADE_USD_E8"
-            } else {
-                "POLYGON_MIN_TRADE_USD_E8"
-            })
+            min_trade_usd_e8: env_opt_u128(&chain.env_key("MIN_TRADE_USD_E8"))
             .or(file_cfg.min_trade_usd_e8.map(u128::from))
             .unwrap_or(1_000_000_000), // $10 default
             poll_interval_ms: env_opt_u64("POLL_INTERVAL_MS").unwrap_or(file_cfg.poll_interval_ms),
@@ -350,36 +331,16 @@ impl Settings {
                 .unwrap_or(file_cfg.staleness_timeout_ms),
             gas_risk_buffer_pct: env_opt_f64("GAS_RISK_BUFFER_PCT")
                 .unwrap_or(file_cfg.gas_risk_buffer_pct),
-            gas_price_ceiling_wei: env_opt_u128(if chain == Chain::Base {
-                "BASE_GAS_PRICE_CEILING_WEI"
-            } else {
-                "POLYGON_GAS_PRICE_CEILING_WEI"
-            })
+            gas_price_ceiling_wei: env_opt_u128(&chain.env_key("GAS_PRICE_CEILING_WEI"))
             .unwrap_or(u128::from(file_cfg.gas_price_ceiling_wei)),
-            max_position: env_opt_u128(if chain == Chain::Base {
-                "BASE_MAX_POSITION"
-            } else {
-                "POLYGON_MAX_POSITION"
-            })
-            .unwrap_or(u128::from(file_cfg.max_position_default)),
-            max_position_usd_e8: env_opt_u128(if chain == Chain::Base {
-                "BASE_MAX_POSITION_USD_E8"
-            } else {
-                "POLYGON_MAX_POSITION_USD_E8"
-            })
+            max_position: env_opt_u128(&chain.env_key("MAX_POSITION"))
+                .unwrap_or(u128::from(file_cfg.max_position_default)),
+            max_position_usd_e8: env_opt_u128(&chain.env_key("MAX_POSITION_USD_E8"))
             .or(file_cfg.max_position_usd_e8.map(u128::from))
             .unwrap_or(200_000_000_000), // $2000 default
-            max_flash_loan: env_opt_u128(if chain == Chain::Base {
-                "BASE_MAX_FLASH_LOAN"
-            } else {
-                "POLYGON_MAX_FLASH_LOAN"
-            })
-            .unwrap_or(u128::from(file_cfg.max_flash_loan_default)),
-            max_flash_loan_usd_e8: env_opt_u128(if chain == Chain::Base {
-                "BASE_MAX_FLASH_LOAN_USD_E8"
-            } else {
-                "POLYGON_MAX_FLASH_LOAN_USD_E8"
-            })
+            max_flash_loan: env_opt_u128(&chain.env_key("MAX_FLASH_LOAN"))
+                .unwrap_or(u128::from(file_cfg.max_flash_loan_default)),
+            max_flash_loan_usd_e8: env_opt_u128(&chain.env_key("MAX_FLASH_LOAN_USD_E8"))
             .or(file_cfg.max_flash_loan_usd_e8.map(u128::from))
             .unwrap_or(1_000_000_000_000), // $10000 default
             daily_loss_limit: env_opt_i128("DAILY_LOSS_LIMIT")
@@ -446,19 +407,29 @@ impl Settings {
             ),
         };
 
+        let env_venues = env_csv("POLICY_VENUES");
+        let env_symbols = env_csv("POLICY_SYMBOLS");
         let policy = UniversePolicy {
-            venues: file_cfg
-                .policy
-                .venues
-                .clone()
-                .or_else(|| file_cfg.venues.clone())
-                .unwrap_or_default(),
-            symbols: file_cfg
-                .policy
-                .symbols
-                .clone()
-                .or_else(|| file_cfg.symbols.clone())
-                .unwrap_or_default(),
+            venues: if env_venues.is_empty() {
+                file_cfg
+                    .policy
+                    .venues
+                    .clone()
+                    .or_else(|| file_cfg.venues.clone())
+                    .unwrap_or_default()
+            } else {
+                env_venues
+            },
+            symbols: if env_symbols.is_empty() {
+                file_cfg
+                    .policy
+                    .symbols
+                    .clone()
+                    .or_else(|| file_cfg.symbols.clone())
+                    .unwrap_or_default()
+            } else {
+                env_symbols
+            },
         };
 
         let symbol_filter = policy
@@ -676,6 +647,19 @@ fn env_or(key: &str, default: &str) -> String {
 
 fn env_opt(key: &str) -> Option<String> {
     env::var(key).ok().filter(|v| !is_unset_marker(v))
+}
+
+fn env_csv(key: &str) -> Vec<String> {
+    env_opt(key)
+        .map(|value| {
+            value
+                .split(',')
+                .map(str::trim)
+                .filter(|part| !part.is_empty())
+                .map(ToOwned::to_owned)
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn is_unset_marker(value: &str) -> bool {

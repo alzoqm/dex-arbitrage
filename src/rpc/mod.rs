@@ -744,6 +744,12 @@ pub fn max_log_range_for_chain(chain: Chain) -> u64 {
     match chain {
         Chain::Base => 10_000, // Alchemy Base eth_getLogs is capped at 10,000 blocks.
         Chain::Polygon => 2_000, // Polygon Pay As You Go limited to 2000 blocks
+        Chain::Avalanche => 2_000,
+        Chain::Sonic => 2_000,
+        Chain::Gnosis => 2_000,
+        Chain::Celo => 2_000,
+        Chain::Linea => 100_000,
+        Chain::Bsc => 2_000,
     }
 }
 

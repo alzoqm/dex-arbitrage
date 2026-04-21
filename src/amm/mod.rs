@@ -1,6 +1,7 @@
 pub mod aerodrome_v2;
 pub mod balancer;
 pub mod curve;
+pub mod trader_joe_lb;
 pub mod uniswap_v2;
 pub mod uniswap_v3;
 

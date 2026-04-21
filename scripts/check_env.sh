@@ -11,6 +11,8 @@ base_verify=(BASE_PUBLIC_RPC_URL BASE_AAVE_POOL BASE_USDC BASE_USDT BASE_WETH BA
 base_run=(BASE_EXECUTOR_ADDRESS)
 polygon_verify=(POLYGON_PUBLIC_RPC_URL POLYGON_AAVE_POOL POLYGON_USDC POLYGON_USDT POLYGON_WMATIC POLYGON_WETH POLYGON_DAI POLYGON_UNISWAP_V3_FACTORY POLYGON_UNISWAP_V3_QUOTER POLYGON_WMATIC_PRICE_E8 POLYGON_WETH_PRICE_E8)
 polygon_run=(POLYGON_EXECUTOR_ADDRESS)
+avalanche_verify=(AVALANCHE_PUBLIC_RPC_URL AVALANCHE_AAVE_POOL AVALANCHE_USDC AVALANCHE_USDT AVALANCHE_WAVAX AVALANCHE_BTCB AVALANCHE_EURC AVALANCHE_UNISWAP_V2_FACTORY AVALANCHE_PANGOLIN_V2_FACTORY AVALANCHE_TRADERJOE_V1_FACTORY AVALANCHE_USDC_PRICE_E8 AVALANCHE_USDT_PRICE_E8 AVALANCHE_WAVAX_PRICE_E8 AVALANCHE_BTCB_PRICE_E8)
+avalanche_run=(AVALANCHE_EXECUTOR_ADDRESS)
 
 missing=()
 
@@ -30,6 +32,10 @@ case "$CHAIN" in
   polygon)
     chain_verify=("${polygon_verify[@]}")
     chain_run=("${polygon_run[@]}")
+    ;;
+  avalanche)
+    chain_verify=("${avalanche_verify[@]}")
+    chain_run=("${avalanche_run[@]}")
     ;;
   *)
     echo "unsupported chain: $CHAIN" >&2
@@ -53,13 +59,17 @@ case "$MODE" in
       if [[ "${ALLOW_PUBLIC_FALLBACK:-false}" != "true" ]]; then
         keys+=(BASE_PROTECTED_RPC_URL)
       fi
+    elif [[ "$CHAIN" == "avalanche" ]]; then
+      if [[ "${ALLOW_PUBLIC_FALLBACK:-false}" != "true" ]]; then
+        keys+=(AVALANCHE_PROTECTED_RPC_URL)
+      fi
     elif [[ "${ALLOW_PUBLIC_FALLBACK:-false}" != "true" ]]; then
       keys+=(POLYGON_PRIVATE_MEMPOOL_URL)
     fi
     ;;
   *)
     echo "unsupported mode: $MODE" >&2
-    echo "usage: $0 [base|polygon] [verify|run|deploy|live]" >&2
+    echo "usage: $0 [base|polygon|avalanche] [verify|run|deploy|live]" >&2
     exit 1
     ;;
 esac

@@ -10,8 +10,8 @@ use tracing::{info, warn};
 
 use crate::{
     abi::{
-        IAerodromeCLFactory, IAerodromeV2Factory, ICurveRegistry, IUniswapV2Factory,
-        IUniswapV3Factory,
+        IAerodromeCLFactory, IAerodromeV2Factory, ICurveRegistry, ITraderJoeLBFactory,
+        IUniswapV2Factory, IUniswapV3Factory,
     },
     cache::{load_cache, load_legacy_cache, repair_cache, AtomicCacheWriter, CacheLoadResult},
     config::{DexConfig, Settings},
@@ -75,6 +75,14 @@ impl FactoryScanner {
                 }
                 DiscoveryKind::PoolCreatedLogs => {
                     self.scan_v3_factory_logs(dex, cached.as_ref(), latest)
+                        .await?
+                }
+                DiscoveryKind::TraderJoeLbConfiguredPairs => {
+                    self.scan_trader_joe_lb_configured_pairs(dex, cached.as_ref(), latest)
+                        .await?
+                }
+                DiscoveryKind::TraderJoeLbFactoryAllPairs => {
+                    self.scan_trader_joe_lb_factory_all_pairs(dex, cached.as_ref(), latest)
                         .await?
                 }
                 DiscoveryKind::CurveRegistry => {
@@ -663,6 +671,253 @@ impl FactoryScanner {
                 dex = %dex.name,
                 seeded_pool_count = pools.len(),
                 "seeded configured-token v3 pools from factory"
+            );
+        }
+        Ok(pools)
+    }
+
+    async fn scan_trader_joe_lb_configured_pairs(
+        &self,
+        dex: &DexConfig,
+        cached: Option<&CachedDexScan>,
+        latest: u64,
+    ) -> Result<(Vec<DiscoveredPool>, ScanCursor)> {
+        if let Some(cached) = cached.filter(|cached| cached.matches(dex, latest)) {
+            if cached.cursor.block == latest {
+                return Ok((
+                    cached.pools.clone(),
+                    ScanCursor {
+                        block: latest,
+                        count: cached.pools.len() as u64,
+                    },
+                ));
+            }
+        }
+        let mut pools = self.seed_configured_trader_joe_lb_pairs(dex).await?;
+        dedup_pools(&mut pools);
+        Ok((
+            pools,
+            ScanCursor {
+                block: latest,
+                count: 0,
+            },
+        ))
+    }
+
+    async fn scan_trader_joe_lb_factory_all_pairs(
+        &self,
+        dex: &DexConfig,
+        cached: Option<&CachedDexScan>,
+        latest: u64,
+    ) -> Result<(Vec<DiscoveredPool>, ScanCursor)> {
+        let Some(factory) = dex.factory else {
+            return Ok((Vec::new(), ScanCursor::default()));
+        };
+        let raw = self
+            .rpc
+            .best_read()
+            .eth_call(
+                factory,
+                None,
+                ITraderJoeLBFactory::getNumberOfLBPairsCall {}
+                    .abi_encode()
+                    .into(),
+                "latest",
+            )
+            .await?;
+        let len = ITraderJoeLBFactory::getNumberOfLBPairsCall::abi_decode_returns(&raw)?;
+        let len = u256_to_u64(len);
+        info!(
+            dex = %dex.name,
+            factory = %factory,
+            total_pools = len,
+            "Trader Joe LB factory pair count loaded"
+        );
+
+        if let Some(cached) = cached.filter(|cached| cached.matches(dex, latest)) {
+            if cached.cursor.count >= len {
+                info!(
+                    dex = %dex.name,
+                    cached_pools = cached.pools.len(),
+                    total_pools = len,
+                    "Trader Joe LB discovery cache is complete"
+                );
+                return Ok((
+                    cached.pools.clone(),
+                    ScanCursor {
+                        block: latest,
+                        count: len,
+                    },
+                ));
+            }
+        }
+
+        let mut pools = cached_pools(cached, dex);
+        let start = cached
+            .filter(|cached| cached.matches(dex, latest))
+            .map(|cached| cached.cursor.count.min(len))
+            .unwrap_or(0);
+        let new_pools = match self
+            .scan_trader_joe_lb_pairs_multicall(factory, start, len)
+            .await
+        {
+            Ok(pools) => pools,
+            Err(err) => {
+                warn!(dex = %dex.name, error = %err, "multicall Trader Joe LB pair scan failed; falling back to sequential eth_call");
+                self.scan_trader_joe_lb_pairs_sequential(factory, start, len)
+                    .await?
+            }
+        };
+        for address in new_pools {
+            pools.push(DiscoveredPool {
+                address,
+                dex_name: dex.name.clone(),
+                amm_kind: dex.amm_kind,
+                factory: dex.factory,
+                registry: dex.registry,
+                vault: dex.vault,
+                quoter: dex.quoter,
+                balancer_pool_id: None,
+                priority: false,
+            });
+        }
+        dedup_pools(&mut pools);
+        Ok((
+            pools,
+            ScanCursor {
+                block: latest,
+                count: len,
+            },
+        ))
+    }
+
+    async fn scan_trader_joe_lb_pairs_multicall(
+        &self,
+        factory: Address,
+        start: u64,
+        len: u64,
+    ) -> Result<Vec<Address>> {
+        if start >= len {
+            return Ok(Vec::new());
+        }
+        let mut out = Vec::new();
+        let chunk_size = multicall_chunk_size();
+        for chunk_start in (start..len).step_by(chunk_size as usize) {
+            let end = (chunk_start + chunk_size).min(len);
+            let calls = (chunk_start..end)
+                .map(|idx| {
+                    (
+                        factory,
+                        ITraderJoeLBFactory::getLBPairAtIndexCall {
+                            id: U256::from(idx),
+                        }
+                        .abi_encode(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            let results = multicall::aggregate3(&self.rpc, calls).await?;
+            for raw in results.into_iter().flatten() {
+                let pair = ITraderJoeLBFactory::getLBPairAtIndexCall::abi_decode_returns(&raw)?;
+                if pair != Address::ZERO {
+                    out.push(pair);
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    async fn scan_trader_joe_lb_pairs_sequential(
+        &self,
+        factory: Address,
+        start: u64,
+        len: u64,
+    ) -> Result<Vec<Address>> {
+        let mut out = Vec::new();
+        for idx in start..len {
+            let raw = self
+                .rpc
+                .best_read()
+                .eth_call(
+                    factory,
+                    None,
+                    ITraderJoeLBFactory::getLBPairAtIndexCall {
+                        id: U256::from(idx),
+                    }
+                    .abi_encode()
+                    .into(),
+                    "latest",
+                )
+                .await?;
+            let pair = ITraderJoeLBFactory::getLBPairAtIndexCall::abi_decode_returns(&raw)?;
+            if pair != Address::ZERO {
+                out.push(pair);
+            }
+        }
+        Ok(out)
+    }
+
+    async fn seed_configured_trader_joe_lb_pairs(
+        &self,
+        dex: &DexConfig,
+    ) -> Result<Vec<DiscoveredPool>> {
+        let Some(factory) = dex.factory else {
+            return Ok(Vec::new());
+        };
+        let tokens = self
+            .settings
+            .tokens
+            .iter()
+            .map(|token| token.address)
+            .collect::<Vec<_>>();
+        if tokens.len() < 2 {
+            return Ok(Vec::new());
+        }
+
+        let mut pools = Vec::new();
+        let bin_steps = trader_joe_lb_bin_steps(&self.settings.chain.env_key("TRADERJOE_LB_BIN_STEPS"));
+        for i in 0..tokens.len() {
+            for j in (i + 1)..tokens.len() {
+                for &bin_step in &bin_steps {
+                    let raw = self
+                        .rpc
+                        .best_read()
+                        .eth_call(
+                            factory,
+                            None,
+                            ITraderJoeLBFactory::getLBPairInformationCall {
+                                tokenX: tokens[i],
+                                tokenY: tokens[j],
+                                binStep: U256::from(bin_step),
+                            }
+                            .abi_encode()
+                            .into(),
+                            "latest",
+                        )
+                        .await?;
+                    let info =
+                        ITraderJoeLBFactory::getLBPairInformationCall::abi_decode_returns(&raw)?;
+                    if info.LBPair == Address::ZERO || info.ignoredForRouting {
+                        continue;
+                    }
+                    pools.push(DiscoveredPool {
+                        address: info.LBPair,
+                        dex_name: dex.name.clone(),
+                        amm_kind: dex.amm_kind,
+                        factory: dex.factory,
+                        registry: dex.registry,
+                        vault: dex.vault,
+                        quoter: dex.quoter,
+                        balancer_pool_id: None,
+                        priority: true,
+                    });
+                }
+            }
+        }
+        if !pools.is_empty() {
+            info!(
+                dex = %dex.name,
+                seeded_pool_count = pools.len(),
+                "seeded configured-token Trader Joe LB pairs from factory"
             );
         }
         Ok(pools)
@@ -1335,6 +1590,20 @@ fn configured_v3_seed_fees() -> Vec<u32> {
     fees.sort_unstable();
     fees.dedup();
     fees
+}
+
+fn trader_joe_lb_bin_steps(env_key: &str) -> Vec<u16> {
+    let mut steps = std::env::var(env_key)
+        .ok()
+        .or_else(|| std::env::var("TRADERJOE_LB_BIN_STEPS").ok())
+        .unwrap_or_else(|| "1,2,5,10,15,20,25,50,100".to_string())
+        .split(',')
+        .filter_map(|value| value.trim().parse::<u16>().ok())
+        .filter(|value| *value > 0)
+        .collect::<Vec<_>>();
+    steps.sort_unstable();
+    steps.dedup();
+    steps
 }
 
 fn default_slipstream_tick_spacings() -> Vec<I24> {

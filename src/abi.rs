@@ -94,6 +94,35 @@ sol! {
             );
     }
 
+    interface ITraderJoeLBFactory {
+        struct LBPairInformation {
+            uint16 binStep;
+            address LBPair;
+            bool createdByOwner;
+            bool ignoredForRouting;
+        }
+
+        function getLBPairInformation(address tokenX, address tokenY, uint256 binStep)
+            external
+            view
+            returns (LBPairInformation memory);
+        function getNumberOfLBPairs() external view returns (uint256);
+        function getLBPairAtIndex(uint256 id) external returns (address);
+    }
+
+    interface ITraderJoeLBPair {
+        function getTokenX() external view returns (address);
+        function getTokenY() external view returns (address);
+        function getBinStep() external view returns (uint16);
+        function getActiveId() external view returns (uint24);
+        function getReserves() external view returns (uint128 reserveX, uint128 reserveY);
+        function getSwapOut(uint128 amountIn, bool swapForY)
+            external
+            view
+            returns (uint128 amountInLeft, uint128 amountOut, uint128 fee);
+        function swap(bool swapForY, address to) external returns (bytes32 amountsOut);
+    }
+
     interface IAerodromeCLPool {
         function token0() external view returns (address);
         function token1() external view returns (address);
@@ -241,6 +270,7 @@ sol! {
         enum AdapterType {
             UniswapV2Like,
             UniswapV3Like,
+            TraderJoeLb,
             CurvePlain,
             BalancerWeighted,
             AerodromeV2Like

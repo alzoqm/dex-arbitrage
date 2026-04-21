@@ -1,0 +1,116 @@
+chain = "bsc"
+chain_id = 56
+native_symbol = "BNB"
+
+max_hops = 4
+screening_margin_bps = 5
+
+min_net_profit_default = 100000
+max_position_default = 100000000
+max_flash_loan_default = 100000000
+daily_loss_limit_default = -5000000
+
+min_net_profit_usd_e8 = 10000000
+min_trade_usd_e8 = 1000000000
+max_position_usd_e8 = 10000000000
+max_flash_loan_usd_e8 = 10000000000
+daily_loss_limit_usd_e8 = 500000000
+
+poll_interval_ms = 1000
+event_backfill_blocks = 16
+staleness_timeout_ms = 900000
+
+gas_risk_buffer_pct = 0.20
+gas_price_ceiling_wei = 5000000000
+pool_health_min_bps = 9000
+stable_depeg_cutoff_e6 = 995000
+strict_target_allowlist = true
+
+[policy]
+venues = ["apeswap_v2", "biswap_v2"]
+symbols = []
+
+[search]
+top_k_paths_per_side = 16
+max_virtual_branches_per_node = 48
+path_beam_width = 384
+max_candidates_per_refresh = 128
+candidate_selection_buffer_multiplier = 4
+dedup_token_paths = true
+max_pair_edges_per_pair = 6
+max_split_parallel_pools = 4
+
+[[tokens]]
+symbol = "USDT"
+address_env = "BSC_USDT"
+decimals = 18
+is_stable = true
+is_cycle_anchor = false
+allow_self_funded = false
+price_env = "BSC_USDT_PRICE_E8"
+
+[[tokens]]
+symbol = "USDC"
+address_env = "BSC_USDC"
+decimals = 18
+is_stable = true
+is_cycle_anchor = false
+allow_self_funded = false
+price_env = "BSC_USDC_PRICE_E8"
+
+[[tokens]]
+symbol = "WBNB"
+address_env = "BSC_WBNB"
+decimals = 18
+is_stable = false
+allow_self_funded = false
+price_env = "BSC_WBNB_PRICE_E8"
+
+[[tokens]]
+symbol = "BTCB"
+address_env = "BSC_BTCB"
+decimals = 18
+is_stable = false
+allow_self_funded = false
+price_env = "BSC_BTCB_PRICE_E8"
+
+[[tokens]]
+symbol = "ETH"
+address_env = "BSC_ETH"
+decimals = 18
+is_stable = false
+allow_self_funded = false
+price_env = "BSC_ETH_PRICE_E8"
+
+[[tokens]]
+symbol = "FDUSD"
+address_env = "BSC_FDUSD"
+decimals = 18
+is_stable = true
+is_cycle_anchor = false
+allow_self_funded = false
+price_env = "BSC_FDUSD_PRICE_E8"
+
+[[dexes]]
+name = "apeswap_v2"
+amm = "uniswap_v2_like"
+discovery = "factory_all_pairs"
+factory_env = "BSC_APESWAP_V2_FACTORY"
+quoter_env = ""
+registry_env = ""
+vault_env = ""
+fee_ppm = 3000
+start_block = 0
+enabled = true
+
+[[dexes]]
+name = "biswap_v2"
+amm = "uniswap_v2_like"
+discovery = "factory_all_pairs"
+factory_env = "BSC_BISWAP_V2_FACTORY"
+quoter_env = ""
+registry_env = ""
+vault_env = ""
+fee_ppm = 1000
+start_block = 0
+enabled = true

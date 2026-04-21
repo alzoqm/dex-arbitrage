@@ -1,5 +1,6 @@
 use std::{
     collections::HashSet,
+    str::FromStr,
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -278,6 +279,9 @@ async fn process_refresh(
         detect_ms,
         "candidate detection complete"
     );
+    if env_bool("DIAGNOSTIC_STOP_AFTER_DETECTION", false) {
+        return Ok(());
+    }
     if candidates.is_empty() {
         return Ok(());
     }
@@ -417,9 +421,12 @@ fn should_verify_ranked_route(plan: &ExactPlan) -> bool {
         return true;
     }
     plan.hops.iter().any(|hop| {
-        hop.splits
-            .iter()
-            .any(|split| split.adapter_type == AdapterType::UniswapV3Like)
+        hop.splits.iter().any(|split| {
+            matches!(
+                split.adapter_type,
+                AdapterType::UniswapV3Like | AdapterType::TraderJoeLb
+            )
+        })
     })
 }
 
@@ -507,10 +514,7 @@ fn estimate_prerank_gas_cost_usd_e8(
     snapshot: &GraphSnapshot,
     settings: &Settings,
 ) -> Option<i128> {
-    let native_symbol = match settings.chain {
-        crate::types::Chain::Base => "WETH",
-        crate::types::Chain::Polygon => "WMATIC",
-    };
+    let native_symbol = settings.chain.wrapped_native_symbol();
     let native = snapshot
         .tokens
         .iter()
@@ -729,6 +733,7 @@ async fn process_routed_candidate(
                 cycle_key = %candidate.cycle_key,
                 route = %format_candidate_route(&candidate),
                 dex_route = %format_candidate_dex_route(&candidate),
+                pool_route = %format_candidate_pool_route(&candidate),
                 verify_ms,
                 verify_evaluated_amounts = verified_stats.evaluated_amounts,
                 verify_no_output_quotes = verified_stats.no_output_quotes,
@@ -868,6 +873,7 @@ async fn process_routed_candidate(
             anchor_symbol = %candidate.start_symbol,
             route = %format_candidate_route(&candidate),
             dex_route = %format_candidate_dex_route(&candidate),
+            pool_route = %format_candidate_pool_route(&candidate),
             input_token = %candidate.start_token,
             path_len = candidate.path.len(),
             input_amount = executable.exact.input_amount,
@@ -1819,6 +1825,15 @@ fn format_candidate_dex_route(candidate: &CandidatePath) -> String {
         .join(" -> ")
 }
 
+fn format_candidate_pool_route(candidate: &CandidatePath) -> String {
+    candidate
+        .path
+        .iter()
+        .map(|hop| hop.pool_id.to_string())
+        .collect::<Vec<_>>()
+        .join(" -> ")
+}
+
 fn validate_runtime_prerequisites(settings: &Settings, simulate_only: bool) -> Result<()> {
     if settings.operator_private_key.is_none() {
         anyhow::bail!("OPERATOR_PRIVATE_KEY is required");
@@ -1847,6 +1862,7 @@ fn validate_runtime_prerequisites(settings: &Settings, simulate_only: bool) -> R
 }
 
 fn initial_edge_refs(snapshot: &GraphSnapshot, distance_cache: &DistanceCache) -> Vec<EdgeRef> {
+    let target_pools = target_initial_pool_ids();
     let mut by_pair = std::collections::HashMap::<(usize, usize), InitialEdgeCandidate>::new();
 
     for (from, edges) in snapshot.adjacency.iter().enumerate() {
@@ -1860,6 +1876,9 @@ fn initial_edge_refs(snapshot: &GraphSnapshot, distance_cache: &DistanceCache) -
         }
 
         for (edge_idx, edge) in edges.iter().enumerate() {
+            if !target_pools.is_empty() && !target_pools.contains(&edge.pool_id) {
+                continue;
+            }
             if !distance_cache
                 .reachable_to_anchor
                 .get(edge.to)
@@ -1893,6 +1912,18 @@ fn initial_edge_refs(snapshot: &GraphSnapshot, distance_cache: &DistanceCache) -
     refs.into_iter()
         .map(|candidate| candidate.edge_ref)
         .collect()
+}
+
+fn target_initial_pool_ids() -> std::collections::HashSet<alloy::primitives::Address> {
+    std::env::var("INITIAL_REFRESH_POOL_IDS")
+        .ok()
+        .map(|value| {
+            value
+                .split(',')
+                .filter_map(|part| alloy::primitives::Address::from_str(part.trim()).ok())
+                .collect::<std::collections::HashSet<_>>()
+        })
+        .unwrap_or_default()
 }
 
 fn total_edge_count(snapshot: &GraphSnapshot) -> usize {

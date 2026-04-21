@@ -138,6 +138,11 @@ fn build_edges_for_pool(pool: &PoolState, token_to_index: &HashMap<Address, usiz
                 amm::uniswap_v3::spot_rate(state, zero_for_one)
             })
         }
+        PoolSpecificState::TraderJoeLb(state) => {
+            build_two_token_edges(pool, token_to_index, pool.kind, 0, |swap_for_y| {
+                amm::trader_joe_lb::spot_rate(state, swap_for_y)
+            })
+        }
         PoolSpecificState::CurvePlain(state) => {
             build_n_token_edges(pool, token_to_index, pool.kind, |i, j| {
                 let (spot_rate_q128, weight_log_q32, liquidity) =

@@ -10,13 +10,13 @@ use tracing::{info, warn};
 use crate::{
     abi::{
         IAerodromeCLPool, IAerodromeV2Factory, IAerodromeV2Pool, IBalancerPool, IBalancerVault,
-        ICurvePool, IUniswapV2Pair, IUniswapV3Pool,
+        ICurvePool, ITraderJoeLBPair, IUniswapV2Pair, IUniswapV3Pool,
     },
     config::{Settings, TokenConfig},
     rpc::RpcClients,
     types::{
         AerodromeV2PoolState, AmmKind, BalancerPoolState, CurvePoolState, PoolAdmissionStatus,
-        PoolHealth, PoolSpecificState, PoolState, V2PoolState, V3PoolState,
+        PoolHealth, PoolSpecificState, PoolState, TraderJoeLbPoolState, V2PoolState, V3PoolState,
     },
 };
 
@@ -59,6 +59,7 @@ impl PoolFetcher {
             AmmKind::UniswapV2Like => self.fetch_v2(spec, block_number).await,
             AmmKind::AerodromeV2Like => self.fetch_aerodrome_v2(spec, block_number).await,
             AmmKind::UniswapV3Like => self.fetch_v3(spec, block_number).await,
+            AmmKind::TraderJoeLb => self.fetch_trader_joe_lb(spec, block_number).await,
             AmmKind::CurvePlain => self.fetch_curve(spec, block_number).await,
             AmmKind::BalancerWeighted => self.fetch_balancer(spec, block_number).await,
         }
@@ -296,6 +297,246 @@ impl PoolFetcher {
             last_updated_block: block_number.unwrap_or_default(),
             extras: HashMap::new(),
         }
+    }
+
+    async fn fetch_trader_joe_lb(
+        &self,
+        spec: &DiscoveredPool,
+        block_number: Option<u64>,
+    ) -> Result<Option<PoolState>> {
+        let calls = vec![
+            (
+                spec.address,
+                ITraderJoeLBPair::getTokenXCall {}.abi_encode(),
+            ),
+            (
+                spec.address,
+                ITraderJoeLBPair::getTokenYCall {}.abi_encode(),
+            ),
+            (
+                spec.address,
+                ITraderJoeLBPair::getBinStepCall {}.abi_encode(),
+            ),
+            (
+                spec.address,
+                ITraderJoeLBPair::getActiveIdCall {}.abi_encode(),
+            ),
+            (
+                spec.address,
+                ITraderJoeLBPair::getReservesCall {}.abi_encode(),
+            ),
+        ];
+        let results = multicall::aggregate3(&self.rpc, calls).await?;
+        let Some(token_x_raw) = results.first().and_then(|v| v.clone()) else {
+            return Ok(None);
+        };
+        let Some(token_y_raw) = results.get(1).and_then(|v| v.clone()) else {
+            return Ok(None);
+        };
+        let Some(bin_step_raw) = results.get(2).and_then(|v| v.clone()) else {
+            return Ok(None);
+        };
+        let Some(active_id_raw) = results.get(3).and_then(|v| v.clone()) else {
+            return Ok(None);
+        };
+        let Some(reserves_raw) = results.get(4).and_then(|v| v.clone()) else {
+            return Ok(None);
+        };
+        let token_x = ITraderJoeLBPair::getTokenXCall::abi_decode_returns(&token_x_raw)?;
+        let token_y = ITraderJoeLBPair::getTokenYCall::abi_decode_returns(&token_y_raw)?;
+        let bin_step = ITraderJoeLBPair::getBinStepCall::abi_decode_returns(&bin_step_raw)?;
+        let active_id = ITraderJoeLBPair::getActiveIdCall::abi_decode_returns(&active_id_raw)?;
+        let reserves = ITraderJoeLBPair::getReservesCall::abi_decode_returns(&reserves_raw)?;
+        if reserves.reserveX == 0 || reserves.reserveY == 0 {
+            return Ok(None);
+        }
+        Ok(Some(self.build_trader_joe_lb_pool(
+            spec,
+            token_x,
+            token_y,
+            bin_step,
+            u256_to_u128(U256::saturating_from(active_id)).min(u32::MAX as u128) as u32,
+            reserves.reserveX,
+            reserves.reserveY,
+            block_number,
+        )))
+    }
+
+    fn build_trader_joe_lb_pool(
+        &self,
+        spec: &DiscoveredPool,
+        token_x: Address,
+        token_y: Address,
+        bin_step: u16,
+        active_id: u32,
+        reserve_x: u128,
+        reserve_y: u128,
+        block_number: Option<u64>,
+    ) -> PoolState {
+        PoolState {
+            pool_id: spec.address,
+            dex_name: spec.dex_name.clone(),
+            kind: spec.amm_kind,
+            token_addresses: vec![token_x, token_y],
+            token_symbols: vec![self.token_symbol(token_x), self.token_symbol(token_y)],
+            factory: spec.factory,
+            registry: spec.registry,
+            vault: spec.vault,
+            quoter: spec.quoter,
+            admission_status: PoolAdmissionStatus::Allowed,
+            health: fresh_health(10_000, false),
+            state: PoolSpecificState::TraderJoeLb(TraderJoeLbPoolState {
+                reserve_x,
+                reserve_y,
+                bin_step,
+                active_id,
+            }),
+            last_updated_block: block_number.unwrap_or_default(),
+            extras: HashMap::new(),
+        }
+    }
+
+    pub async fn fetch_trader_joe_lb_batch(
+        &self,
+        specs: &[DiscoveredPool],
+        block_number: Option<u64>,
+    ) -> Result<PoolFetchBatch> {
+        if specs.is_empty() {
+            return Ok(PoolFetchBatch {
+                pools: Vec::new(),
+                skipped: Vec::new(),
+            });
+        }
+
+        let chunk_size = pool_fetch_multicall_chunk_size();
+        let mut pools = Vec::new();
+        let mut skipped_pools = Vec::new();
+        let mut scanned = 0usize;
+        let mut skipped = 0usize;
+        info!(
+            total = specs.len(),
+            chunk_size, "starting Trader Joe LB pool state batch fetch"
+        );
+
+        for (chunk_index, chunk) in specs.chunks(chunk_size).enumerate() {
+            let mut calls = Vec::with_capacity(chunk.len() * 5);
+            for spec in chunk {
+                calls.push((spec.address, ITraderJoeLBPair::getTokenXCall {}.abi_encode()));
+                calls.push((spec.address, ITraderJoeLBPair::getTokenYCall {}.abi_encode()));
+                calls.push((spec.address, ITraderJoeLBPair::getBinStepCall {}.abi_encode()));
+                calls.push((spec.address, ITraderJoeLBPair::getActiveIdCall {}.abi_encode()));
+                calls.push((spec.address, ITraderJoeLBPair::getReservesCall {}.abi_encode()));
+            }
+            match multicall::aggregate3(&self.rpc, calls).await {
+                Ok(results) => {
+                    for (spec, raw) in chunk.iter().zip(results.chunks(5)) {
+                        scanned += 1;
+                        let Some(pool) =
+                            self.decode_trader_joe_lb_batch_result(spec, raw, block_number)?
+                        else {
+                            skipped += 1;
+                            skipped_pools.push(SkippedPoolFetch {
+                                spec: spec.clone(),
+                                reason: "trader_joe_lb_decode_or_zero_liquidity",
+                            });
+                            continue;
+                        };
+                        pools.push(pool);
+                    }
+                }
+                Err(err) => {
+                    warn!(
+                        chunk_index,
+                        count = chunk.len(),
+                        error = %err,
+                        "batch Trader Joe LB fetch failed; falling back to per-pool fetch"
+                    );
+                    for spec in chunk {
+                        scanned += 1;
+                        match self.fetch_trader_joe_lb(spec, block_number).await {
+                            Ok(Some(pool)) => pools.push(pool),
+                            Ok(None) => {
+                                skipped += 1;
+                                skipped_pools.push(SkippedPoolFetch {
+                                    spec: spec.clone(),
+                                    reason: "trader_joe_lb_fetch_returned_none",
+                                });
+                            }
+                            Err(err) => {
+                                skipped += 1;
+                                warn!(pool = %spec.address, error = %err, "skipping Trader Joe LB pool after per-pool fetch failure");
+                                skipped_pools.push(SkippedPoolFetch {
+                                    spec: spec.clone(),
+                                    reason: "trader_joe_lb_fetch_failed",
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+            if (chunk_index + 1) % 10 == 0 || scanned == specs.len() {
+                info!(
+                    scanned,
+                    total = specs.len(),
+                    admitted_candidates = pools.len(),
+                    skipped,
+                    "Trader Joe LB pool state batch fetch progress"
+                );
+            }
+        }
+
+        info!(
+            scanned,
+            total = specs.len(),
+            admitted_candidates = pools.len(),
+            skipped,
+            "Trader Joe LB pool state batch fetch complete"
+        );
+        Ok(PoolFetchBatch {
+            pools,
+            skipped: skipped_pools,
+        })
+    }
+
+    fn decode_trader_joe_lb_batch_result(
+        &self,
+        spec: &DiscoveredPool,
+        raw: &[Option<Bytes>],
+        block_number: Option<u64>,
+    ) -> Result<Option<PoolState>> {
+        let Some(token_x_raw) = raw.first().and_then(|v| v.clone()) else {
+            return Ok(None);
+        };
+        let Some(token_y_raw) = raw.get(1).and_then(|v| v.clone()) else {
+            return Ok(None);
+        };
+        let Some(bin_step_raw) = raw.get(2).and_then(|v| v.clone()) else {
+            return Ok(None);
+        };
+        let Some(active_id_raw) = raw.get(3).and_then(|v| v.clone()) else {
+            return Ok(None);
+        };
+        let Some(reserves_raw) = raw.get(4).and_then(|v| v.clone()) else {
+            return Ok(None);
+        };
+        let token_x = ITraderJoeLBPair::getTokenXCall::abi_decode_returns(&token_x_raw)?;
+        let token_y = ITraderJoeLBPair::getTokenYCall::abi_decode_returns(&token_y_raw)?;
+        let bin_step = ITraderJoeLBPair::getBinStepCall::abi_decode_returns(&bin_step_raw)?;
+        let active_id = ITraderJoeLBPair::getActiveIdCall::abi_decode_returns(&active_id_raw)?;
+        let reserves = ITraderJoeLBPair::getReservesCall::abi_decode_returns(&reserves_raw)?;
+        if reserves.reserveX == 0 || reserves.reserveY == 0 {
+            return Ok(None);
+        }
+        Ok(Some(self.build_trader_joe_lb_pool(
+            spec,
+            token_x,
+            token_y,
+            bin_step,
+            u256_to_u128(U256::saturating_from(active_id)).min(u32::MAX as u128) as u32,
+            reserves.reserveX,
+            reserves.reserveY,
+            block_number,
+        )))
     }
 
     pub async fn fetch_aerodrome_v2_batch(
@@ -1323,7 +1564,10 @@ fn pool_fetch_max_retries() -> usize {
 fn pool_fetch_max_retries_for_kind(kind: AmmKind) -> usize {
     if matches!(
         kind,
-        AmmKind::UniswapV2Like | AmmKind::AerodromeV2Like | AmmKind::UniswapV3Like
+        AmmKind::UniswapV2Like
+            | AmmKind::AerodromeV2Like
+            | AmmKind::UniswapV3Like
+            | AmmKind::TraderJoeLb
     ) {
         return pool_fetch_max_retries();
     }

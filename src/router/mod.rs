@@ -15,7 +15,7 @@ use crate::{
     config::Settings,
     execution::flash_loan::FlashLoanEngine,
     graph::GraphSnapshot,
-    types::{AmmKind, CandidatePath, CapitalSource, ExactPlan, HopPlan, SplitPlan},
+    types::{AmmKind, AdapterType, CandidatePath, CapitalSource, ExactPlan, HopPlan, SplitExtra, SplitPlan},
 };
 
 use self::{
@@ -74,6 +74,7 @@ impl RouteSearchStats {
             AmmKind::UniswapV2Like => self.no_output_v2 += 1,
             AmmKind::AerodromeV2Like => self.no_output_aerodrome_v2 += 1,
             AmmKind::UniswapV3Like => self.no_output_v3 += 1,
+            AmmKind::TraderJoeLb => self.no_output_v2 += 1,
             AmmKind::CurvePlain => self.no_output_curve += 1,
             AmmKind::BalancerWeighted => self.no_output_balancer += 1,
         }
@@ -183,6 +184,20 @@ impl Router {
         stats.max_amount = max_amount;
         let mut evaluated = std::collections::HashMap::<u128, Option<ExactPlan>>::new();
 
+        if candidate_uses_only_trader_joe_lb(candidate) {
+            let plan = self
+                .search_trader_joe_lb_bounded(
+                    snapshot,
+                    candidate,
+                    min_amount,
+                    max_amount,
+                    premium_ppm,
+                    &mut stats,
+                )
+                .await?;
+            return Ok(RouteSearchResult { plan, stats });
+        }
+
         if let Some(plan) = self
             .search_fast_sized(
                 snapshot,
@@ -241,7 +256,7 @@ impl Router {
         if verify_final_plan
             && self.verify_v3_early_exit
             && self.verify_split_optimizer.is_some()
-            && plan_uses_v3(best.as_ref().expect("best checked above"))
+            && plan_uses_rpc_verified_adapter(best.as_ref().expect("best checked above"))
         {
             let Some(verified_probe) = self
                 .verify_probe_plan(
@@ -381,6 +396,126 @@ impl Router {
         };
 
         Ok(RouteSearchResult { plan, stats })
+    }
+
+    async fn search_trader_joe_lb_bounded(
+        &self,
+        snapshot: &GraphSnapshot,
+        candidate: &CandidatePath,
+        min_amount: u128,
+        max_amount: u128,
+        premium_ppm: u128,
+        stats: &mut RouteSearchStats,
+    ) -> Result<Option<ExactPlan>> {
+        let split_optimizer = self
+            .verify_split_optimizer
+            .as_ref()
+            .unwrap_or(&self.split_optimizer);
+        let mut best = None::<ExactPlan>;
+        for amount in bounded_lb_amounts(min_amount, max_amount) {
+            if let Some(plan) = self
+                .quote_lb_candidate_direct(
+                    split_optimizer,
+                    snapshot,
+                    candidate,
+                    amount,
+                    premium_ppm,
+                    stats,
+                )
+                .await?
+            {
+                best = better_plan(best, plan);
+            }
+        }
+        Ok(best)
+    }
+
+    async fn quote_lb_candidate_direct(
+        &self,
+        split_optimizer: &SplitOptimizer,
+        snapshot: &GraphSnapshot,
+        candidate: &CandidatePath,
+        input_amount: u128,
+        flash_premium_ppm: u128,
+        stats: &mut RouteSearchStats,
+    ) -> Result<Option<ExactPlan>> {
+        stats.evaluated_amounts += 1;
+        let mut next_amount = input_amount;
+        let mut hops = Vec::<HopPlan>::new();
+
+        for (hop_index, hop) in candidate.path.iter().enumerate() {
+            let split = SplitPlan {
+                dex_name: hop.dex_name.clone(),
+                pool_id: hop.pool_id,
+                adapter_type: AdapterType::TraderJoeLb,
+                token_in: hop.from,
+                token_out: hop.to,
+                amount_in: next_amount,
+                min_amount_out: 0,
+                expected_amount_out: 0,
+                extra: SplitExtra::TraderJoeLb,
+            };
+            let out = split_optimizer.quote_split(snapshot, &split).await?;
+            if out == 0 {
+                stats.record_no_output(hop_index, hop.amm_kind, Some(hop.pool_id), next_amount);
+                return Ok(None);
+            }
+            let mut split = split;
+            split.expected_amount_out = out;
+            hops.push(HopPlan {
+                token_in: hop.from,
+                token_out: hop.to,
+                total_in: next_amount,
+                total_out: out,
+                splits: vec![split],
+            });
+            next_amount = out;
+        }
+
+        let rough_gas_limit = estimate_gas_limit(&hops);
+        let gross_profit_raw = next_amount as i128 - input_amount as i128;
+        if gross_profit_raw <= 0 {
+            stats.gross_nonpositive += 1;
+            return Ok(None);
+        }
+        let search_flash_fee_raw =
+            estimated_full_flash_fee_raw(snapshot, candidate, input_amount, flash_premium_ppm);
+        let expected_profit =
+            gross_profit_raw.saturating_sub(u128_to_i128_saturating(search_flash_fee_raw));
+        if expected_profit <= 0 {
+            stats.flash_fee_nonpositive += 1;
+            return Ok(None);
+        }
+        stats.profitable_plans += 1;
+
+        Ok(Some(ExactPlan {
+            snapshot_id: candidate.snapshot_id,
+            input_token: candidate.start_token,
+            output_token: candidate.start_token,
+            input_amount,
+            output_amount: next_amount,
+            gross_profit_raw,
+            flash_premium_ppm,
+            flash_fee_raw: search_flash_fee_raw,
+            net_profit_before_gas_raw: expected_profit,
+            contract_min_profit_raw: 0,
+            input_value_usd_e8: 0,
+            flash_loan_value_usd_e8: 0,
+            gross_profit_usd_e8: 0,
+            flash_fee_usd_e8: 0,
+            actual_flash_fee_usd_e8: 0,
+            gas_cost_usd_e8: 0,
+            net_profit_usd_e8: 0,
+            expected_profit,
+            gas_limit: rough_gas_limit,
+            gas_l2_execution_cost_wei: alloy::primitives::U256::ZERO,
+            gas_l1_data_fee_wei: alloy::primitives::U256::ZERO,
+            gas_cost_wei: alloy::primitives::U256::ZERO,
+            capital_source: CapitalSource::SelfFunded,
+            flash_loan_amount: 0,
+            actual_flash_fee_raw: 0,
+            hops,
+        }))
     }
 
     async fn search_fast_sized(
@@ -625,7 +760,7 @@ impl Router {
         let Some(split_optimizer) = &self.verify_split_optimizer else {
             return Ok(Some(plan));
         };
-        if !plan_uses_v3(&plan) {
+        if !plan_uses_rpc_verified_adapter(&plan) {
             return Ok(Some(plan));
         }
 
@@ -923,6 +1058,7 @@ fn estimate_gas_limit(hops: &[HopPlan]) -> u64 {
                 crate::types::AdapterType::UniswapV2Like => 75_000,
                 crate::types::AdapterType::AerodromeV2Like => 100_000,
                 crate::types::AdapterType::UniswapV3Like => 155_000,
+                crate::types::AdapterType::TraderJoeLb => 130_000,
                 crate::types::AdapterType::CurvePlain => 240_000,
                 crate::types::AdapterType::BalancerWeighted => 150_000,
             });
@@ -931,12 +1067,44 @@ fn estimate_gas_limit(hops: &[HopPlan]) -> u64 {
     gas
 }
 
-fn plan_uses_v3(plan: &ExactPlan) -> bool {
+fn plan_uses_rpc_verified_adapter(plan: &ExactPlan) -> bool {
     plan.hops.iter().any(|hop| {
-        hop.splits
-            .iter()
-            .any(|split| split.adapter_type == crate::types::AdapterType::UniswapV3Like)
+        hop.splits.iter().any(|split| {
+            matches!(
+                split.adapter_type,
+                crate::types::AdapterType::UniswapV3Like | crate::types::AdapterType::TraderJoeLb
+            )
+        })
     })
+}
+
+fn candidate_uses_only_trader_joe_lb(candidate: &CandidatePath) -> bool {
+    !candidate.path.is_empty()
+        && candidate
+            .path
+            .iter()
+            .all(|hop| hop.amm_kind == AmmKind::TraderJoeLb)
+}
+
+fn bounded_lb_amounts(min_amount: u128, max_amount: u128) -> Vec<u128> {
+    if min_amount == 0 || min_amount > max_amount {
+        return Vec::new();
+    }
+    let target_count = env_usize("LB_EXACT_SEARCH_POINTS", 18).clamp(2, 64);
+    let mut out = Vec::with_capacity(target_count + 2);
+    let mut amount = min_amount;
+    while amount <= max_amount && out.len() < target_count {
+        out.push(amount);
+        let next = amount.saturating_mul(2);
+        if next <= amount {
+            break;
+        }
+        amount = next;
+    }
+    out.push(max_amount);
+    out.sort_unstable();
+    out.dedup();
+    out
 }
 
 fn verification_amounts(

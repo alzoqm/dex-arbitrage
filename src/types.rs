@@ -13,6 +13,12 @@ use smallvec::SmallVec;
 pub enum Chain {
     Base,
     Polygon,
+    Avalanche,
+    Sonic,
+    Gnosis,
+    Celo,
+    Linea,
+    Bsc,
 }
 
 impl Chain {
@@ -20,6 +26,12 @@ impl Chain {
         match self {
             Self::Base => "base",
             Self::Polygon => "polygon",
+            Self::Avalanche => "avalanche",
+            Self::Sonic => "sonic",
+            Self::Gnosis => "gnosis",
+            Self::Celo => "celo",
+            Self::Linea => "linea",
+            Self::Bsc => "bsc",
         }
     }
 
@@ -27,13 +39,42 @@ impl Chain {
         match self {
             Self::Base => "config/base.toml",
             Self::Polygon => "config/polygon.toml",
+            Self::Avalanche => "config/avalanche.toml",
+            Self::Sonic => "config/sonic.toml",
+            Self::Gnosis => "config/gnosis.toml",
+            Self::Celo => "config/celo.toml",
+            Self::Linea => "config/linea.toml",
+            Self::Bsc => "config/bsc.toml",
         }
+    }
+
+    pub fn env_prefix(&self) -> &'static str {
+        match self {
+            Self::Base => "BASE",
+            Self::Polygon => "POLYGON",
+            Self::Avalanche => "AVALANCHE",
+            Self::Sonic => "SONIC",
+            Self::Gnosis => "GNOSIS",
+            Self::Celo => "CELO",
+            Self::Linea => "LINEA",
+            Self::Bsc => "BSC",
+        }
+    }
+
+    pub fn env_key(&self, suffix: &str) -> String {
+        format!("{}_{}", self.env_prefix(), suffix)
     }
 
     pub fn executor_env(&self) -> &'static str {
         match self {
             Self::Base => "BASE_EXECUTOR_ADDRESS",
             Self::Polygon => "POLYGON_EXECUTOR_ADDRESS",
+            Self::Avalanche => "AVALANCHE_EXECUTOR_ADDRESS",
+            Self::Sonic => "SONIC_EXECUTOR_ADDRESS",
+            Self::Gnosis => "GNOSIS_EXECUTOR_ADDRESS",
+            Self::Celo => "CELO_EXECUTOR_ADDRESS",
+            Self::Linea => "LINEA_EXECUTOR_ADDRESS",
+            Self::Bsc => "BSC_EXECUTOR_ADDRESS",
         }
     }
 
@@ -41,6 +82,25 @@ impl Chain {
         match self {
             Self::Base => "BASE_AAVE_POOL",
             Self::Polygon => "POLYGON_AAVE_POOL",
+            Self::Avalanche => "AVALANCHE_AAVE_POOL",
+            Self::Sonic => "SONIC_AAVE_POOL",
+            Self::Gnosis => "GNOSIS_AAVE_POOL",
+            Self::Celo => "CELO_AAVE_POOL",
+            Self::Linea => "LINEA_AAVE_POOL",
+            Self::Bsc => "BSC_AAVE_POOL",
+        }
+    }
+
+    pub fn wrapped_native_symbol(&self) -> &'static str {
+        match self {
+            Self::Base => "WETH",
+            Self::Polygon => "WMATIC",
+            Self::Avalanche => "WAVAX",
+            Self::Sonic => "wS",
+            Self::Gnosis => "WXDAI",
+            Self::Celo => "CELO",
+            Self::Linea => "WETH",
+            Self::Bsc => "WBNB",
         }
     }
 }
@@ -52,6 +112,12 @@ impl FromStr for Chain {
         match value.to_ascii_lowercase().as_str() {
             "base" => Ok(Self::Base),
             "polygon" => Ok(Self::Polygon),
+            "avalanche" | "avax" => Ok(Self::Avalanche),
+            "sonic" => Ok(Self::Sonic),
+            "gnosis" | "xdai" => Ok(Self::Gnosis),
+            "celo" => Ok(Self::Celo),
+            "linea" => Ok(Self::Linea),
+            "bsc" | "bnb" | "bnbchain" => Ok(Self::Bsc),
             other => anyhow::bail!("unsupported chain: {other}"),
         }
     }
@@ -68,6 +134,7 @@ pub enum AmmKind {
     UniswapV2Like,
     AerodromeV2Like,
     UniswapV3Like,
+    TraderJoeLb,
     CurvePlain,
     BalancerWeighted,
 }
@@ -78,6 +145,7 @@ impl AmmKind {
             "uniswap_v2_like" => Ok(Self::UniswapV2Like),
             "aerodrome_v2_like" => Ok(Self::AerodromeV2Like),
             "uniswap_v3_like" => Ok(Self::UniswapV3Like),
+            "trader_joe_lb" => Ok(Self::TraderJoeLb),
             "curve_plain" => Ok(Self::CurvePlain),
             "balancer_weighted" => Ok(Self::BalancerWeighted),
             other => anyhow::bail!("unsupported amm kind: {other}"),
@@ -91,6 +159,8 @@ pub enum DiscoveryKind {
     SolidlyFactoryAllPools,
     SlipstreamFactoryAllPools,
     PoolCreatedLogs,
+    TraderJoeLbFactoryAllPairs,
+    TraderJoeLbConfiguredPairs,
     CurveRegistry,
     BalancerVaultLogs,
     StaticList,
@@ -103,6 +173,8 @@ impl DiscoveryKind {
             "solidly_factory_all_pools" => Ok(Self::SolidlyFactoryAllPools),
             "slipstream_factory_all_pools" => Ok(Self::SlipstreamFactoryAllPools),
             "pool_created_logs" => Ok(Self::PoolCreatedLogs),
+            "traderjoe_lb_factory_all_pairs" => Ok(Self::TraderJoeLbFactoryAllPairs),
+            "traderjoe_lb_configured_pairs" => Ok(Self::TraderJoeLbConfiguredPairs),
             "curve_registry" => Ok(Self::CurveRegistry),
             "balancer_vault_logs" => Ok(Self::BalancerVaultLogs),
             "static_list" => Ok(Self::StaticList),
@@ -145,9 +217,10 @@ pub struct CapitalChoice {
 pub enum AdapterType {
     UniswapV2Like = 0,
     UniswapV3Like = 1,
-    CurvePlain = 2,
-    BalancerWeighted = 3,
-    AerodromeV2Like = 4,
+    TraderJoeLb = 2,
+    CurvePlain = 3,
+    BalancerWeighted = 4,
+    AerodromeV2Like = 5,
 }
 
 impl From<AmmKind> for AdapterType {
@@ -156,6 +229,7 @@ impl From<AmmKind> for AdapterType {
             AmmKind::UniswapV2Like => Self::UniswapV2Like,
             AmmKind::AerodromeV2Like => Self::AerodromeV2Like,
             AmmKind::UniswapV3Like => Self::UniswapV3Like,
+            AmmKind::TraderJoeLb => Self::TraderJoeLb,
             AmmKind::CurvePlain => Self::CurvePlain,
             AmmKind::BalancerWeighted => Self::BalancerWeighted,
         }
@@ -269,6 +343,14 @@ pub struct V3PoolState {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TraderJoeLbPoolState {
+    pub reserve_x: u128,
+    pub reserve_y: u128,
+    pub bin_step: u16,
+    pub active_id: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CurvePoolState {
     pub balances: Vec<u128>,
     pub amp: u128,
@@ -289,6 +371,7 @@ pub enum PoolSpecificState {
     UniswapV2Like(V2PoolState),
     AerodromeV2Like(AerodromeV2PoolState),
     UniswapV3Like(V3PoolState),
+    TraderJoeLb(TraderJoeLbPoolState),
     CurvePlain(CurvePoolState),
     BalancerWeighted(BalancerPoolState),
 }
@@ -374,6 +457,7 @@ pub enum SplitExtra {
         zero_for_one: bool,
         sqrt_price_limit_x96: U256,
     },
+    TraderJoeLb,
     Curve {
         i: i128,
         j: i128,

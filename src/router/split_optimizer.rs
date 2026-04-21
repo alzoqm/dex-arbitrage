@@ -277,7 +277,14 @@ impl SplitOptimizer {
             if expected == 0 {
                 continue;
             }
-            let min_amount_out = expected.saturating_mul(self.split_min_output_bps) / 10_000;
+            let min_amount_out = if matches!(
+                pool.state,
+                crate::types::PoolSpecificState::TraderJoeLb(_)
+            ) {
+                0
+            } else {
+                expected.saturating_mul(self.split_min_output_bps) / 10_000
+            };
             let extra = match &pool.state {
                 crate::types::PoolSpecificState::UniswapV2Like(state) => SplitExtra::V2 {
                     fee_ppm: state.fee_ppm,
@@ -298,6 +305,7 @@ impl SplitOptimizer {
                         ),
                     }
                 }
+                crate::types::PoolSpecificState::TraderJoeLb(_) => SplitExtra::TraderJoeLb,
                 crate::types::PoolSpecificState::CurvePlain(state) => {
                     let Some(i) = pool
                         .token_addresses

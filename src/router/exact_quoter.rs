@@ -13,7 +13,7 @@ use parking_lot::Mutex;
 use tokio::time::timeout;
 
 use crate::{
-    abi::{IAerodromeCLQuoter, IBalancerVault, ICurvePool, IV3QuoterV2},
+    abi::{IAerodromeCLQuoter, IBalancerVault, ICurvePool, ITraderJoeLBPair, IV3QuoterV2},
     amm,
     graph::GraphSnapshot,
     monitoring::metrics as telemetry,
@@ -31,6 +31,7 @@ pub struct ExactQuoter {
     v3_direction_blocklist: Arc<Mutex<V3DirectionBlocklist>>,
     curve_underlying_support: Arc<Mutex<HashMap<alloy::primitives::Address, bool>>>,
     use_v3_rpc_quoter: bool,
+    use_lb_rpc_quoter: bool,
     use_curve_rpc_quoter: bool,
     use_balancer_rpc_quoter: bool,
     quote_rpc_timeout: Duration,
@@ -86,6 +87,10 @@ impl ExactQuoter {
             v3_direction_blocklist: shared_v3_direction_blocklist(),
             curve_underlying_support: Arc::new(Mutex::new(HashMap::new())),
             use_v3_rpc_quoter,
+            use_lb_rpc_quoter: use_v3_rpc_quoter
+                || std::env::var("USE_LB_RPC_QUOTER")
+                    .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+                    .unwrap_or(false),
             use_curve_rpc_quoter: std::env::var("USE_CURVE_RPC_QUOTER")
                 .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
                 .unwrap_or(false),
@@ -237,6 +242,36 @@ impl ExactQuoter {
                 } else {
                     let zero_for_one = i == 0 && j == 1;
                     amm::uniswap_v3::fallback_quote(state, zero_for_one, amount_in)
+                }
+            }
+            PoolSpecificState::TraderJoeLb(state) => {
+                if pool.token_addresses.len() != 2 {
+                    return Ok(0);
+                }
+                let swap_for_y = i == 0 && j == 1;
+                if self.use_lb_rpc_quoter {
+                    let Some(raw) = self
+                        .eth_call_with_timeout(
+                            pool.pool_id,
+                            ITraderJoeLBPair::getSwapOutCall {
+                                amountIn: amount_in,
+                                swapForY: swap_for_y,
+                            }
+                            .abi_encode()
+                            .into(),
+                        )
+                        .await?
+                    else {
+                        return Ok(0);
+                    };
+                    let ret = ITraderJoeLBPair::getSwapOutCall::abi_decode_returns(&raw)?;
+                    if ret.amountInLeft > 0 {
+                        0
+                    } else {
+                        ret.amountOut
+                    }
+                } else {
+                    amm::trader_joe_lb::quote_exact_in(state, swap_for_y, amount_in).unwrap_or(0)
                 }
             }
             PoolSpecificState::CurvePlain(state) => {

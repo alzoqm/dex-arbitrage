@@ -1,0 +1,95 @@
+chain = "linea"
+chain_id = 59144
+native_symbol = "ETH"
+
+max_hops = 4
+screening_margin_bps = 5
+
+min_net_profit_default = 100000
+max_position_default = 100000000
+max_flash_loan_default = 100000000
+daily_loss_limit_default = -5000000
+
+min_net_profit_usd_e8 = 10000000
+min_trade_usd_e8 = 1000000000
+max_position_usd_e8 = 10000000000
+max_flash_loan_usd_e8 = 10000000000
+daily_loss_limit_usd_e8 = 500000000
+
+poll_interval_ms = 1000
+event_backfill_blocks = 16
+staleness_timeout_ms = 900000
+
+gas_risk_buffer_pct = 0.20
+gas_price_ceiling_wei = 3000000000
+pool_health_min_bps = 9000
+stable_depeg_cutoff_e6 = 995000
+strict_target_allowlist = true
+
+[policy]
+venues = ["pancakeswap_v3"]
+symbols = []
+
+[search]
+top_k_paths_per_side = 16
+max_virtual_branches_per_node = 48
+path_beam_width = 384
+max_candidates_per_refresh = 128
+candidate_selection_buffer_multiplier = 4
+dedup_token_paths = true
+max_pair_edges_per_pair = 6
+max_split_parallel_pools = 4
+
+[[tokens]]
+symbol = "USDC"
+address_env = "LINEA_USDC"
+decimals = 6
+is_stable = true
+is_cycle_anchor = false
+allow_self_funded = false
+price_env = "LINEA_USDC_PRICE_E8"
+
+[[tokens]]
+symbol = "USDT"
+address_env = "LINEA_USDT"
+decimals = 6
+is_stable = true
+is_cycle_anchor = false
+allow_self_funded = false
+price_env = "LINEA_USDT_PRICE_E8"
+
+[[tokens]]
+symbol = "WETH"
+address_env = "LINEA_WETH"
+decimals = 18
+is_stable = false
+allow_self_funded = false
+price_env = "LINEA_WETH_PRICE_E8"
+
+[[tokens]]
+symbol = "WBTC"
+address_env = "LINEA_WBTC"
+decimals = 8
+is_stable = false
+allow_self_funded = false
+price_env = "LINEA_WBTC_PRICE_E8"
+
+[[tokens]]
+symbol = "wstETH"
+address_env = "LINEA_WSTETH"
+decimals = 18
+is_stable = false
+allow_self_funded = false
+price_env = "LINEA_WSTETH_PRICE_E8"
+
+[[dexes]]
+name = "pancakeswap_v3"
+amm = "uniswap_v3_like"
+discovery = "pool_created_logs"
+factory_env = "LINEA_PANCAKESWAP_V3_FACTORY"
+quoter_env = "LINEA_PANCAKESWAP_V3_QUOTER"
+registry_env = ""
+vault_env = ""
+fee_ppm = 0
+start_block = 1700000
+enabled = true

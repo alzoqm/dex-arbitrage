@@ -1,0 +1,144 @@
+chain = "avalanche"
+chain_id = 43114
+native_symbol = "AVAX"
+
+max_hops = 4
+screening_margin_bps = 5
+
+min_net_profit_default = 100000
+max_position_default = 100000000
+max_flash_loan_default = 100000000
+daily_loss_limit_default = -5000000
+
+min_net_profit_usd_e8 = 10000000
+min_trade_usd_e8 = 1000000000
+max_position_usd_e8 = 10000000000
+max_flash_loan_usd_e8 = 10000000000
+daily_loss_limit_usd_e8 = 500000000
+
+poll_interval_ms = 1000
+event_backfill_blocks = 16
+staleness_timeout_ms = 900000
+
+gas_risk_buffer_pct = 0.20
+gas_price_ceiling_wei = 100000000000
+pool_health_min_bps = 9000
+stable_depeg_cutoff_e6 = 995000
+strict_target_allowlist = true
+
+[policy]
+venues = ["uniswap_v2", "pangolin_v2", "traderjoe_v1", "traderjoe_lb_v22", "traderjoe_lb_v21"]
+symbols = []
+
+[search]
+top_k_paths_per_side = 16
+max_virtual_branches_per_node = 48
+path_beam_width = 384
+max_candidates_per_refresh = 128
+candidate_selection_buffer_multiplier = 4
+dedup_token_paths = true
+max_pair_edges_per_pair = 6
+max_split_parallel_pools = 4
+
+[[tokens]]
+symbol = "USDC"
+address_env = "AVALANCHE_USDC"
+decimals = 6
+is_stable = true
+is_cycle_anchor = false
+allow_self_funded = false
+price_env = "AVALANCHE_USDC_PRICE_E8"
+
+[[tokens]]
+symbol = "USDT"
+address_env = "AVALANCHE_USDT"
+decimals = 6
+is_stable = true
+is_cycle_anchor = false
+allow_self_funded = false
+price_env = "AVALANCHE_USDT_PRICE_E8"
+
+[[tokens]]
+symbol = "WAVAX"
+address_env = "AVALANCHE_WAVAX"
+decimals = 18
+is_stable = false
+allow_self_funded = false
+price_env = "AVALANCHE_WAVAX_PRICE_E8"
+
+[[tokens]]
+symbol = "BTCb"
+address_env = "AVALANCHE_BTCB"
+decimals = 8
+is_stable = false
+allow_self_funded = false
+price_env = "AVALANCHE_BTCB_PRICE_E8"
+
+[[tokens]]
+symbol = "EURC"
+address_env = "AVALANCHE_EURC"
+decimals = 6
+is_stable = true
+is_cycle_anchor = false
+allow_self_funded = false
+price_env = "AVALANCHE_EURC_PRICE_E8"
+
+[[dexes]]
+name = "uniswap_v2"
+amm = "uniswap_v2_like"
+discovery = "factory_all_pairs"
+factory_env = "AVALANCHE_UNISWAP_V2_FACTORY"
+quoter_env = ""
+registry_env = ""
+vault_env = ""
+fee_ppm = 3000
+start_block = 0
+enabled = true
+
+[[dexes]]
+name = "pangolin_v2"
+amm = "uniswap_v2_like"
+discovery = "factory_all_pairs"
+factory_env = "AVALANCHE_PANGOLIN_V2_FACTORY"
+quoter_env = ""
+registry_env = ""
+vault_env = ""
+fee_ppm = 3000
+start_block = 0
+enabled = true
+
+[[dexes]]
+name = "traderjoe_v1"
+amm = "uniswap_v2_like"
+discovery = "factory_all_pairs"
+factory_env = "AVALANCHE_TRADERJOE_V1_FACTORY"
+quoter_env = ""
+registry_env = ""
+vault_env = ""
+fee_ppm = 3000
+start_block = 0
+enabled = true
+
+[[dexes]]
+name = "traderjoe_lb_v22"
+amm = "trader_joe_lb"
+discovery = "traderjoe_lb_factory_all_pairs"
+factory_env = "AVALANCHE_TRADERJOE_LB_V22_FACTORY"
+quoter_env = ""
+registry_env = ""
+vault_env = ""
+fee_ppm = 0
+start_block = 0
+enabled = true
+
+[[dexes]]
+name = "traderjoe_lb_v21"
+amm = "trader_joe_lb"
+discovery = "traderjoe_lb_factory_all_pairs"
+factory_env = "AVALANCHE_TRADERJOE_LB_V21_FACTORY"
+quoter_env = ""
+registry_env = ""
+vault_env = ""
+fee_ppm = 0
+start_block = 0
+enabled = true

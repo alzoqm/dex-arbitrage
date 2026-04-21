@@ -8,6 +8,7 @@ import {IUniswapV2Pair} from "./interfaces/IUniswapV2Pair.sol";
 import {IAerodromeV2Pool} from "./interfaces/IAerodromeV2Pool.sol";
 import {IUniswapV3Pool} from "./interfaces/IUniswapV3Pool.sol";
 import {IUniswapV3SwapCallback} from "./interfaces/IUniswapV3SwapCallback.sol";
+import {ITraderJoeLBPair} from "./interfaces/ITraderJoeLBPair.sol";
 import {ICurvePool} from "./interfaces/ICurvePool.sol";
 import {IBalancerPool} from "./interfaces/IBalancerPool.sol";
 import {IBalancerVault} from "./interfaces/IBalancerVault.sol";
@@ -16,6 +17,7 @@ contract ArbitrageExecutor is IFlashLoanSimpleReceiver, IUniswapV3SwapCallback {
     enum AdapterType {
         UniswapV2Like,
         UniswapV3Like,
+        TraderJoeLb,
         CurvePlain,
         BalancerWeighted,
         AerodromeV2Like
@@ -290,6 +292,8 @@ contract ArbitrageExecutor is IFlashLoanSimpleReceiver, IUniswapV3SwapCallback {
 
         if (split.adapterType == AdapterType.UniswapV2Like) {
             amountOut = _swapV2(split);
+        } else if (split.adapterType == AdapterType.TraderJoeLb) {
+            amountOut = _swapTraderJoeLb(split);
         } else if (split.adapterType == AdapterType.AerodromeV2Like) {
             amountOut = _swapAerodromeV2(split);
         } else if (split.adapterType == AdapterType.UniswapV3Like) {
@@ -358,6 +362,27 @@ contract ArbitrageExecutor is IFlashLoanSimpleReceiver, IUniswapV3SwapCallback {
         );
         require(zeroForOne ? amount1Delta < 0 : amount0Delta < 0, "V3_NO_OUTPUT");
         amountOut = IERC20(split.tokenOut).balanceOf(address(this)) - balanceBefore;
+    }
+
+    function _swapTraderJoeLb(Split memory split) internal returns (uint256 amountOut) {
+        ITraderJoeLBPair pair = ITraderJoeLBPair(split.target);
+        address tokenX = pair.getTokenX();
+        address tokenY = pair.getTokenY();
+
+        bool swapForY = false;
+        if (split.tokenIn == tokenX && split.tokenOut == tokenY) {
+            swapForY = true;
+        } else if (split.tokenIn == tokenY && split.tokenOut == tokenX) {
+            swapForY = false;
+        } else {
+            revert("BAD_LB_TOKEN_PAIR");
+        }
+
+        uint256 balanceBefore = IERC20(split.tokenOut).balanceOf(address(this));
+        _safeTransfer(split.tokenIn, split.target, split.amountIn);
+        pair.swap(swapForY, address(this));
+        amountOut = IERC20(split.tokenOut).balanceOf(address(this)) - balanceBefore;
+        require(amountOut >= split.minAmountOut, "LB_MIN_OUT");
     }
 
     function _swapAerodromeV2(Split memory split) internal returns (uint256 amountOut) {

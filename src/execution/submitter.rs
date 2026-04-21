@@ -134,45 +134,22 @@ impl Submitter {
         let mut out = Vec::new();
         let allow_public_fallback = self.settings.execution.allow_public_fallback;
 
-        match self.settings.chain {
-            crate::types::Chain::Base => {
-                if let Some(url) = self.settings.rpc.protected_rpc_url.clone() {
-                    out.push(SubmitChannel::private(
-                        "base-protected",
-                        url,
-                        &self.settings,
-                    ));
-                }
-                // Public fallback is disabled by default for production safety
-                // Must be explicitly enabled via ALLOW_PUBLIC_FALLBACK env var
-                if allow_public_fallback {
-                    out.push(SubmitChannel::public(
-                        "base-public",
-                        self.settings.rpc.public_rpc_url.clone(),
-                    ));
-                    if let Some(url) = self.settings.rpc.fallback_rpc_url.clone() {
-                        out.push(SubmitChannel::public("base-fallback", url));
-                    }
-                }
-            }
-            crate::types::Chain::Polygon => {
-                if let Some(url) = self.settings.rpc.protected_rpc_url.clone() {
-                    out.push(SubmitChannel::private(
-                        "polygon-private",
-                        url,
-                        &self.settings,
-                    ));
-                }
-                // Public fallback is disabled by default for production safety
-                if allow_public_fallback {
-                    out.push(SubmitChannel::public(
-                        "polygon-public",
-                        self.settings.rpc.public_rpc_url.clone(),
-                    ));
-                    if let Some(url) = self.settings.rpc.fallback_rpc_url.clone() {
-                        out.push(SubmitChannel::public("polygon-fallback", url));
-                    }
-                }
+        let chain = self.settings.chain.as_str();
+        if let Some(url) = self.settings.rpc.protected_rpc_url.clone() {
+            out.push(SubmitChannel::private(
+                &format!("{chain}-protected"),
+                url,
+                &self.settings,
+            ));
+        }
+        // Public fallback is disabled by default for production safety.
+        if allow_public_fallback {
+            out.push(SubmitChannel::public(
+                &format!("{chain}-public"),
+                self.settings.rpc.public_rpc_url.clone(),
+            ));
+            if let Some(url) = self.settings.rpc.fallback_rpc_url.clone() {
+                out.push(SubmitChannel::public(&format!("{chain}-fallback"), url));
             }
         }
 
@@ -361,7 +338,7 @@ mod tests {
         );
 
         let channels = submitter.channels();
-        assert_eq!(channels[0].name, "polygon-private");
+        assert_eq!(channels[0].name, "polygon-protected");
         assert_eq!(channels[0].method, "eth_sendPrivateTransaction");
         assert!(channels[1..]
             .iter()
